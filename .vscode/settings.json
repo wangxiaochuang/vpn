@@ -1,0 +1,4 @@
+{
+  "cSpell.words": ["datagram", "nextest", "QUIC", "rcgen", "rustls"],
+  "editor.defaultFormatter": "rust-lang.rust-analyzer"
+}
