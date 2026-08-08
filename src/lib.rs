@@ -15,5 +15,11 @@
 )]
 
 pub mod auth;
+pub mod ctrl;
 pub mod ipam;
 pub mod route;
+
+pub mod vpn {
+    #![allow(clippy::doc_markdown)]
+    include!(concat!(env!("OUT_DIR"), "/vpn.rs"));
+}
