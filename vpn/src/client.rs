@@ -118,7 +118,7 @@ fn deny_reason_text(reason: i32) -> &'static str {
 }
 
 pub async fn run(config: ClientConfig) -> anyhow::Result<()> {
-    let password = rpassword::read_password().context("failed to read password from stdin")?;
+    let password = rpassword::prompt_password("请输入密码：")?;
     run_with_credentials(config, password).await
 }
 

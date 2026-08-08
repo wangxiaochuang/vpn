@@ -67,7 +67,7 @@
 │   - 防止 MITM 截获应用层凭证                              │
 │   - 服务端持有由 CA 签发的证书（含匹配的 SAN）            │
 │   - 客户端配置信任的 CA 证书，按标准 WebPKI 校验服务端    │
-│   - CA 由运营者自建（自签根 CA），用 examples/tlsgen 生成 │
+│   - CA 由运营者自建（自签根 CA），用 vpn/examples/tlsgen 生成 │
 ├──────────────────────────────────────────────────────────┤
 │ 应用层: 用户名 / 密码                                     │
 │   - 服务端配置文件存储用户列表                            │
@@ -214,6 +214,8 @@ username = "alice"
 
 客户端解析语义：`server` 为 `SocketAddr`（V1 仅支持 `IP:port`，域名 DNS 解析列 V2）；`server_name` 非空、`ca_cert` 非空（文件存在性由 TLS 构造阶段校验）；`ClientConfig` 不含密码字段。
 
+服务端用户管理工具 `cargo xtask add-user`（workspace 内独立 `xtask` crate，`.cargo/config.toml` 定义 alias）：交互式输入两次密码（rpassword 不回显），生成 argon2id PHC 哈希后写回 `server.toml` 的 `[[users]]`，同名用户只更新 `password_hash`，toml_edit 原地编辑保留注释与格式，无 `[[users]]` 段时自动创建。
+
 ## 10. 技术栈
 
 | 组件 | 选型 |
@@ -282,4 +284,4 @@ vpn client --config client.toml   # 以客户端模式运行
 
 `vpn client --config <PATH>` 启动流程：加载 `ClientConfig` → 交互式提示输入密码（不回显）→ 连接、认证、建 TUN、转发。任一步骤失败以非零退出码退出并打印错误；认证失败会打印 `AuthDenied` 的可读原因（认证失败 / 服务端繁忙）。
 
-协议定义、加密、配置解析、数据泵等共享代码置于 library crate（`src/lib.rs`），两个子命令复用。
+协议定义、加密、配置解析、数据泵等共享代码置于 `vpn` crate 的 library（`vpn/src/lib.rs`），两个子命令复用。

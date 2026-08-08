@@ -447,7 +447,10 @@ mod tests {
     }
 
     fn repo(p: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(p)
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("vpn crate nested under repo root")
+            .join(p)
     }
 
     async fn make_client_conns(n: usize) -> Vec<quinn::Connection> {

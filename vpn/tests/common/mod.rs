@@ -30,7 +30,10 @@ pub fn alice_users() -> Vec<(String, String)> {
 }
 
 pub fn repo(p: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(p)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("vpn crate nested under repo root")
+        .join(p)
 }
 
 pub fn test_config() -> ServerConfig {

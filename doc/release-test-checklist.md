@@ -22,7 +22,7 @@
 
 ## 服务端启动流程（Q3）
 
-1. [ ] 生成或准备自签证书：`cargo run --example tlsgen`（产出 `cert.pem` / `key.pem`）
+1. [ ] 生成或准备自签证书：`cargo run -p vpn --example tlsgen`（产出 `cert.pem` / `key.pem`）
 2. [ ] 编写 `server.toml`（参考 `doc/arch-v1.md` §9），含 `[server]` 段与至少一个 `[[users]]`
 3. [ ] `cargo build --release --bin vpn`
 4. [ ] 以 root 运行：`sudo ./target/release/vpn server --config server.toml`
@@ -91,7 +91,7 @@ echo "nat on en0 from 10.0.0.0/24 to any -> (en0)" | sudo pfctl -ef -
 
 - [ ] 配置文件格式错误时报错信息可读
 - [ ] NAT / IP forwarding 配置文档照着走能跑通
-- [ ] `vpn hash-password`（或等价工具）能生成可用 argon2 hash
+- [ ] `cargo xtask add-user` 能交互式生成可用 argon2 hash 并写回 `server.toml`（同名更新、无 `[[users]]` 段自动创建、保留注释）
 
 ## 已知限制（V1，非 bug）
 

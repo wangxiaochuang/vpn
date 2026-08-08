@@ -76,6 +76,9 @@ mod tests {
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("vpn crate nested under repo root")
+            .to_path_buf()
     }
 
     #[test]

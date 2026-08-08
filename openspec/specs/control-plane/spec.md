@@ -2,7 +2,7 @@
 
 ## Purpose
 
-定义 VPN 控制面的能力契约：客户端与服务端在一条双向 QUIC stream 上交换的信令消息结构（认证请求/响应、配置下发、心跳、顶替通知）、length-prefix framing 契约、服务端运行期错误到协议错误码的映射，以及心跳常量。本 spec 是 `ctrl` 模块与 `proto/vpn.proto` 的 Q1 单元测试契约来源。IO 层（stream 读写、心跳超时循环、连接生命周期编排）不在本 spec 范围。
+定义 VPN 控制面的能力契约：客户端与服务端在一条双向 QUIC stream 上交换的信令消息结构（认证请求/响应、配置下发、心跳、顶替通知）、length-prefix framing 契约、服务端运行期错误到协议错误码的映射，以及心跳常量。本 spec 是 `ctrl` 模块与 `vpn/proto/vpn.proto` 的 Q1 单元测试契约来源。IO 层（stream 读写、心跳超时循环、连接生命周期编排）不在本 spec 范围。
 
 ## Requirements
 

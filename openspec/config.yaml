@@ -5,7 +5,7 @@ context: |
   技术栈：quinn / rustls(aws-lc-rs) / tun-rs / tokio / prost / clap / argon2
   架构见 doc/arch-v1.md：控制面 QUIC stream + length-prefix framing，
   数据面 QUIC datagram 原样转发 IP 包。
-  测试策略见 AGENTS.md：四象限模型，spec 场景与 tests/ 绑定。
+  测试策略见 AGENTS.md：四象限模型，spec 场景与 vpn/tests/ 绑定。
 
 rules:
   proposal:
@@ -13,7 +13,7 @@ rules:
     - 必须列出非目标（Non-goals）
   spec:
     - 每个需求必须写成 Given/When/Then 格式
-    - 每个场景必须对应 tests/ 下一个自动化测试
+    - 每个场景必须对应 vpn/tests/ 下一个自动化测试
   design:
     - 涉并发的部分必须说明 cancel-safety
     - 引入新依赖前先确认无既有方案
