@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::auth::AuthError;
 use crate::auth::UserStore;
 use crate::ipam::IpPool;
-const MIN_MTU: u16 = 1280;
+pub const MIN_MTU: u16 = 1280;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -26,6 +26,10 @@ pub enum ConfigError {
     DuplicateUser(String),
     #[error("password hash is not a valid argon2 PHC string")]
     InvalidHash,
+    #[error("server_name must not be empty")]
+    EmptyServerName,
+    #[error("ca_cert must not be empty")]
+    EmptyCaCert,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +100,37 @@ fn map_user_error(res: Result<UserStore, AuthError>) -> Result<(), ConfigError> 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientConfig {
+    pub server: SocketAddr,
+    pub server_name: String,
+    pub ca_cert: PathBuf,
+    pub username: String,
+}
+
+impl ClientConfig {
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
+        let raw: RawClientConfig = toml::from_str(&content)?;
+        Self::from_raw(raw)
+    }
+
+    fn from_raw(raw: RawClientConfig) -> Result<Self, ConfigError> {
+        if raw.client.server_name.is_empty() {
+            return Err(ConfigError::EmptyServerName);
+        }
+        if raw.client.ca_cert.as_os_str().is_empty() {
+            return Err(ConfigError::EmptyCaCert);
+        }
+        Ok(Self {
+            server: raw.client.server,
+            server_name: raw.client.server_name,
+            ca_cert: raw.client.ca_cert,
+            username: raw.client.username,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     server: RawServer,
@@ -126,6 +161,19 @@ where
 struct RawUser {
     username: String,
     password_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawClientConfig {
+    client: RawClient,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawClient {
+    server: SocketAddr,
+    server_name: String,
+    ca_cert: PathBuf,
+    username: String,
 }
 
 #[cfg(test)]
@@ -338,5 +386,96 @@ password_hash = "{hash}"
     fn test_map_user_error_invalid_credentials_is_tolerated() {
         let res: Result<(), ConfigError> = map_user_error(Err(AuthError::InvalidCredentials));
         assert!(res.is_ok());
+    }
+
+    fn minimal_client_config_body() -> String {
+        r#"[client]
+server = "127.0.0.1:4433"
+server_name = "vpn.example.com"
+ca_cert = "ca.crt"
+username = "alice"
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn test_client_load_when_valid_minimal_returns_ok_with_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "client_ok.toml", &minimal_client_config_body());
+        let cfg = ClientConfig::load(&path).unwrap();
+        assert_eq!(cfg.server, "127.0.0.1:4433".parse().unwrap());
+        assert_eq!(cfg.server_name, "vpn.example.com");
+        assert_eq!(cfg.ca_cert, PathBuf::from("ca.crt"));
+        assert_eq!(cfg.username, "alice");
+    }
+
+    #[test]
+    fn test_client_load_when_file_missing_returns_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.toml");
+        let err = ClientConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Io(_)));
+    }
+
+    #[test]
+    fn test_client_load_when_toml_syntax_error_returns_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "client_bad.toml", "server = ");
+        let err = ClientConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn test_client_load_when_empty_server_name_returns_empty_server_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = minimal_client_config_body()
+            .replace(r#"server_name = "vpn.example.com""#, r#"server_name = """#);
+        let path = write_config(&dir, "client_sn.toml", &body);
+        let err = ClientConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::EmptyServerName));
+    }
+
+    #[test]
+    fn test_client_load_when_empty_ca_cert_returns_empty_ca_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = minimal_client_config_body().replace(r#"ca_cert = "ca.crt""#, r#"ca_cert = """#);
+        let path = write_config(&dir, "client_ca.toml", &body);
+        let err = ClientConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::EmptyCaCert));
+    }
+
+    #[test]
+    fn test_client_error_new_variants_display_distinct_from_existing() {
+        let io = ConfigError::Io(io_stub()).to_string();
+        let parse = ConfigError::Parse(toml::from_str::<serde::de::IgnoredAny>("x =").unwrap_err())
+            .to_string();
+        let mtu = ConfigError::MtuTooSmall(1000).to_string();
+        let subnet = ConfigError::InvalidSubnet.to_string();
+        let empty = ConfigError::EmptyUsername.to_string();
+        let dup = ConfigError::DuplicateUser("alice".into()).to_string();
+        let hash = ConfigError::InvalidHash.to_string();
+        let sn = ConfigError::EmptyServerName.to_string();
+        let ca = ConfigError::EmptyCaCert.to_string();
+
+        let all = [&io, &parse, &mtu, &subnet, &empty, &dup, &hash, &sn, &ca];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j]);
+            }
+        }
+        assert!(sn.contains("server_name"));
+        assert!(ca.contains("ca_cert"));
+    }
+
+    #[test]
+    fn test_client_load_when_syntax_error_takes_precedence_over_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = minimal_client_config_body().replace(
+            "server = \"127.0.0.1:4433\"",
+            "server = \"127.0.0.1:4433\"\nbroken = ",
+        );
+        let path = write_config(&dir, "client_precedence.toml", &body);
+        let err = ClientConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
     }
 }

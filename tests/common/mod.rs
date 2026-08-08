@@ -167,7 +167,7 @@ pub async fn make_connected_pair() -> ConnectionPair {
         .expect("connect");
 
     let server_conn = accept_task.await.unwrap().unwrap();
-    drop(client);
+    std::mem::forget(client);
 
     ConnectionPair {
         _endpoint: server,

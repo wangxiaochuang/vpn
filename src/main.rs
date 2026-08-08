@@ -28,9 +28,9 @@ async fn main() -> anyhow::Result<()> {
             let cfg = vpn::config::ServerConfig::load(&config)?;
             vpn::server::run(cfg).await?;
         }
-        Cli::Client { .. } => {
-            eprintln!("client mode not yet implemented");
-            std::process::exit(1);
+        Cli::Client { config } => {
+            let cfg = vpn::config::ClientConfig::load(&config)?;
+            vpn::client::run(cfg).await?;
         }
     }
 

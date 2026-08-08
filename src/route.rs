@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::io;
 use std::net::Ipv4Addr;
 
+use ipnet::Ipv4Net;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -108,6 +110,37 @@ impl<H: Clone + Eq + Hash> Default for SessionRegistry<H> {
     }
 }
 
+pub fn ensure_subnet_route(dev_name: &str, subnet: Ipv4Net) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("ip")
+            .args(["route", "add", &subnet.to_string(), "dev", dev_name])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        let output = std::process::Command::new("ip")
+            .args(["route", "show", "to", &subnet.to_string(), "dev", dev_name])
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "failed to add route {subnet} dev {dev_name}: ip exited with {}",
+                    status.code().unwrap_or(-1)
+                ),
+            ))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (dev_name, subnet);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -115,6 +148,31 @@ mod tests {
 
     fn ip(last: u8) -> Ipv4Addr {
         Ipv4Addr::new(10, 0, 0, last)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_ensure_subnet_route_non_linux_returns_ok_without_command() {
+        let subnet: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+        assert!(ensure_subnet_route("utun10", subnet).is_ok());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_ensure_subnet_route_non_linux_accepts_any_subnet() {
+        let subnet: Ipv4Net = "192.168.5.0/24".parse().unwrap();
+        assert!(ensure_subnet_route("utun99", subnet).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_ensure_subnet_route_linux_builds_correct_command() {
+        let subnet: Ipv4Net = "10.0.0.0/24".parse().unwrap();
+        let cmd = std::process::Command::new("ip")
+            .args(["route", "add", &subnet.to_string(), "dev", "tun0"])
+            .to_owned();
+        let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(args, vec!["route", "add", "10.0.0.0/24", "dev", "tun0"]);
     }
 
     #[test]

@@ -29,6 +29,7 @@ getrandom = "0.2"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 futures = "0.3"
+rpassword = "7.5"
 
 [build-dependencies]
 prost-build = "0.13"

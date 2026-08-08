@@ -1,0 +1,436 @@
+use std::net::Ipv4Addr;
+use std::time::Duration;
+
+use anyhow::{Context, anyhow};
+use ipnet::Ipv4Net;
+use thiserror::Error;
+
+use crate::config::ClientConfig;
+use crate::config::MIN_MTU;
+use crate::ctrl::{HEARTBEAT_INTERVAL, HeartbeatTracker};
+use crate::data::{PacketSink, PacketSource, QuinnDatagram, forward};
+use crate::framing::ControlCodec;
+use crate::server::ControlStream;
+use crate::vpn::AuthOk;
+use crate::vpn::control_message::Msg;
+use futures::{SinkExt, StreamExt};
+use tokio_util::codec::{Framed, FramedParts};
+
+pub struct TunSource(pub std::sync::Arc<tun_rs::AsyncDevice>);
+
+impl PacketSource for TunSource {
+    fn recv(&mut self) -> impl std::future::Future<Output = std::io::Result<bytes::Bytes>> + Send {
+        async move {
+            let mut buf = vec![0u8; 1280];
+            let n = tun_rs::AsyncDevice::recv(&self.0, &mut buf).await?;
+            buf.truncate(n);
+            Ok(bytes::Bytes::from(buf))
+        }
+    }
+}
+
+pub struct TunSink(pub std::sync::Arc<tun_rs::AsyncDevice>);
+
+impl PacketSink for TunSink {
+    fn send(
+        &mut self,
+        pkt: bytes::Bytes,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+        async move {
+            tun_rs::AsyncDevice::send(&self.0, &pkt).await?;
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientTunParams {
+    pub assigned_ip: Ipv4Addr,
+    pub subnet: Ipv4Net,
+    pub gateway: Ipv4Addr,
+    pub mtu: u16,
+}
+
+#[derive(Debug, Error)]
+pub enum ClientError {
+    #[error("AuthOk contains invalid assigned_ip: {0}")]
+    InvalidAssignedIp(String),
+    #[error("AuthOk contains invalid gateway: {0}")]
+    InvalidGateway(String),
+    #[error("AuthOk contains invalid subnet: {0}")]
+    InvalidSubnet(String),
+    #[error("AuthOk mtu {0} is smaller than minimum {MIN_MTU}")]
+    MtuTooSmall(u32),
+    #[error("AuthOk mtu {0} exceeds maximum 65535")]
+    MtuTooLarge(u32),
+    #[error("AuthOk gateway {0} is not inside subnet {1}")]
+    GatewayOutsideSubnet(Ipv4Addr, Ipv4Net),
+    #[error("AuthOk gateway {0} equals the subnet network address")]
+    GatewayIsNetworkAddr(Ipv4Addr),
+    #[error("authentication failed: {0}")]
+    AuthDenied(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
+}
+
+pub fn parse_auth_ok(ok: &AuthOk) -> Result<ClientTunParams, ClientError> {
+    let assigned_ip: Ipv4Addr = ok
+        .assigned_ip
+        .parse()
+        .map_err(|_| ClientError::InvalidAssignedIp(ok.assigned_ip.clone()))?;
+    let gateway: Ipv4Addr = ok
+        .gateway
+        .parse()
+        .map_err(|_| ClientError::InvalidGateway(ok.gateway.clone()))?;
+    let subnet: Ipv4Net = ok
+        .subnet
+        .parse()
+        .map_err(|_| ClientError::InvalidSubnet(ok.subnet.clone()))?;
+
+    if ok.mtu < u32::from(MIN_MTU) {
+        return Err(ClientError::MtuTooSmall(ok.mtu));
+    }
+    if ok.mtu > u32::from(u16::MAX) {
+        return Err(ClientError::MtuTooLarge(ok.mtu));
+    }
+    let mtu = u16::try_from(ok.mtu).map_err(|_| ClientError::MtuTooLarge(ok.mtu))?;
+    if !subnet.contains(&gateway) {
+        return Err(ClientError::GatewayOutsideSubnet(gateway, subnet));
+    }
+    if gateway == subnet.network() {
+        return Err(ClientError::GatewayIsNetworkAddr(gateway));
+    }
+
+    Ok(ClientTunParams {
+        assigned_ip,
+        subnet,
+        gateway,
+        mtu,
+    })
+}
+
+fn deny_reason_text(reason: i32) -> &'static str {
+    match reason {
+        r if r == crate::vpn::DenyReason::AuthFailed as i32 => "认证失败（用户名或密码错误）",
+        r if r == crate::vpn::DenyReason::ServerBusy as i32 => "服务端繁忙（IP 池耗尽）",
+        _ => "未知拒绝原因",
+    }
+}
+
+pub async fn run(config: ClientConfig) -> anyhow::Result<()> {
+    let password = rpassword::read_password().context("failed to read password from stdin")?;
+    run_with_credentials(config, password).await
+}
+
+pub async fn run_with_credentials(config: ClientConfig, password: String) -> anyhow::Result<()> {
+    let (conn, framed, params) = establish_connection(&config, password).await?;
+    let tun = setup_tun(&params)?;
+    tracing::info!(
+        "authenticated as {}, assigned_ip={}, subnet={}, mtu={}",
+        config.username,
+        params.assigned_ip,
+        params.subnet,
+        params.mtu
+    );
+    run_data_plane(&conn, tun, framed).await
+}
+
+async fn establish_connection(
+    config: &ClientConfig,
+    password: String,
+) -> anyhow::Result<(quinn::Connection, ControlFramed, ClientTunParams)> {
+    let quinn_cfg = crate::tls::build_quinn_client_config(&config.ca_cert, &config.server_name)
+        .context("failed to build client TLS config")?;
+    let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    let conn = endpoint
+        .connect_with(quinn_cfg, config.server, &config.server_name)
+        .context("failed to initiate QUIC connection")?
+        .await
+        .context("failed to connect to server")?;
+
+    tracing::info!("connected to {}", config.server);
+
+    let (send, recv) = conn
+        .open_bi()
+        .await
+        .context("failed to open control stream")?;
+    let mut framed = Framed::new(ControlStream::new(send, recv), ControlCodec::new());
+
+    framed
+        .send(crate::vpn::ControlMessage {
+            msg: Some(Msg::AuthRequest(crate::vpn::AuthRequest {
+                username: config.username.clone(),
+                password,
+            })),
+        })
+        .await
+        .context("failed to send AuthRequest")?;
+
+    let first = framed
+        .next()
+        .await
+        .ok_or_else(|| anyhow!("control stream closed before AuthOk"))?
+        .context("failed to decode first response")?;
+
+    let Some(Msg::AuthOk(ok)) = first.msg else {
+        if let Some(Msg::AuthDenied(denied)) = first.msg {
+            let reason = deny_reason_text(denied.reason);
+            tracing::error!("{reason}");
+            return Err(ClientError::AuthDenied(reason.to_string()).into());
+        }
+        return Err(
+            ClientError::Protocol("expected AuthOk but got an unexpected message".into()).into(),
+        );
+    };
+
+    let params = parse_auth_ok(&ok)?;
+    Ok((conn, framed, params))
+}
+
+fn setup_tun(params: &ClientTunParams) -> anyhow::Result<std::sync::Arc<tun_rs::AsyncDevice>> {
+    let tun = crate::tun_setup::create_client_tun(params.assigned_ip, params.subnet, params.mtu)
+        .context("failed to create client TUN device")?;
+    let dev_name = tun.name().unwrap_or_default();
+    crate::route::ensure_subnet_route(&dev_name, params.subnet)
+        .context("failed to configure subnet route")?;
+    Ok(std::sync::Arc::new(tun))
+}
+
+type ControlFramed = Framed<ControlStream, ControlCodec>;
+type HeartbeatReader = Framed<quinn::RecvStream, ControlCodec>;
+type HeartbeatWriter = Framed<quinn::SendStream, ControlCodec>;
+
+pub async fn heartbeat_loop(
+    conn: quinn::Connection,
+    reader: HeartbeatReader,
+    writer: HeartbeatWriter,
+) {
+    let mut reader = reader;
+    let mut writer = writer;
+    let mut tracker = HeartbeatTracker::new(tokio::time::Instant::now().into_std());
+    let mut send_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut timeout_tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            biased;
+            _ = timeout_tick.tick() => {
+                if tracker.is_dead(tokio::time::Instant::now().into_std()) {
+                    conn.close(0x100u32.into(), b"timeout");
+                    break;
+                }
+            }
+            _ = send_tick.tick() => {
+                let hb = crate::vpn::ControlMessage {
+                    msg: Some(Msg::Heartbeat(crate::vpn::Heartbeat {})),
+                };
+                if writer.send(hb).await.is_err() {
+                    break;
+                }
+            }
+            msg = reader.next() => {
+                match msg {
+                    Some(Ok(crate::vpn::ControlMessage { msg: Some(Msg::Heartbeat(_)) })) => {
+                        tracker.observe(tokio::time::Instant::now().into_std());
+                    }
+                    Some(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+        }
+    }
+}
+
+async fn run_data_plane(
+    conn: &quinn::Connection,
+    tun: std::sync::Arc<tun_rs::AsyncDevice>,
+    framed: ControlFramed,
+) -> anyhow::Result<()> {
+    let parts = framed.into_parts();
+    let control_stream = parts.io;
+    let read_buf = parts.read_buf;
+    let (send_stream, recv_stream) = control_stream.into_parts();
+
+    let mut reader_parts = FramedParts::new(recv_stream, ControlCodec::new());
+    reader_parts.read_buf = read_buf;
+    let reader = Framed::from_parts(reader_parts);
+    let writer = Framed::new(send_stream, ControlCodec::new());
+
+    // cancel-safety: reader 与 writer 各自持有独立的 Framed，跨 await 无共享 &mut 借用；
+    // HeartbeatTracker 仅被无 await 的 timeout 分支 &mut 借用，取消无残留。
+    let conn_for_hb = conn.clone();
+    let ctrl_task = tokio::spawn(heartbeat_loop(conn_for_hb, reader, writer));
+
+    let uplink_conn = conn.clone();
+    let uplink_tun = tun.clone();
+    let uplink_task = tokio::spawn(async move {
+        let mut source = TunSource(uplink_tun);
+        let mut sink = QuinnDatagram::new(uplink_conn.clone());
+        let _ = forward(&mut source, &mut sink).await;
+        uplink_conn.close(0x101u32.into(), b"uplink-ended");
+    });
+
+    let downlink_conn = conn.clone();
+    let downlink_tun = tun.clone();
+    let downlink_task = tokio::spawn(async move {
+        let mut source = QuinnDatagram::new(downlink_conn.clone());
+        let mut sink = TunSink(downlink_tun);
+        let _ = forward(&mut source, &mut sink).await;
+        downlink_conn.close(0x102u32.into(), b"downlink-ended");
+    });
+
+    tokio::select! {
+        _ = ctrl_task => {}
+        _ = uplink_task => {}
+        _ = downlink_task => {}
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received Ctrl+C, shutting down");
+        }
+    }
+
+    conn.close(0u32.into(), b"client-shutdown");
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::many_single_char_names
+)]
+mod tests {
+    use super::*;
+
+    fn auth_ok() -> AuthOk {
+        AuthOk {
+            assigned_ip: "10.0.0.2".to_string(),
+            subnet: "10.0.0.0/24".to_string(),
+            gateway: "10.0.0.1".to_string(),
+            mtu: 1280,
+        }
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_valid_returns_params() {
+        let params = parse_auth_ok(&auth_ok()).unwrap();
+        assert_eq!(params.assigned_ip, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(params.subnet, "10.0.0.0/24".parse::<Ipv4Net>().unwrap());
+        assert_eq!(params.gateway, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(params.mtu, 1280);
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_invalid_assigned_ip_returns_err() {
+        let mut ok = auth_ok();
+        ok.assigned_ip = "not-an-ip".to_string();
+        assert!(matches!(
+            parse_auth_ok(&ok),
+            Err(ClientError::InvalidAssignedIp(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_invalid_gateway_returns_err() {
+        let mut ok = auth_ok();
+        ok.gateway = "not-an-ip".to_string();
+        assert!(matches!(
+            parse_auth_ok(&ok),
+            Err(ClientError::InvalidGateway(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_invalid_subnet_returns_err() {
+        let mut ok = auth_ok();
+        ok.subnet = "not-a-net".to_string();
+        assert!(matches!(
+            parse_auth_ok(&ok),
+            Err(ClientError::InvalidSubnet(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_mtu_below_min_returns_err() {
+        let mut ok = auth_ok();
+        ok.mtu = 1000;
+        assert!(matches!(
+            parse_auth_ok(&ok),
+            Err(ClientError::MtuTooSmall(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_mtu_above_max_returns_err() {
+        let mut ok = auth_ok();
+        ok.mtu = 65_536;
+        assert!(matches!(
+            parse_auth_ok(&ok),
+            Err(ClientError::MtuTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_gateway_outside_subnet_returns_err() {
+        let mut ok = auth_ok();
+        ok.gateway = "192.168.1.1".to_string();
+        assert!(matches!(
+            parse_auth_ok(&ok),
+            Err(ClientError::GatewayOutsideSubnet(_, _))
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_gateway_is_network_addr_returns_err() {
+        let mut ok = auth_ok();
+        ok.gateway = "10.0.0.0".to_string();
+        assert!(matches!(
+            parse_auth_ok(&ok),
+            Err(ClientError::GatewayIsNetworkAddr(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_gateway_is_host_addr_returns_ok() {
+        let mut ok = auth_ok();
+        ok.gateway = "10.0.0.1".to_string();
+        assert!(parse_auth_ok(&ok).is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn test_client_error_variants_display_are_distinct() {
+        let all = [
+            ClientError::InvalidAssignedIp("x".into()).to_string(),
+            ClientError::InvalidGateway("x".into()).to_string(),
+            ClientError::InvalidSubnet("x".into()).to_string(),
+            ClientError::MtuTooSmall(100).to_string(),
+            ClientError::MtuTooLarge(70_000).to_string(),
+            ClientError::GatewayOutsideSubnet(
+                Ipv4Addr::new(10, 0, 0, 9),
+                "10.0.0.0/24".parse().unwrap(),
+            )
+            .to_string(),
+            ClientError::GatewayIsNetworkAddr(Ipv4Addr::new(10, 0, 0, 0)).to_string(),
+            ClientError::AuthDenied("wrong password".into()).to_string(),
+            ClientError::Protocol("unexpected msg".into()).to_string(),
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j]);
+            }
+        }
+        assert!(all[0].contains("assigned_ip"));
+        assert!(all[1].contains("gateway"));
+        assert!(all[2].contains("subnet"));
+        assert!(all[3].contains("1280"));
+        assert!(all[4].contains("65535"));
+        assert!(all[7].contains("authentication failed"));
+        assert!(all[8].contains("protocol"));
+    }
+
+    #[test]
+    fn test_deny_reason_text_maps_known_reasons() {
+        assert!(deny_reason_text(crate::vpn::DenyReason::AuthFailed as i32).contains("认证失败"));
+        assert!(deny_reason_text(crate::vpn::DenyReason::ServerBusy as i32).contains("服务端繁忙"));
+        assert!(deny_reason_text(999).contains("未知"));
+    }
+}

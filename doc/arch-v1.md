@@ -23,17 +23,18 @@
             ┌───────────────┴────────┐      ┌────────────────┴──────────────┐
             │       客户端            │      │            服务端             │
             ├────────────────────────┤      ├───────────────────────────────┤
-            │  TUN: 动态分配 IP       │      │  TUN: 网关 IP (池首地址)       │
+            │  密码交互输入 (不回显)   │      │  用户表: argon2 哈希           │
+            │  TUN: 服务端分配 IP      │      │  TUN: 网关 IP (池首地址)       │
             │  MTU = 1280            │      │  MTU = 1280                   │
-            │     ↓ 系统路由         │      │      ↓                        │
-            │  普通应用流量 → TUN    │      │  收到包 → 写入 TUN → OS 转发   │
+            │     ↓ subnet 路由(A)   │      │      ↓                        │
+            │  应用流量 → TUN         │      │  收到包 → 写入 TUN → OS 转发   │
             │     ↓                  │      │      ↓                        │
             │  发 datagram 给服务端  │      │  OS 路由回包 → TUN → datagram  │
             └────────────────────────┘      │      ↓                        │
-                                          │  发 datagram给客户端          │
-                                          │                               │
-                                          │  NAT / IP forwarding (OS 层)  │
-                                          └───────────────────────────────┘
+                                           │  发 datagram给客户端          │
+                                           │                               │
+                                           │  NAT / IP forwarding (OS 层)  │
+                                           └───────────────────────────────┘
 ```
 
 两端 TUN 设备的 MTU 统一设为较小值（默认 **1280**，见 §4），确保 IP 包能装入 QUIC datagram。
@@ -157,6 +158,32 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 
 （前瞻）V2 引入主动 migration 后，"合法迁移"与"顶替"的判据将由 connection ID 区分：同一 CID 换路径 = 合法迁移（保留），新 CID + 同 username = 顶替（杀旧的）。
 
+### 8.1 客户端运行流程（方案 A）
+
+`vpn client --config client.toml` 的运行流程（与服务端对称，客户端是主动方）：
+
+```
+ 1. 交互式读取密码（rpassword，不回显）
+ 2. build_quinn_client_config(ca_cert, server_name)
+    → 从 CA PEM 建立信任根，按 server_name 做 SNI 与证书校验
+ 3. Endpoint::client + connect_with 连接 server
+ 4. 打开控制 stream，发送 AuthRequest{ username, password }
+ 5. 匹配首条响应:
+    - AuthOk{ assigned_ip, subnet, gateway, mtu }
+        → parse_auth_ok 校验（IPv4 / Ipv4Net / mtu≥1280 / gateway 在 subnet 内）
+        → create_client_tun(assigned_ip, subnet, mtu)
+            TUN 地址 = 服务端分配的虚拟 IP（区别于服务端的网关地址）
+            macOS 显式 associate_route(true)
+        → ensure_subnet_route(dev, subnet)
+        → 拆分控制 stream 为 reader/writer
+        → 心跳 task（每 10s 发心跳，30s 判死）+ 上行/下行 forward task
+    - AuthDenied{ reason } → 打印可读信息退出（不建 TUN）
+ 6. 任一 task 结束（连接关闭 / 心跳超时 / 被顶替 / Ctrl+C）
+    → conn.close → 进程退出（V1 不自动重连）
+```
+
+**方案 A 路由限制（重要）**：客户端仅把 `subnet` 内的流量导入 TUN（Linux 上执行 `ip route add <subnet> dev <dev>`，幂等；macOS/BSD 依赖 tun-rs `associate_route` 自动加/删路由）。V1 **不做全流量代理**（方案 B：默认路由 + server `/32` 例外），因此客户端只能访问 VPN 内网，不能把外网流量经由服务端转发出去。macOS 上若 `associate_route` 被环境关闭则无路由，客户端在 TUN 构造时显式开启，不依赖默认值。
+
 ## 9. 配置形态（示意）
 
 服务端：
@@ -182,8 +209,10 @@ server = "vpn.example.com:443"
 server_name = "vpn.example.com"   # 用于 SNI 与证书 SAN 匹配
 ca_cert = "ca.crt"                # 信任的 CA 证书，用于校验服务端
 username = "alice"
-password = "..."                  # 或交互输入
+# 注意：密码不写入配置，运行时交互式输入（rpassword 读取，不回显）
 ```
+
+客户端解析语义：`server` 为 `SocketAddr`（V1 仅支持 `IP:port`，域名 DNS 解析列 V2）；`server_name` 非空、`ca_cert` 非空（文件存在性由 TLS 构造阶段校验）；`ClientConfig` 不含密码字段。
 
 ## 10. 技术栈
 
@@ -209,6 +238,8 @@ password = "..."                  # 或交互输入
 - CA 签发证书 + CA 校验（运营者自建 CA）
 - TUN MTU 设小（默认 1280），避免 datagram 超限
 - 被动 NAT rebinding（quinn 默认行为：客户端底层地址变化时连接不断、虚拟 IP 不释放）
+- 客户端交互式密码输入（rpassword，不回显，不落盘）
+- 客户端方案 A 路由：仅 subnet 内流量导入 TUN（Linux `ip route add`，macOS `associate_route`）
 
 **V1 不包含（后续迭代）**：
 - 动态 MTU 协商 / 路径 MTU 发现 / 分片处理
@@ -218,6 +249,8 @@ password = "..."                  # 或交互输入
 - 更复杂的认证（如 token、证书认证、MFA）
 - 流量统计 / 计费
 - 主动 connection migration（客户端检测网络变化并主动 `Endpoint::rebind` 切换路径；虚拟 IP 绑定原则已就位，V2 为纯增量）
+- **客户端全流量代理（方案 B：默认路由 + server `/32` 例外）**——V1 客户端仅能访问 VPN 内网，不把外网流量经服务端转发
+- **客户端自动重连**——V1 断开即退出，重连视为全新会话（与服务端语义一致）
 
 ## 12. 决策记录
 
@@ -235,6 +268,8 @@ password = "..."                  # 或交互输入
 | CA 签发证书 + CA 校验（非自签指纹固定） | 标准做法、工具链成熟，避免自定义 cert verifier |
 | 虚拟 IP 绑定 QUIC 连接（CID）而非传输地址 | NAT rebinding 下连接不断、IP 不必释放；为 V2 主动 migration 留纯增量接口，成本几乎为零 |
 | V1 仅做被动 NAT rebinding，不做主动 migration | quinn 默认免费支持被动 rebinding；主动迁移需额外写 OS 网络变化检测器，V1 收益与工作量不匹配，留待 V2 |
+| 客户端密码交互式输入（rpassword，不落盘） | 配置不存明文密码，安全性好；无自动登录需求 |
+| 客户端方案 A 路由（仅 subnet 内，非全流量代理） | 实现最简、无需 NAT；V1 定位内网互通，全流量代理（方案 B）留待后续 |
 
 ## 13. 程序结构
 
@@ -244,5 +279,7 @@ password = "..."                  # 或交互输入
 vpn server --config server.toml   # 以服务端模式运行
 vpn client --config client.toml   # 以客户端模式运行
 ```
+
+`vpn client --config <PATH>` 启动流程：加载 `ClientConfig` → 交互式提示输入密码（不回显）→ 连接、认证、建 TUN、转发。任一步骤失败以非零退出码退出并打印错误；认证失败会打印 `AuthDenied` 的可读原因（认证失败 / 服务端繁忙）。
 
 协议定义、加密、配置解析、数据泵等共享代码置于 library crate（`src/lib.rs`），两个子命令复用。

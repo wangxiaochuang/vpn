@@ -3,9 +3,7 @@
 ## Purpose
 
 定义服务端运行时的能力契约：从 `ServerConfig` 启动 QUIC 端点与 TUN 设备，维护共享状态（用户凭据、IP 池、会话注册表），处理认证握手与连接生命周期（心跳保活、数据面上下行转发、断连清理），并提供二进制入口与 CLI。本 spec 是 `server` 模块的 Q2 场景测试契约来源。
-
 ## Requirements
-
 ### Requirement: 服务端从 ServerConfig 启动运行时
 
 系统 SHALL 提供 `server::run(config: ServerConfig) -> anyhow::Result<()>` 作为服务端运行入口（async）。`run` SHALL 完成：(1) 加载 cert/key PEM 构造 `rustls::ServerConfig`（无客户端认证，单证书）；(2) 包装为 `quinn::ServerConfig` 与 `quinn::Endpoint::server(...)` 监听 `config.listen`；(3) 创建 TUN 设备，IP 为 `config.tun_subnet` 的网关地址（池首地址，即 `.network()` 的下一跳 `.1`），MTU 为 `config.mtu`；(4) 构造共享状态 `Arc<ServerState>`，含 `UserStore`（从 `config.users` 构造）、`Mutex<IpPool>`（从 `config.tun_subnet` 构造）、`Mutex<SessionRegistry<ConnectionHandle>>`、`Arc<AsyncDevice>`、`Arc<ServerConfig>`；(5) spawn 全局下行泵 task；(6) 进入 accept loop。`run` SHALL 在 endpoint 绑定失败或 TUN 创建失败时立即返回 `Err`。
@@ -144,7 +142,7 @@
 
 ### Requirement: 二进制入口与 CLI
 
-系统 SHALL 提供 `src/main.rs` 作为单一二进制入口，使用 `clap` derive 定义子命令 `server --config <PATH>`。`main` SHALL：(1) 初始化 `tracing_subscriber`（默认 INFO 级，env-filter 覆盖）；(2) 解析 CLI；(3) 调用 `ServerConfig::load(&path)` 加载配置；(4) 调用 `vpn::server::run(config).await`。任一步骤失败 SHALL 以非零退出码退出并打印错误。`client` 子命令 SHALL 留占位（未实现，提示用户等待后续版本）。
+系统 SHALL 提供 `src/main.rs` 作为单一二进制入口，使用 `clap` derive 定义子命令 `server --config <PATH>` 与 `client --config <PATH>`。`main` SHALL：(1) 初始化 `tracing_subscriber`（默认 INFO 级，env-filter 覆盖）；(2) 解析 CLI；(3) `server` 子命令调用 `ServerConfig::load(&path)` 后调用 `vpn::server::run(config).await`；(4) `client` 子命令调用 `ClientConfig::load(&path)`、交互式读取密码后调用 `vpn::client::run(config).await`。任一步骤失败 SHALL 以非零退出码退出并打印错误。
 
 #### Scenario: server 子命令启动运行时
 
@@ -156,7 +154,7 @@
 - **WHEN** 执行 `vpn server`（无参数）
 - **THEN** clap 打印用法错误，进程以非零退出码退出，不尝试加载任何配置
 
-#### Scenario: client 子命令提示未实现
+#### Scenario: client 子命令启动客户端运行时
 
-- **WHEN** 执行 `vpn client --config client.toml`
-- **THEN** 进程打印"client mode not yet implemented"并以非零退出码退出
+- **WHEN** 执行 `vpn client --config client.toml`（配置合法，密码交互输入正确，服务端可达）
+- **THEN** 进程进入客户端运行时，交互式提示输入密码，认证成功后建立 TUN 并转发流量；按 Ctrl+C 或连接关闭后进程退出
