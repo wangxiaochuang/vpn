@@ -1,20 +1,23 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  基于 QUIC 的 VPN（Rust，edition 2024）。
+  技术栈：quinn / rustls(aws-lc-rs) / tun-rs / tokio / prost / clap / argon2
+  架构见 doc/arch-v1.md：控制面 QUIC stream + length-prefix framing，
+  数据面 QUIC datagram 原样转发 IP 包。
+  测试策略见 AGENTS.md：四象限模型，spec 场景与 tests/ 绑定。
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+rules:
+  proposal:
+    - 必须标注涉及的测试象限（Q1/Q2/Q3/Q4）
+    - 必须列出非目标（Non-goals）
+  spec:
+    - 每个需求必须写成 Given/When/Then 格式
+    - 每个场景必须对应 tests/ 下一个自动化测试
+    - spec 文件名 = capability 名（如 ipam.md、session.md）
+  design:
+    - 涉并发的部分必须说明 cancel-safety
+    - 引入新依赖前先确认无既有方案
+  tasks:
+    - 每个任务标注所属象限
+    - Q1/Q2 任务必须含「测试先行」步骤

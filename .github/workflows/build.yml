@@ -41,6 +41,12 @@ jobs:
         run: cargo clippy --all-targets --all-features --tests --benches -- -D warnings
       - name: Execute rust tests
         run: cargo nextest run --all-features
+      - name: Coverage
+        # 分模块覆盖率策略见 AGENTS.md「测试策略」。
+        # 纯逻辑模块（ipam/framing/auth/config/ctrl 纯部分）行覆盖率门槛 100%；
+        # 模块建立后，在此添加针对具体 package 的 --fail-under-lines 门槛。
+        # 当前阶段：生成报告，不 gate。
+        run: cargo llvm-cov nextest --all-features --text
       - name: Generate a changelog
         uses: orhun/git-cliff-action@v4
         id: git-cliff
