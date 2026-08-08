@@ -11,11 +11,13 @@
     clippy::module_name_repetitions,
     clippy::must_use_candidate,
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::manual_async_fn
 )]
 
 pub mod auth;
 pub mod ctrl;
+pub mod data;
 pub mod ipam;
 pub mod route;
 
