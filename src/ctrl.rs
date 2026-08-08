@@ -1,6 +1,9 @@
+use std::net::Ipv4Addr;
 use std::time::Duration;
+use std::time::Instant;
 
-use crate::auth::AuthError;
+use crate::auth::{AuthError, UserStore};
+use crate::ipam::IpPool;
 
 pub use crate::vpn::*;
 
@@ -21,12 +24,70 @@ pub fn deny_reason_from(e: &ServerSideError) -> DenyReason {
     }
 }
 
+pub fn authenticate(
+    store: &UserStore,
+    pool: &mut IpPool,
+    req: &AuthRequest,
+) -> Result<Ipv4Addr, ServerSideError> {
+    store
+        .verify(&req.username, &req.password)
+        .map_err(ServerSideError::Auth)?;
+    pool.alloc().map_err(|_| ServerSideError::PoolExhausted)
+}
+
+#[derive(Debug)]
+pub struct HeartbeatTracker {
+    last_seen: Instant,
+}
+
+impl HeartbeatTracker {
+    pub fn new(now: Instant) -> Self {
+        Self { last_seen: now }
+    }
+
+    pub fn observe(&mut self, now: Instant) {
+        self.last_seen = now;
+    }
+
+    pub fn is_dead(&self, now: Instant) -> bool {
+        now.duration_since(self.last_seen) >= HEARTBEAT_TIMEOUT
+    }
+
+    pub fn next_deadline(&self) -> Instant {
+        self.last_seen + HEARTBEAT_TIMEOUT
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::auth::UserStore;
+    use crate::ipam::IpPool;
     use crate::vpn::control_message::Msg;
+    use argon2::password_hash::SaltString;
+    use argon2::password_hash::rand_core::OsRng;
+    use argon2::{Argon2, PasswordHasher};
+    use ipnet::Ipv4Net;
     use prost::Message;
+    use std::net::Ipv4Addr;
+    use std::time::Instant;
+
+    fn hash_password(pw: &str) -> String {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(pw.as_bytes(), &salt)
+            .unwrap()
+            .to_string()
+    }
+
+    fn alice_store() -> UserStore {
+        UserStore::from_users([("alice".to_string(), hash_password("s3cret"))]).unwrap()
+    }
+
+    fn net24() -> IpPool {
+        IpPool::new(Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 24)).unwrap()
+    }
 
     fn roundtrip(msg: &ControlMessage) -> ControlMessage {
         let buf = msg.encode_to_vec();
@@ -177,5 +238,170 @@ mod tests {
     #[test]
     fn test_max_frame_length_equals_64kib() {
         assert_eq!(MAX_FRAME_LENGTH, 65_536);
+    }
+
+    #[test]
+    fn test_authenticate_when_valid_credentials_returns_allocated_ip_and_decrements() {
+        let store = alice_store();
+        let mut pool = net24();
+        let before = pool.available_count();
+        let req = AuthRequest {
+            username: "alice".to_string(),
+            password: "s3cret".to_string(),
+        };
+        let result = authenticate(&store, &mut pool, &req);
+        assert_eq!(result, Ok(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(pool.available_count(), before - 1);
+    }
+
+    #[test]
+    fn test_authenticate_when_wrong_password_returns_auth_error_and_pool_unchanged() {
+        let store = alice_store();
+        let mut pool = net24();
+        let before = pool.available_count();
+        let req = AuthRequest {
+            username: "alice".to_string(),
+            password: "wrong".to_string(),
+        };
+        let result = authenticate(&store, &mut pool, &req);
+        assert_eq!(
+            result,
+            Err(ServerSideError::Auth(AuthError::InvalidCredentials))
+        );
+        assert_eq!(pool.available_count(), before);
+    }
+
+    #[test]
+    fn test_authenticate_when_unknown_user_returns_auth_error_and_pool_unchanged() {
+        let store = alice_store();
+        let mut pool = net24();
+        let before = pool.available_count();
+        let req = AuthRequest {
+            username: "eve".to_string(),
+            password: "anything".to_string(),
+        };
+        let result = authenticate(&store, &mut pool, &req);
+        assert_eq!(
+            result,
+            Err(ServerSideError::Auth(AuthError::InvalidCredentials))
+        );
+        assert_eq!(pool.available_count(), before);
+    }
+
+    #[test]
+    fn test_authenticate_when_empty_username_returns_auth_error_and_pool_unchanged() {
+        let store = alice_store();
+        let mut pool = net24();
+        let before = pool.available_count();
+        let req = AuthRequest {
+            username: String::new(),
+            password: "s3cret".to_string(),
+        };
+        let result = authenticate(&store, &mut pool, &req);
+        assert_eq!(
+            result,
+            Err(ServerSideError::Auth(AuthError::InvalidCredentials))
+        );
+        assert_eq!(pool.available_count(), before);
+    }
+
+    #[test]
+    fn test_authenticate_when_pool_exhausted_returns_pool_exhausted() {
+        let store = alice_store();
+        let mut pool = IpPool::new(Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 30)).unwrap();
+        pool.alloc().unwrap();
+        assert_eq!(pool.available_count(), 0);
+        let req = AuthRequest {
+            username: "alice".to_string(),
+            password: "s3cret".to_string(),
+        };
+        let result = authenticate(&store, &mut pool, &req);
+        assert_eq!(result, Err(ServerSideError::PoolExhausted));
+    }
+
+    #[test]
+    fn test_authenticate_error_maps_to_deny_reason_end_to_end() {
+        let store = alice_store();
+        let mut pool = IpPool::new(Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 30)).unwrap();
+        pool.alloc().unwrap();
+
+        let auth_err = authenticate(
+            &store,
+            &mut pool,
+            &AuthRequest {
+                username: "alice".to_string(),
+                password: "wrong".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(deny_reason_from(&auth_err), DenyReason::AuthFailed);
+
+        let pool_err = authenticate(
+            &store,
+            &mut pool,
+            &AuthRequest {
+                username: "alice".to_string(),
+                password: "s3cret".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(deny_reason_from(&pool_err), DenyReason::ServerBusy);
+    }
+
+    #[test]
+    fn test_heartbeat_tracker_is_dead_at_construction_returns_false() {
+        let t0 = Instant::now();
+        let tracker = HeartbeatTracker::new(t0);
+        assert!(!tracker.is_dead(t0));
+    }
+
+    #[test]
+    fn test_heartbeat_tracker_is_dead_just_below_timeout_returns_false() {
+        let t0 = Instant::now();
+        let tracker = HeartbeatTracker::new(t0);
+        let just_below = (t0 + HEARTBEAT_TIMEOUT)
+            .checked_sub(Duration::from_nanos(1))
+            .unwrap();
+        assert!(!tracker.is_dead(just_below));
+    }
+
+    #[test]
+    fn test_heartbeat_tracker_is_dead_at_exact_timeout_returns_true() {
+        let t0 = Instant::now();
+        let tracker = HeartbeatTracker::new(t0);
+        assert!(tracker.is_dead(t0 + HEARTBEAT_TIMEOUT));
+    }
+
+    #[test]
+    fn test_heartbeat_tracker_is_dead_beyond_timeout_returns_true() {
+        let t0 = Instant::now();
+        let tracker = HeartbeatTracker::new(t0);
+        assert!(tracker.is_dead(t0 + HEARTBEAT_TIMEOUT + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_heartbeat_tracker_observe_revives_after_death() {
+        let t0 = Instant::now();
+        let mut tracker = HeartbeatTracker::new(t0);
+        let deadline = t0 + HEARTBEAT_TIMEOUT;
+        assert!(tracker.is_dead(deadline));
+        tracker.observe(deadline);
+        assert!(!tracker.is_dead(deadline + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_heartbeat_tracker_next_deadline_equals_last_seen_plus_timeout() {
+        let t0 = Instant::now();
+        let tracker = HeartbeatTracker::new(t0);
+        assert_eq!(tracker.next_deadline(), t0 + HEARTBEAT_TIMEOUT);
+    }
+
+    #[test]
+    fn test_heartbeat_tracker_next_deadline_updates_after_observe() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(100);
+        let mut tracker = HeartbeatTracker::new(t0);
+        tracker.observe(t1);
+        assert_eq!(tracker.next_deadline(), t1 + HEARTBEAT_TIMEOUT);
     }
 }
