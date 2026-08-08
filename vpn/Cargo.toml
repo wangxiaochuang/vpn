@@ -37,3 +37,4 @@ prost-build = "0.13"
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+libc = "0.2"

@@ -5,6 +5,7 @@ use std::io;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use vpn::data::{PacketSink, PacketSource, forward};
 
 struct ChannelSource {
@@ -57,7 +58,7 @@ async fn test_forward_relays_packets_in_order_until_source_closes() {
     let result = {
         let mut source = ChannelSource { rx: src_rx };
         let mut sink = ChannelSink { tx: sink_tx };
-        forward(&mut source, &mut sink).await
+        forward(&mut source, &mut sink, &CancellationToken::new()).await
     };
     assert!(result.is_err());
 
@@ -77,7 +78,7 @@ async fn test_forward_source_first_error_forwards_no_packets() {
     let result = {
         let mut source = ChannelSource { rx: src_rx };
         let mut sink = ChannelSink { tx: sink_tx };
-        forward(&mut source, &mut sink).await
+        forward(&mut source, &mut sink, &CancellationToken::new()).await
     };
     assert!(result.is_err());
     assert!(sink_rx.recv().await.is_none());

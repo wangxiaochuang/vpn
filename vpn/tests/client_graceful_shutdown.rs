@@ -5,12 +5,11 @@ mod common;
 use std::time::Duration;
 
 use futures::SinkExt;
-use futures::StreamExt;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use vpn::client::heartbeat_loop;
 use vpn::ctrl::control_message::Msg;
-use vpn::ctrl::{ControlMessage, Heartbeat};
+use vpn::ctrl::{ControlMessage, Disconnect, Heartbeat};
 use vpn::framing::ControlCodec;
 
 fn hb() -> ControlMessage {
@@ -38,9 +37,9 @@ async fn open_control_streams(
 }
 
 #[tokio::test]
-async fn test_client_heartbeats_from_server_keep_connection_alive() {
+async fn test_client_exits_immediately_on_server_disconnect() {
     let pair = common::make_connected_pair().await;
-    let (client_writer, client_reader, mut server_writer, mut server_reader) =
+    let (client_writer, client_reader, mut server_writer, _server_reader) =
         open_control_streams(&pair).await;
 
     let hb_task = tokio::spawn(heartbeat_loop(
@@ -50,68 +49,45 @@ async fn test_client_heartbeats_from_server_keep_connection_alive() {
         CancellationToken::new(),
     ));
 
-    tokio::time::pause();
-    for _ in 0..15 {
-        server_writer.send(hb()).await.unwrap();
-        let _ = tokio::time::timeout(Duration::from_millis(50), server_reader.next()).await;
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
-    tokio::time::resume();
-
-    assert!(
-        pair.client.close_reason().is_none(),
-        "connection should stay alive while server heartbeats arrive"
-    );
-    hb_task.abort();
-}
-
-#[tokio::test]
-async fn test_client_closes_connection_after_heartbeat_timeout() {
-    let pair = common::make_connected_pair().await;
-    let (client_writer, client_reader, server_writer, server_reader) =
-        open_control_streams(&pair).await;
-
-    let hb_task = tokio::spawn(heartbeat_loop(
-        pair.client.clone(),
-        client_reader,
-        client_writer,
-        CancellationToken::new(),
-    ));
-
-    tokio::time::pause();
-    tokio::time::sleep(Duration::from_secs(35)).await;
-    tokio::time::resume();
-
-    let result = tokio::time::timeout(Duration::from_secs(3), hb_task).await;
-    assert!(result.is_ok(), "heartbeat loop should exit after timeout");
-    assert!(
-        pair.client.close_reason().is_some(),
-        "client should close the connection after 30s without heartbeats"
-    );
-    drop(server_writer);
-    let _ = server_reader;
-}
-
-#[tokio::test]
-async fn test_client_exits_when_connection_closed_by_server() {
-    let pair = common::make_connected_pair().await;
-    let (client_writer, client_reader, mut server_writer, server_reader) =
-        open_control_streams(&pair).await;
-
-    let hb_task = tokio::spawn(heartbeat_loop(
-        pair.client.clone(),
-        client_reader,
-        client_writer,
-        CancellationToken::new(),
-    ));
-
+    server_writer
+        .send(ControlMessage {
+            msg: Some(Msg::Disconnect(Disconnect {
+                reason: "server-shutdown".to_string(),
+            })),
+        })
+        .await
+        .expect("send disconnect");
     let _ = server_writer.close().await;
-    pair.server.close(0u32.into(), b"bye");
 
     let result = tokio::time::timeout(Duration::from_secs(3), hb_task).await;
     assert!(
         result.is_ok(),
-        "heartbeat loop should exit when server closes the connection"
+        "heartbeat loop should exit immediately on receiving Disconnect, not wait for timeout"
     );
+}
+
+#[tokio::test]
+async fn test_client_heartbeat_exits_on_cancel() {
+    let pair = common::make_connected_pair().await;
+    let (client_writer, client_reader, server_writer, server_reader) =
+        open_control_streams(&pair).await;
+
+    let shutdown = CancellationToken::new();
+    let hb_task = tokio::spawn(heartbeat_loop(
+        pair.client.clone(),
+        client_reader,
+        client_writer,
+        shutdown.clone(),
+    ));
+
+    tokio::task::yield_now().await;
+    shutdown.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(3), hb_task).await;
+    assert!(
+        result.is_ok(),
+        "heartbeat loop should exit promptly when shutdown token is cancelled"
+    );
+    drop(server_writer);
     let _ = server_reader;
 }

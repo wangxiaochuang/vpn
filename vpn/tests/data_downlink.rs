@@ -5,6 +5,7 @@ use std::io;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use vpn::data::{DownlinkDispatcher, PacketSource, downlink_pump};
 
 struct ChannelSource {
@@ -50,7 +51,7 @@ async fn test_downlink_pump_relays_packets_in_order_until_tun_closes() {
     let result = {
         let mut tun = ChannelSource { rx: src_rx };
         let dispatcher = RecordingDispatcher { tx: disp_tx };
-        downlink_pump(&mut tun, &dispatcher).await
+        downlink_pump(&mut tun, &dispatcher, &CancellationToken::new()).await
     };
     assert!(result.is_err());
 
@@ -78,7 +79,7 @@ async fn test_downlink_pump_keeps_running_after_dispatch_returns() {
     let result = {
         let mut tun = ChannelSource { rx: src_rx };
         let dispatcher = RecordingDispatcher { tx: disp_tx };
-        downlink_pump(&mut tun, &dispatcher).await
+        downlink_pump(&mut tun, &dispatcher, &CancellationToken::new()).await
     };
     assert!(result.is_err());
 

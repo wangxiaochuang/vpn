@@ -140,6 +140,24 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
   连接断开 (主动关闭 / 心跳超时 / 被同名新连接顶替)
     → IP 立即归还池 → 路由表与 username→连接表清除 → 数据泵停止
 
+主动关闭 (V1):
+  - 服务端 Ctrl-C/SIGTERM: 广播 CancellationToken 取消信号 → 停止 accept →
+    各 handle_conn 清理 (释放 IP、移除 registry)；心跳 task 在 cancel 分支
+    向客户端 best-effort 发送 Disconnect { reason: "server-shutdown" }；
+    endpoint.close → 等所有连接清理 (带 5s 超时保护) → 超时 abort_all 兜底退出。
+    用 JoinSet 追踪所有 handle_conn task，使关闭时可 await 全部完成。
+  - 客户端 Ctrl-C 或任一 task 结束: 广播 cancel → conn.close → 等三个 task
+    (心跳/上行/下行) 清理 (带 5s 超时保护) → 超时 abort 兜底 → endpoint.close
+    (endpoint 生命周期由 establish_connection 返回，延长到数据面结束)。
+  - 客户端在 `run()` 入口即 spawn signal watchdog 注册 SIGINT 捕获，避免密码输入期间
+    rpassword 的 raise(SIGINT) 触发 SIG_DFL 杀死进程导致终端 ISIG 残留关闭
+    (之后 Ctrl-C 只产生字节不产生信号)；密码读取用 spawn_blocking 让出 runtime
+    保证 handler 尽快注册。收到 Ctrl-C 后 watchdog 打印关闭日志并 cancel token。
+  - 客户端收到服务端 Disconnect: 心跳 task 打印原因后立即退出 (不等 30s 心跳超时)，
+    触发优雅关闭流程。
+  - 所有 select! 以 biased 优先 cancel 分支，CancellationToken.cancelled() 为
+    cancel-safe future，确保取消信号不被遗漏。
+
 重连:
   同一 username 重新连接 → 视为全新会话 → 重新分配空闲 IP
 

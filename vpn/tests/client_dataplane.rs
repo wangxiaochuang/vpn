@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use vpn::data::{PacketSink, QuinnDatagram, forward};
 
 struct ChannelSink {
@@ -41,7 +42,7 @@ async fn test_client_uplink_packet_reaches_server_side() {
     let mut source = QuinnDatagram::new(pair.server.clone());
 
     let forward_task = tokio::spawn(async move {
-        let _ = forward(&mut source, &mut sink).await;
+        let _ = forward(&mut source, &mut sink, &CancellationToken::new()).await;
     });
 
     let pkt = make_ipv4_packet([10, 0, 0, 2]);
@@ -71,7 +72,7 @@ async fn test_client_downlink_packet_reaches_client_side() {
     let mut source = QuinnDatagram::new(pair.client.clone());
 
     let forward_task = tokio::spawn(async move {
-        let _ = forward(&mut source, &mut sink).await;
+        let _ = forward(&mut source, &mut sink, &CancellationToken::new()).await;
     });
 
     let pkt = make_ipv4_packet([10, 0, 0, 5]);
@@ -100,7 +101,10 @@ async fn test_client_downlink_exits_when_connection_closed() {
     let mut sink = ChannelSink { tx };
     let mut source = QuinnDatagram::new(pair.client.clone());
 
-    let forward_task = tokio::spawn(async move { forward(&mut source, &mut sink).await });
+    let forward_task =
+        tokio::spawn(
+            async move { forward(&mut source, &mut sink, &CancellationToken::new()).await },
+        );
 
     pair.server.close(0u32.into(), b"bye");
     let result = tokio::time::timeout(Duration::from_secs(3), forward_task).await;

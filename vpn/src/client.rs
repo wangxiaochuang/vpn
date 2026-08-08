@@ -15,6 +15,7 @@ use crate::vpn::AuthOk;
 use crate::vpn::control_message::Msg;
 use futures::{SinkExt, StreamExt};
 use tokio_util::codec::{Framed, FramedParts};
+use tokio_util::sync::CancellationToken;
 
 pub struct TunSource(pub std::sync::Arc<tun_rs::AsyncDevice>);
 
@@ -117,13 +118,46 @@ fn deny_reason_text(reason: i32) -> &'static str {
     }
 }
 
-pub async fn run(config: ClientConfig) -> anyhow::Result<()> {
-    let password = rpassword::prompt_password("请输入密码：")?;
-    run_with_credentials(config, password).await
+pub fn spawn_signal_watchdog() -> CancellationToken {
+    spawn_signal_watchdog_inner().0
 }
 
-pub async fn run_with_credentials(config: ClientConfig, password: String) -> anyhow::Result<()> {
-    let (conn, framed, params) = establish_connection(&config, password).await?;
+fn spawn_signal_watchdog_inner() -> (CancellationToken, tokio::sync::oneshot::Receiver<()>) {
+    let shutdown = CancellationToken::new();
+    let ctrl_shutdown = shutdown.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        {
+            Ok(sig) => sig,
+            Err(e) => {
+                tracing::warn!("failed to register SIGINT handler: {e}");
+                return;
+            }
+        };
+        let _ = ready_tx.send(());
+        if sig.recv().await.is_some() {
+            tracing::info!("received Ctrl+C, initiating graceful shutdown");
+            ctrl_shutdown.cancel();
+        }
+    });
+    (shutdown, ready_rx)
+}
+
+pub async fn run(config: ClientConfig) -> anyhow::Result<()> {
+    let shutdown = spawn_signal_watchdog();
+    let password = tokio::task::spawn_blocking(move || rpassword::prompt_password("请输入密码："))
+        .await
+        .context("password prompt task panicked")??;
+    run_with_credentials(config, password, shutdown).await
+}
+
+pub async fn run_with_credentials(
+    config: ClientConfig,
+    password: String,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let (endpoint, conn, framed, params) = establish_connection(&config, password).await?;
     let tun = setup_tun(&params)?;
     tracing::info!(
         "authenticated as {}, assigned_ip={}, subnet={}, mtu={}",
@@ -132,13 +166,18 @@ pub async fn run_with_credentials(config: ClientConfig, password: String) -> any
         params.subnet,
         params.mtu
     );
-    run_data_plane(&conn, tun, framed).await
+    run_data_plane(&conn, tun, framed, endpoint, shutdown).await
 }
 
 async fn establish_connection(
     config: &ClientConfig,
     password: String,
-) -> anyhow::Result<(quinn::Connection, ControlFramed, ClientTunParams)> {
+) -> anyhow::Result<(
+    quinn::Endpoint,
+    quinn::Connection,
+    ControlFramed,
+    ClientTunParams,
+)> {
     let quinn_cfg = crate::tls::build_quinn_client_config(&config.ca_cert, &config.server_name)
         .context("failed to build client TLS config")?;
     let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
@@ -184,7 +223,7 @@ async fn establish_connection(
     };
 
     let params = parse_auth_ok(&ok)?;
-    Ok((conn, framed, params))
+    Ok((endpoint, conn, framed, params))
 }
 
 fn setup_tun(params: &ClientTunParams) -> anyhow::Result<std::sync::Arc<tun_rs::AsyncDevice>> {
@@ -204,6 +243,7 @@ pub async fn heartbeat_loop(
     conn: quinn::Connection,
     reader: HeartbeatReader,
     writer: HeartbeatWriter,
+    shutdown: CancellationToken,
 ) {
     let mut reader = reader;
     let mut writer = writer;
@@ -213,6 +253,9 @@ pub async fn heartbeat_loop(
     loop {
         tokio::select! {
             biased;
+            () = shutdown.cancelled() => {
+                break;
+            }
             _ = timeout_tick.tick() => {
                 if tracker.is_dead(tokio::time::Instant::now().into_std()) {
                     conn.close(0x100u32.into(), b"timeout");
@@ -232,6 +275,10 @@ pub async fn heartbeat_loop(
                     Some(Ok(crate::vpn::ControlMessage { msg: Some(Msg::Heartbeat(_)) })) => {
                         tracker.observe(tokio::time::Instant::now().into_std());
                     }
+                    Some(Ok(crate::vpn::ControlMessage { msg: Some(Msg::Disconnect(d)) })) => {
+                        tracing::info!("server disconnected: {}", d.reason);
+                        break;
+                    }
                     Some(Ok(_)) => {}
                     _ => break,
                 }
@@ -244,6 +291,8 @@ async fn run_data_plane(
     conn: &quinn::Connection,
     tun: std::sync::Arc<tun_rs::AsyncDevice>,
     framed: ControlFramed,
+    endpoint: quinn::Endpoint,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let parts = framed.into_parts();
     let control_stream = parts.io;
@@ -255,39 +304,56 @@ async fn run_data_plane(
     let reader = Framed::from_parts(reader_parts);
     let writer = Framed::new(send_stream, ControlCodec::new());
 
-    // cancel-safety: reader 与 writer 各自持有独立的 Framed，跨 await 无共享 &mut 借用；
-    // HeartbeatTracker 仅被无 await 的 timeout 分支 &mut 借用，取消无残留。
+    let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     let conn_for_hb = conn.clone();
-    let ctrl_task = tokio::spawn(heartbeat_loop(conn_for_hb, reader, writer));
+    let ctrl_shutdown = shutdown.clone();
+    tasks.spawn(async move {
+        heartbeat_loop(conn_for_hb, reader, writer, ctrl_shutdown.clone()).await;
+        ctrl_shutdown.cancel();
+    });
 
     let uplink_conn = conn.clone();
     let uplink_tun = tun.clone();
-    let uplink_task = tokio::spawn(async move {
+    let uplink_shutdown = shutdown.clone();
+    tasks.spawn(async move {
         let mut source = TunSource(uplink_tun);
         let mut sink = QuinnDatagram::new(uplink_conn.clone());
-        let _ = forward(&mut source, &mut sink).await;
+        let _ = forward(&mut source, &mut sink, &uplink_shutdown).await;
         uplink_conn.close(0x101u32.into(), b"uplink-ended");
+        uplink_shutdown.cancel();
     });
 
     let downlink_conn = conn.clone();
     let downlink_tun = tun.clone();
-    let downlink_task = tokio::spawn(async move {
+    let downlink_shutdown = shutdown.clone();
+    tasks.spawn(async move {
         let mut source = QuinnDatagram::new(downlink_conn.clone());
         let mut sink = TunSink(downlink_tun);
-        let _ = forward(&mut source, &mut sink).await;
+        let _ = forward(&mut source, &mut sink, &downlink_shutdown).await;
         downlink_conn.close(0x102u32.into(), b"downlink-ended");
+        downlink_shutdown.cancel();
     });
-
     tokio::select! {
-        _ = ctrl_task => {}
-        _ = uplink_task => {}
-        _ = downlink_task => {}
+        biased;
+        () = shutdown.cancelled() => {}
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received Ctrl+C, shutting down");
+            tracing::info!("received Ctrl+C, initiating graceful shutdown");
+            shutdown.cancel();
         }
     }
 
     conn.close(0u32.into(), b"client-shutdown");
+
+    let drain = async { while tasks.join_next().await.is_some() {} };
+    if let Ok(()) = tokio::time::timeout(Duration::from_secs(5), drain).await {
+        tracing::info!("client graceful shutdown complete");
+    } else {
+        let remaining = tasks.len();
+        tasks.abort_all();
+        tracing::warn!("client graceful shutdown timed out, aborted {remaining} remaining task(s)");
+    }
+    endpoint.close(0u32.into(), b"client-shutdown");
     Ok(())
 }
 
@@ -307,6 +373,20 @@ mod tests {
             gateway: "10.0.0.1".to_string(),
             mtu: 1280,
         }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_signal_watchdog_cancels_on_sigint() {
+        let (shutdown, ready) = spawn_signal_watchdog_inner();
+        ready
+            .await
+            .expect("watchdog should finish registering the SIGINT handler");
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGINT);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), shutdown.cancelled())
+            .await
+            .expect("watchdog should cancel the token when SIGINT is received");
     }
 
     #[test]

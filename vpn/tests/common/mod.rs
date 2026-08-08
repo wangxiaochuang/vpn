@@ -9,6 +9,7 @@ use argon2::PasswordHasher;
 use argon2::password_hash::SaltString;
 use argon2::password_hash::rand_core::OsRng;
 use ipnet::Ipv4Net;
+use tokio_util::sync::CancellationToken;
 use vpn::auth::UserStore;
 use vpn::config::ServerConfig;
 use vpn::ipam::IpPool;
@@ -183,26 +184,37 @@ pub async fn start_test_server(
     users: Vec<(String, String)>,
     subnet: Ipv4Net,
 ) -> (quinn::Endpoint, SharedState) {
+    let (endpoint, state, _shutdown) = start_test_server_with_shutdown(users, subnet).await;
+    (endpoint, state)
+}
+
+pub async fn start_test_server_with_shutdown(
+    users: Vec<(String, String)>,
+    subnet: Ipv4Net,
+) -> (quinn::Endpoint, SharedState, CancellationToken) {
     let server_cfg = vpn::tls::build_quinn_server_config(&repo("cert.pem"), &repo("key.pem"))
         .expect("server cfg");
     let endpoint = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
         .expect("server endpoint");
     let state = test_state_with_subnet(subnet, users);
 
+    let shutdown = CancellationToken::new();
     let accept_endpoint = endpoint.clone();
     let state_clone = state.clone();
+    let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
         while let Some(incoming) = accept_endpoint.accept().await {
             if let Ok(conn) = incoming.await {
                 let state = state_clone.clone();
+                let ct = shutdown_clone.clone();
                 tokio::spawn(async move {
-                    let _ = vpn::server::handle_conn(conn, state).await;
+                    let _ = vpn::server::handle_conn(conn, state, ct).await;
                 });
             }
         }
     });
 
-    (endpoint, state)
+    (endpoint, state, shutdown)
 }
 
 pub async fn test_client_connect(addr: std::net::SocketAddr) -> quinn::Connection {

@@ -61,6 +61,12 @@ echo "nat on en0 from 10.0.0.0/24 to any -> (en0)" | sudo pfctl -ef -
 4. [ ] 客户端 ping 公网 IP（如 8.8.8.8）通（验证 NAT 转发）
 5. [ ] 服务端抓包（`tcpdump -i tun0`）确认上下行包均经过 TUN
 
+### 客户端优雅关闭测试
+
+1. [ ] 客户端运行中按 Ctrl+C，确认打印 `received Ctrl+C, initiating graceful shutdown`，三个 task 清理后进程退出
+2. [ ] 客户端密码输入过程中按 Ctrl+C：进程应优雅退出（打印关闭日志）而非被信号杀死，退出后该终端按 Ctrl+C 应仍正常
+   - 排障：若终端按 Ctrl+C 无反应（`kill -INT <pid>` 却有效、按 Ctrl+C 时回显 `^C`），说明该终端 ISIG 已被残留清除；执行 `stty isig` 一次性恢复
+
 ## 连接稳定性
 
 - [ ] 客户端休眠 / 合盖 10 分钟后唤醒，连接恢复或干净断开重连

@@ -3,6 +3,7 @@ use std::io;
 use std::net::Ipv4Addr;
 
 use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 
 pub fn dst_ipv4_addr(pkt: &[u8]) -> Option<Ipv4Addr> {
     let first = *pkt.first()?;
@@ -28,9 +29,14 @@ pub trait DownlinkDispatcher {
 pub async fn forward<S: PacketSource + Unpin, K: PacketSink + Unpin>(
     source: &mut S,
     sink: &mut K,
+    cancel: &CancellationToken,
 ) -> io::Result<()> {
     loop {
-        let pkt = source.recv().await?;
+        let pkt = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(()),
+            pkt = source.recv() => pkt?,
+        };
         sink.send(pkt).await?;
     }
 }
@@ -38,9 +44,14 @@ pub async fn forward<S: PacketSource + Unpin, K: PacketSink + Unpin>(
 pub async fn downlink_pump<S: PacketSource + Unpin, D: DownlinkDispatcher>(
     tun: &mut S,
     dispatcher: &D,
+    cancel: &CancellationToken,
 ) -> io::Result<()> {
     loop {
-        let pkt = tun.recv().await?;
+        let pkt = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(()),
+            pkt = tun.recv() => pkt?,
+        };
         dispatcher.dispatch(pkt).await;
     }
 }
@@ -101,7 +112,56 @@ impl PacketSink for QuinnDatagram {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    use std::future::Future;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+
     use super::*;
+
+    struct ChannelSource {
+        rx: mpsc::Receiver<Bytes>,
+    }
+
+    impl PacketSource for ChannelSource {
+        fn recv(&mut self) -> impl Future<Output = io::Result<Bytes>> + Send {
+            async move {
+                match self.rx.recv().await {
+                    Some(b) => Ok(b),
+                    None => Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "source closed",
+                    )),
+                }
+            }
+        }
+    }
+
+    struct ChannelSink {
+        tx: mpsc::Sender<Bytes>,
+    }
+
+    impl PacketSink for ChannelSink {
+        fn send(&mut self, pkt: Bytes) -> impl Future<Output = io::Result<()>> + Send {
+            async move {
+                self.tx
+                    .send(pkt)
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "sink closed"))
+            }
+        }
+    }
+
+    struct RecordingDispatcher {
+        tx: mpsc::UnboundedSender<Bytes>,
+    }
+
+    impl DownlinkDispatcher for RecordingDispatcher {
+        fn dispatch(&self, pkt: Bytes) -> impl Future<Output = ()> + Send {
+            let _ = self.tx.send(pkt);
+            async {}
+        }
+    }
 
     fn ip_header(version_ihl: u8, dst: [u8; 4], total_len: usize) -> Vec<u8> {
         let mut pkt = vec![0u8; total_len];
@@ -143,5 +203,129 @@ mod tests {
     #[test]
     fn test_dst_ipv4_addr_empty_packet_returns_none() {
         assert_eq!(dst_ipv4_addr(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn test_forward_cancel_when_source_hanging_returns_ok() {
+        let cancel = CancellationToken::new();
+        let (src_tx, src_rx) = mpsc::channel::<Bytes>(8);
+        let (sink_tx, mut sink_rx) = mpsc::channel::<Bytes>(8);
+        let mut source = ChannelSource { rx: src_rx };
+        let mut sink = ChannelSink { tx: sink_tx };
+
+        let cancel_for_task = cancel.clone();
+        let task =
+            tokio::spawn(async move { forward(&mut source, &mut sink, &cancel_for_task).await });
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("forward should return promptly after cancel")
+            .expect("task should not panic");
+        assert!(result.is_ok(), "forward returns Ok(()) on cancel");
+        assert!(
+            sink_rx.recv().await.is_none(),
+            "no packet should be sent after cancel"
+        );
+        drop(src_tx);
+    }
+
+    #[tokio::test]
+    async fn test_forward_cancel_biased_priority_over_ready_recv() {
+        let cancel = CancellationToken::new();
+        let (src_tx, src_rx) = mpsc::channel::<Bytes>(8);
+        let (sink_tx, mut sink_rx) = mpsc::channel::<Bytes>(8);
+
+        src_tx.send(Bytes::from_static(b"P")).await.unwrap();
+        cancel.cancel();
+
+        let result = {
+            let mut source = ChannelSource { rx: src_rx };
+            let mut sink = ChannelSink { tx: sink_tx };
+            forward(&mut source, &mut sink, &cancel).await
+        };
+
+        assert!(
+            result.is_ok(),
+            "biased cancel should win over a ready packet"
+        );
+        assert!(
+            sink_rx.recv().await.is_none(),
+            "the ready packet P should be dropped, not forwarded"
+        );
+        drop(src_tx);
+    }
+
+    #[tokio::test]
+    async fn test_forward_uncancelled_relays_packets_until_source_error() {
+        let cancel = CancellationToken::new();
+        let (src_tx, src_rx) = mpsc::channel::<Bytes>(8);
+        let (sink_tx, mut sink_rx) = mpsc::channel::<Bytes>(8);
+
+        src_tx.send(Bytes::from_static(b"p1")).await.unwrap();
+        src_tx.send(Bytes::from_static(b"p2")).await.unwrap();
+        drop(src_tx);
+
+        let result = {
+            let mut source = ChannelSource { rx: src_rx };
+            let mut sink = ChannelSink { tx: sink_tx };
+            forward(&mut source, &mut sink, &cancel).await
+        };
+        assert!(result.is_err());
+
+        assert_eq!(sink_rx.recv().await.unwrap(), Bytes::from_static(b"p1"));
+        assert_eq!(sink_rx.recv().await.unwrap(), Bytes::from_static(b"p2"));
+        assert!(sink_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_downlink_pump_cancel_when_tun_hanging_returns_ok() {
+        let cancel = CancellationToken::new();
+        let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(8);
+        let (disp_tx, mut disp_rx) = mpsc::unbounded_channel::<Bytes>();
+        let mut tun = ChannelSource { rx: tun_rx };
+        let dispatcher = RecordingDispatcher { tx: disp_tx };
+
+        let cancel_for_task = cancel.clone();
+        let task =
+            tokio::spawn(
+                async move { downlink_pump(&mut tun, &dispatcher, &cancel_for_task).await },
+            );
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("downlink_pump should return promptly after cancel")
+            .expect("task should not panic");
+        assert!(result.is_ok(), "downlink_pump returns Ok(()) on cancel");
+        assert!(
+            disp_rx.recv().await.is_none(),
+            "no packet should be dispatched after cancel"
+        );
+        drop(tun_tx);
+    }
+
+    #[tokio::test]
+    async fn test_downlink_pump_uncancelled_relays_until_tun_error() {
+        let cancel = CancellationToken::new();
+        let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(8);
+        let (disp_tx, mut disp_rx) = mpsc::unbounded_channel::<Bytes>();
+
+        tun_tx.send(Bytes::from_static(b"p1")).await.unwrap();
+        drop(tun_tx);
+
+        let result = {
+            let mut tun = ChannelSource { rx: tun_rx };
+            let dispatcher = RecordingDispatcher { tx: disp_tx };
+            downlink_pump(&mut tun, &dispatcher, &cancel).await
+        };
+        assert!(result.is_err());
+
+        assert_eq!(disp_rx.recv().await.unwrap(), Bytes::from_static(b"p1"));
+        assert!(disp_rx.recv().await.is_none());
     }
 }

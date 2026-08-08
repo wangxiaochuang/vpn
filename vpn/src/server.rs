@@ -17,10 +17,11 @@ use crate::ipam::IpPool;
 use crate::route::SessionRegistry;
 use crate::tun_setup::gateway_addr;
 use crate::vpn::control_message::Msg;
-use crate::vpn::{AuthDenied, AuthOk, ControlMessage, Heartbeat};
+use crate::vpn::{AuthDenied, AuthOk, ControlMessage, Disconnect, Heartbeat};
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::codec::{Framed, FramedParts};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 pub struct ConnectionHandle {
@@ -171,7 +172,11 @@ impl DownlinkDispatcher for RegistryDispatcher {
 }
 
 #[allow(clippy::too_many_lines)]
-pub async fn handle_conn(conn: quinn::Connection, state: SharedState) -> anyhow::Result<()> {
+pub async fn handle_conn(
+    conn: quinn::Connection,
+    state: SharedState,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
     let (send, recv) = conn
         .accept_bi()
         .await
@@ -264,6 +269,7 @@ pub async fn handle_conn(conn: quinn::Connection, state: SharedState) -> anyhow:
     let mut writer = Framed::new(send_stream, ControlCodec::new());
 
     let conn_for_hb = conn.clone();
+    let shutdown_for_hb = shutdown.clone();
     let ctrl_task = tokio::spawn(async move {
         let mut tracker = HeartbeatTracker::new(tokio::time::Instant::now().into_std());
         let mut send_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -271,6 +277,15 @@ pub async fn handle_conn(conn: quinn::Connection, state: SharedState) -> anyhow:
         loop {
             tokio::select! {
                 biased;
+                () = shutdown_for_hb.cancelled() => {
+                    let disconnect = ControlMessage {
+                        msg: Some(Msg::Disconnect(Disconnect {
+                            reason: "server-shutdown".to_string(),
+                        })),
+                    };
+                    let _ = writer.send(disconnect).await;
+                    break;
+                }
                 _ = timeout_tick.tick() => {
                     if tracker.is_dead(tokio::time::Instant::now().into_std()) {
                         conn_for_hb.close(0x100u32.into(), b"timeout");
@@ -300,10 +315,11 @@ pub async fn handle_conn(conn: quinn::Connection, state: SharedState) -> anyhow:
 
     let uplink_task = if let Some(tun) = state.tun.clone() {
         let conn_for_uplink = conn.clone();
+        let shutdown_for_uplink = shutdown.clone();
         Some(tokio::spawn(async move {
             let mut source = QuinnDatagram::new(conn_for_uplink.clone());
             let mut sink = TunSink(tun);
-            let _ = forward(&mut source, &mut sink).await;
+            let _ = forward(&mut source, &mut sink, &shutdown_for_uplink).await;
             conn_for_uplink.close(0x101u32.into(), b"uplink-ended");
         }))
     } else {
@@ -361,37 +377,66 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let dispatcher = RegistryDispatcher {
         state: state.clone(),
     };
+    let shutdown = CancellationToken::new();
+    let downlink_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut src = downlink_tun;
-        let _ = downlink_pump(&mut src, &dispatcher).await;
+        let _ = downlink_pump(&mut src, &dispatcher, &downlink_shutdown).await;
     });
+
+    let mut conn_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     let accept_endpoint = endpoint.clone();
     let accept_state = state.clone();
-    let accept_loop = async move {
-        while let Some(incoming) = accept_endpoint.accept().await {
-            match incoming.await {
-                Ok(conn) => {
-                    let st = accept_state.clone();
-                    tokio::spawn(async move {
-                        let _ = handle_conn(conn, st).await;
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("connection accept error: {e}");
+    let accept_shutdown = shutdown.clone();
+    let accept_loop = async {
+        loop {
+            tokio::select! {
+                biased;
+                () = accept_shutdown.cancelled() => break,
+                incoming = accept_endpoint.accept() => {
+                    match incoming {
+                        Some(incoming) => match incoming.await {
+                            Ok(conn) => {
+                                let st = accept_state.clone();
+                                let ct = accept_shutdown.clone();
+                                conn_set.spawn(async move {
+                                    let _ = handle_conn(conn, st, ct).await;
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!("connection accept error: {e}");
+                            }
+                        },
+                        None => break,
+                    }
                 }
             }
         }
     };
 
     tokio::select! {
-        () = accept_loop => {}
+        () = accept_loop => {
+            tracing::info!("accept loop ended");
+            shutdown.cancel();
+        }
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received Ctrl+C, shutting down");
+            tracing::info!("received Ctrl+C, initiating graceful shutdown");
+            shutdown.cancel();
         }
     }
 
     endpoint.close(0u32.into(), b"shutdown");
+
+    let drain = async { while conn_set.join_next().await.is_some() {} };
+    if let Ok(()) = tokio::time::timeout(Duration::from_secs(5), drain).await {
+        tracing::info!("graceful shutdown complete");
+    } else {
+        let remaining = conn_set.len();
+        conn_set.abort_all();
+        tracing::warn!("graceful shutdown timed out, aborted {remaining} remaining task(s)");
+    }
+
     Ok(())
 }
 
