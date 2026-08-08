@@ -22,6 +22,29 @@ pub struct IpPool {
     bits: Vec<u64>,
 }
 
+fn build_reserved_bits(total: u32) -> Vec<u64> {
+    let broadcast_off = total - 1;
+    let word_count = total.div_ceil(64);
+    (0..word_count)
+        .map(|w| build_reserved_word(w * 64, total, broadcast_off))
+        .collect()
+}
+
+fn build_reserved_word(base: u32, total: u32, broadcast_off: u32) -> u64 {
+    let mut word = 0u64;
+    for bit in 0..64u32 {
+        let off = base + bit;
+        if off >= total {
+            word |= u64::MAX << bit;
+            break;
+        }
+        if off == 0 || off == 1 || off == broadcast_off {
+            word |= 1u64 << bit;
+        }
+    }
+    word
+}
+
 impl IpPool {
     pub fn new(subnet: Ipv4Net) -> Result<Self, IpPoolError> {
         let prefix = subnet.prefix_len();
@@ -29,26 +52,8 @@ impl IpPool {
             return Err(IpPoolError::InvalidSubnet);
         }
         let total = 1u32 << (32u8 - prefix);
-        let broadcast_off = total - 1;
-        let word_count = total.div_ceil(64);
         let network = u32::from(subnet.network());
-        let bits: Vec<u64> = (0..word_count)
-            .map(|w| {
-                let base = w * 64;
-                let mut word = 0u64;
-                for bit in 0..64u32 {
-                    let off = base + bit;
-                    if off >= total {
-                        word |= u64::MAX << bit;
-                        break;
-                    }
-                    if off == 0 || off == 1 || off == broadcast_off {
-                        word |= 1u64 << bit;
-                    }
-                }
-                word
-            })
-            .collect();
+        let bits = build_reserved_bits(total);
         Ok(Self {
             network,
             total,

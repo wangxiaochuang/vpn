@@ -17,32 +17,34 @@ pub fn create_client_tun(
     subnet: Ipv4Net,
     mtu: u16,
 ) -> io::Result<tun_rs::AsyncDevice> {
+    build_client_device(assigned_ip, subnet, mtu).build_async()
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+fn build_client_device(assigned_ip: Ipv4Addr, subnet: Ipv4Net, mtu: u16) -> DeviceBuilder {
     let gateway = gateway_addr(subnet);
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))]
-    {
-        DeviceBuilder::new()
-            .ipv4(assigned_ip, subnet.prefix_len(), Some(gateway))
-            .mtu(mtu)
-            .associate_route(true)
-            .build_async()
-    }
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    )))]
-    {
-        DeviceBuilder::new()
-            .ipv4(assigned_ip, subnet.prefix_len(), Some(gateway))
-            .mtu(mtu)
-            .build_async()
-    }
+    DeviceBuilder::new()
+        .ipv4(assigned_ip, subnet.prefix_len(), Some(gateway))
+        .mtu(mtu)
+        .associate_route(true)
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+)))]
+fn build_client_device(assigned_ip: Ipv4Addr, subnet: Ipv4Net, mtu: u16) -> DeviceBuilder {
+    let gateway = gateway_addr(subnet);
+    DeviceBuilder::new()
+        .ipv4(assigned_ip, subnet.prefix_len(), Some(gateway))
+        .mtu(mtu)
 }
 
 pub fn gateway_addr(subnet: Ipv4Net) -> Ipv4Addr {

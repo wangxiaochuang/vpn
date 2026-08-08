@@ -374,12 +374,16 @@ mod tests {
         assert_eq!(result, Err(ServerSideError::PoolExhausted));
     }
 
-    #[test]
-    fn test_authenticate_error_maps_to_deny_reason_end_to_end() {
-        let store = alice_store();
+    fn exhausted_pool() -> IpPool {
         let mut pool = IpPool::new(Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 30)).unwrap();
         pool.alloc().unwrap();
+        pool
+    }
 
+    #[test]
+    fn test_authenticate_wrong_password_maps_to_auth_failed_deny_reason() {
+        let store = alice_store();
+        let mut pool = exhausted_pool();
         let auth_err = authenticate(
             &store,
             &mut pool,
@@ -390,7 +394,12 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(deny_reason_from(&auth_err), DenyReason::AuthFailed);
+    }
 
+    #[test]
+    fn test_authenticate_pool_exhausted_maps_to_server_busy_deny_reason() {
+        let store = alice_store();
+        let mut pool = exhausted_pool();
         let pool_err = authenticate(
             &store,
             &mut pool,

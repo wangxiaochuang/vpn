@@ -24,6 +24,7 @@ pub mod framing;
 pub mod ipam;
 pub mod route;
 pub mod server;
+pub mod shutdown;
 pub mod tls;
 pub mod tun_setup;
 

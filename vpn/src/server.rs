@@ -352,16 +352,32 @@ pub async fn handle_conn(
 }
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
+    let endpoint = build_server_endpoint(&config)?;
+    let tun = Arc::new(crate::tun_setup::create_tun(config.tun_subnet, config.mtu)?);
+    let state = build_server_state(config, tun.clone())?;
+    let shutdown = CancellationToken::new();
+    spawn_downlink(tun, state.clone(), shutdown.clone());
+    let mut conn_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    accept_connections(&endpoint, state, shutdown.clone(), &mut conn_set).await;
+    endpoint.close(0u32.into(), b"shutdown");
+    crate::shutdown::drain_with_timeout(&mut conn_set, Duration::from_secs(5), "server").await;
+    Ok(())
+}
+
+fn build_server_endpoint(config: &ServerConfig) -> anyhow::Result<quinn::Endpoint> {
     let quinn_cfg = crate::tls::build_quinn_server_config(&config.cert, &config.key)?;
     let endpoint = quinn::Endpoint::server(quinn_cfg, config.listen)?;
     tracing::info!(
         "listening on {}",
         endpoint.local_addr().unwrap_or(config.listen)
     );
+    Ok(endpoint)
+}
 
-    let tun_device = crate::tun_setup::create_tun(config.tun_subnet, config.mtu)?;
-    let tun = Arc::new(tun_device);
-
+fn build_server_state(
+    config: ServerConfig,
+    tun: Arc<tun_rs::AsyncDevice>,
+) -> anyhow::Result<SharedState> {
     let user_pairs: Vec<(String, String)> = config
         .users
         .iter()
@@ -370,80 +386,87 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let users = UserStore::from_users(user_pairs)?;
     let pool = IpPool::new(config.tun_subnet)?;
     let registry = SessionRegistry::new();
-
-    let state: SharedState = Arc::new(ServerState {
+    Ok(Arc::new(ServerState {
         users,
         pool: std::sync::Mutex::new(pool),
         registry: std::sync::Mutex::new(registry),
-        tun: Some(tun.clone()),
+        tun: Some(tun),
         config: Arc::new(config),
-    });
+    }))
+}
 
+fn spawn_downlink(tun: Arc<tun_rs::AsyncDevice>, state: SharedState, shutdown: CancellationToken) {
     let downlink_tun = TunSource(tun);
-    let dispatcher = RegistryDispatcher {
-        state: state.clone(),
-    };
-    let shutdown = CancellationToken::new();
-    let downlink_shutdown = shutdown.clone();
+    let dispatcher = RegistryDispatcher { state };
     tokio::spawn(async move {
         let mut src = downlink_tun;
-        let _ = downlink_pump(&mut src, &dispatcher, &downlink_shutdown).await;
+        let _ = downlink_pump(&mut src, &dispatcher, &shutdown).await;
     });
+}
 
-    let mut conn_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-
+async fn accept_connections(
+    endpoint: &quinn::Endpoint,
+    state: SharedState,
+    shutdown: CancellationToken,
+    conn_set: &mut tokio::task::JoinSet<()>,
+) {
     let accept_endpoint = endpoint.clone();
-    let accept_state = state.clone();
     let accept_shutdown = shutdown.clone();
-    let accept_loop = async {
-        loop {
-            tokio::select! {
-                biased;
-                () = accept_shutdown.cancelled() => break,
-                incoming = accept_endpoint.accept() => {
-                    match incoming {
-                        Some(incoming) => match incoming.await {
-                            Ok(conn) => {
-                                let st = accept_state.clone();
-                                let ct = accept_shutdown.clone();
-                                conn_set.spawn(async move {
-                                    let _ = handle_conn(conn, st, ct).await;
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!("connection accept error: {e}");
-                            }
-                        },
-                        None => break,
-                    }
-                }
-            }
-        }
-    };
-
+    let accept_loop = run_accept_loop(&accept_endpoint, &state, &accept_shutdown, conn_set);
     tokio::select! {
-        () = accept_loop => {
-            tracing::info!("accept loop ended");
-            shutdown.cancel();
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received Ctrl+C, initiating graceful shutdown");
-            shutdown.cancel();
+        () = accept_loop => tracing::info!("accept loop ended"),
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    tracing::info!("initiating graceful shutdown");
+    shutdown.cancel();
+}
+
+async fn run_accept_loop(
+    endpoint: &quinn::Endpoint,
+    state: &SharedState,
+    shutdown: &CancellationToken,
+    conn_set: &mut tokio::task::JoinSet<()>,
+) {
+    loop {
+        if !accept_one(endpoint, state, shutdown, conn_set).await {
+            break;
         }
     }
+}
 
-    endpoint.close(0u32.into(), b"shutdown");
-
-    let drain = async { while conn_set.join_next().await.is_some() {} };
-    if let Ok(()) = tokio::time::timeout(Duration::from_secs(5), drain).await {
-        tracing::info!("graceful shutdown complete");
-    } else {
-        let remaining = conn_set.len();
-        conn_set.abort_all();
-        tracing::warn!("graceful shutdown timed out, aborted {remaining} remaining task(s)");
+async fn accept_one(
+    endpoint: &quinn::Endpoint,
+    state: &SharedState,
+    shutdown: &CancellationToken,
+    conn_set: &mut tokio::task::JoinSet<()>,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => false,
+        incoming = endpoint.accept() => {
+            match incoming {
+                Some(incoming) => match incoming.await {
+                    Ok(conn) => spawn_handle_conn(conn, state, shutdown, conn_set),
+                    Err(e) => tracing::warn!("connection accept error: {e}"),
+                },
+                None => return false,
+            }
+            true
+        }
     }
+}
 
-    Ok(())
+fn spawn_handle_conn(
+    conn: quinn::Connection,
+    state: &SharedState,
+    shutdown: &CancellationToken,
+    conn_set: &mut tokio::task::JoinSet<()>,
+) {
+    let st = state.clone();
+    let ct = shutdown.clone();
+    conn_set.spawn(async move {
+        let _ = handle_conn(conn, st, ct).await;
+    });
 }
 
 #[cfg(test)]
@@ -505,38 +528,10 @@ mod tests {
     }
 
     async fn make_client_conns(n: usize) -> Vec<quinn::Connection> {
-        let cert = repo("cert.pem");
-        let key = repo("key.pem");
-        let server_cfg = crate::tls::build_quinn_server_config(&cert, &key).expect("server cfg");
-        let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
-            .expect("server endpoint");
-
-        let server_for_accept = server.clone();
-        tokio::spawn(async move {
-            while let Some(incoming) = server_for_accept.accept().await {
-                let _ = incoming.accept().map(|c| {
-                    tokio::spawn(async move {
-                        let _ = c.await;
-                    });
-                });
-            }
-        });
-
-        let rustls_client = rustls::ClientConfig::builder_with_provider(StdArc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(StdArc::new(NoVerify))
-        .with_no_client_auth();
-        let quic_client =
-            quinn::crypto::rustls::QuicClientConfig::try_from(StdArc::new(rustls_client)).unwrap();
-        let client_cfg = quinn::ClientConfig::new(StdArc::new(quic_client));
-
+        let server = build_test_server();
+        let client_cfg = build_no_verify_client_config();
         let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = server.local_addr().unwrap();
-
         let mut conns = Vec::new();
         for _ in 0..n {
             let conn = client
@@ -547,6 +542,39 @@ mod tests {
             conns.push(conn);
         }
         conns
+    }
+
+    fn build_test_server() -> quinn::Endpoint {
+        let cert = repo("cert.pem");
+        let key = repo("key.pem");
+        let server_cfg = crate::tls::build_quinn_server_config(&cert, &key).expect("server cfg");
+        let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
+            .expect("server endpoint");
+        let server_for_accept = server.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = server_for_accept.accept().await {
+                let _ = incoming.accept().map(|c| {
+                    tokio::spawn(async move {
+                        let _ = c.await;
+                    });
+                });
+            }
+        });
+        server
+    }
+
+    fn build_no_verify_client_config() -> quinn::ClientConfig {
+        let rustls_client = rustls::ClientConfig::builder_with_provider(StdArc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(StdArc::new(NoVerify))
+        .with_no_client_auth();
+        let quic_client =
+            quinn::crypto::rustls::QuicClientConfig::try_from(StdArc::new(rustls_client)).unwrap();
+        quinn::ClientConfig::new(StdArc::new(quic_client))
     }
 
     #[tokio::test]

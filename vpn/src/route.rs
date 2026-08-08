@@ -37,35 +37,40 @@ impl<H: Clone + Eq + Hash> SessionRegistry<H> {
         ip: Ipv4Addr,
         handle: H,
     ) -> Result<Option<Evicted<H>>, RouteError> {
-        if let Some(existing) = self.by_ip.get(&ip) {
-            let belongs_to_username = self
-                .by_username
-                .get(username)
-                .is_some_and(|h| h == existing);
-            if !belongs_to_username {
-                return Err(RouteError::IpInUse(ip));
-            }
-        }
-
-        let evicted = if let Some(old_handle) = self.by_username.remove(username) {
-            let old_ip = self
-                .by_ip
-                .iter()
-                .find_map(|(k, v)| (v == &old_handle).then_some(*k))
-                .unwrap_or(ip);
-            self.by_ip.remove(&old_ip);
-            Some(Evicted {
-                ip: old_ip,
-                handle: old_handle,
-            })
-        } else {
-            None
-        };
-
+        self.ensure_ip_not_conflicting(username, ip)?;
+        let evicted = self.evict_old_session(username, ip);
         self.by_ip.insert(ip, handle.clone());
         self.by_username.insert(username.to_string(), handle);
-
         Ok(evicted)
+    }
+
+    fn ensure_ip_not_conflicting(&self, username: &str, ip: Ipv4Addr) -> Result<(), RouteError> {
+        let Some(existing) = self.by_ip.get(&ip) else {
+            return Ok(());
+        };
+        let belongs_to_username = self
+            .by_username
+            .get(username)
+            .is_some_and(|h| h == existing);
+        if belongs_to_username {
+            Ok(())
+        } else {
+            Err(RouteError::IpInUse(ip))
+        }
+    }
+
+    fn evict_old_session(&mut self, username: &str, fallback_ip: Ipv4Addr) -> Option<Evicted<H>> {
+        let old_handle = self.by_username.remove(username)?;
+        let old_ip = self
+            .by_ip
+            .iter()
+            .find_map(|(k, v)| (v == &old_handle).then_some(*k))
+            .unwrap_or(fallback_ip);
+        self.by_ip.remove(&old_ip);
+        Some(Evicted {
+            ip: old_ip,
+            handle: old_handle,
+        })
     }
 
     pub fn lookup(&self, ip: Ipv4Addr) -> Option<&H> {
@@ -113,31 +118,36 @@ impl<H: Clone + Eq + Hash> Default for SessionRegistry<H> {
 pub fn ensure_subnet_route(dev_name: &str, subnet: Ipv4Net) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let status = std::process::Command::new("ip")
-            .args(["route", "add", &subnet.to_string(), "dev", dev_name])
-            .status()?;
-        if status.success() {
-            return Ok(());
-        }
-        let output = std::process::Command::new("ip")
-            .args(["route", "show", "to", &subnet.to_string(), "dev", dev_name])
-            .output()?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "failed to add route {subnet} dev {dev_name}: ip exited with {}",
-                    status.code().unwrap_or(-1)
-                ),
-            ))
-        }
+        add_route_or_verify(dev_name, subnet)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (dev_name, subnet);
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn add_route_or_verify(dev_name: &str, subnet: Ipv4Net) -> io::Result<()> {
+    let status = std::process::Command::new("ip")
+        .args(["route", "add", &subnet.to_string(), "dev", dev_name])
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    let output = std::process::Command::new("ip")
+        .args(["route", "show", "to", &subnet.to_string(), "dev", dev_name])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "failed to add route {subnet} dev {dev_name}: ip exited with {}",
+                status.code().unwrap_or(-1)
+            ),
+        ))
     }
 }
 

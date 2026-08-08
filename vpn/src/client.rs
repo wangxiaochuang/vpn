@@ -78,6 +78,20 @@ pub enum ClientError {
 }
 
 pub fn parse_auth_ok(ok: &AuthOk) -> Result<ClientTunParams, ClientError> {
+    let (assigned_ip, gateway, subnet) = parse_endpoint_addrs(ok)?;
+    let mtu = validate_mtu(ok.mtu)?;
+    validate_gateway(gateway, subnet)?;
+    let routes = parse_routes(&ok.routes)?;
+    Ok(ClientTunParams {
+        assigned_ip,
+        subnet,
+        gateway,
+        mtu,
+        routes,
+    })
+}
+
+fn parse_endpoint_addrs(ok: &AuthOk) -> Result<(Ipv4Addr, Ipv4Addr, Ipv4Net), ClientError> {
     let assigned_ip: Ipv4Addr = ok
         .assigned_ip
         .parse()
@@ -90,36 +104,38 @@ pub fn parse_auth_ok(ok: &AuthOk) -> Result<ClientTunParams, ClientError> {
         .subnet
         .parse()
         .map_err(|_| ClientError::InvalidSubnet(ok.subnet.clone()))?;
+    Ok((assigned_ip, gateway, subnet))
+}
 
-    if ok.mtu < u32::from(MIN_MTU) {
-        return Err(ClientError::MtuTooSmall(ok.mtu));
+fn validate_mtu(raw: u32) -> Result<u16, ClientError> {
+    if raw < u32::from(MIN_MTU) {
+        return Err(ClientError::MtuTooSmall(raw));
     }
-    if ok.mtu > u32::from(u16::MAX) {
-        return Err(ClientError::MtuTooLarge(ok.mtu));
+    if raw > u32::from(u16::MAX) {
+        return Err(ClientError::MtuTooLarge(raw));
     }
-    let mtu = u16::try_from(ok.mtu).map_err(|_| ClientError::MtuTooLarge(ok.mtu))?;
+    u16::try_from(raw).map_err(|_| ClientError::MtuTooLarge(raw))
+}
+
+fn validate_gateway(gateway: Ipv4Addr, subnet: Ipv4Net) -> Result<(), ClientError> {
     if !subnet.contains(&gateway) {
         return Err(ClientError::GatewayOutsideSubnet(gateway, subnet));
     }
     if gateway == subnet.network() {
         return Err(ClientError::GatewayIsNetworkAddr(gateway));
     }
+    Ok(())
+}
 
-    let mut routes = Vec::with_capacity(ok.routes.len());
-    for r in &ok.routes {
+fn parse_routes(raw: &[String]) -> Result<Vec<Ipv4Net>, ClientError> {
+    let mut routes = Vec::with_capacity(raw.len());
+    for r in raw {
         let net: Ipv4Net = r
             .parse()
             .map_err(|_| ClientError::InvalidRoute(r.clone()))?;
         routes.push(net);
     }
-
-    Ok(ClientTunParams {
-        assigned_ip,
-        subnet,
-        gateway,
-        mtu,
-        routes,
-    })
+    Ok(routes)
 }
 
 fn deny_reason_text(reason: i32) -> &'static str {
@@ -190,52 +206,80 @@ async fn establish_connection(
     ControlFramed,
     ClientTunParams,
 )> {
-    let quinn_cfg = crate::tls::build_quinn_client_config(&config.ca_cert, &config.server_name)
-        .context("failed to build client TLS config")?;
-    let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    let endpoint = connect_quic()?;
     let conn = endpoint
-        .connect_with(quinn_cfg, config.server, &config.server_name)
+        .connect_with(
+            crate::tls::build_quinn_client_config(&config.ca_cert, &config.server_name)
+                .context("failed to build client TLS config")?,
+            config.server,
+            &config.server_name,
+        )
         .context("failed to initiate QUIC connection")?
         .await
         .context("failed to connect to server")?;
-
     tracing::info!("connected to {}", config.server);
+    let mut framed = open_control_stream(&conn).await?;
+    let params = authenticate(&mut framed, &config.username, password).await?;
+    Ok((endpoint, conn, framed, params))
+}
 
+fn connect_quic() -> anyhow::Result<quinn::Endpoint> {
+    quinn::Endpoint::client("0.0.0.0:0".parse()?).context("failed to bind client endpoint")
+}
+
+async fn open_control_stream(conn: &quinn::Connection) -> anyhow::Result<ControlFramed> {
     let (send, recv) = conn
         .open_bi()
         .await
         .context("failed to open control stream")?;
-    let mut framed = Framed::new(ControlStream::new(send, recv), ControlCodec::new());
+    Ok(Framed::new(
+        ControlStream::new(send, recv),
+        ControlCodec::new(),
+    ))
+}
 
-    framed
-        .send(crate::vpn::ControlMessage {
-            msg: Some(Msg::AuthRequest(crate::vpn::AuthRequest {
-                username: config.username.clone(),
-                password,
-            })),
-        })
-        .await
-        .context("failed to send AuthRequest")?;
-
+async fn authenticate(
+    framed: &mut ControlFramed,
+    username: &str,
+    password: String,
+) -> anyhow::Result<ClientTunParams> {
+    send_auth_request(framed, username, password).await?;
     let first = framed
         .next()
         .await
         .ok_or_else(|| anyhow!("control stream closed before AuthOk"))?
         .context("failed to decode first response")?;
+    interpret_auth_response(first)
+}
 
-    let Some(Msg::AuthOk(ok)) = first.msg else {
-        if let Some(Msg::AuthDenied(denied)) = first.msg {
+async fn send_auth_request(
+    framed: &mut ControlFramed,
+    username: &str,
+    password: String,
+) -> anyhow::Result<()> {
+    framed
+        .send(crate::vpn::ControlMessage {
+            msg: Some(Msg::AuthRequest(crate::vpn::AuthRequest {
+                username: username.to_string(),
+                password,
+            })),
+        })
+        .await
+        .context("failed to send AuthRequest")
+}
+
+fn interpret_auth_response(first: crate::vpn::ControlMessage) -> anyhow::Result<ClientTunParams> {
+    match first.msg {
+        Some(Msg::AuthOk(ok)) => parse_auth_ok(&ok).map_err(Into::into),
+        Some(Msg::AuthDenied(denied)) => {
             let reason = deny_reason_text(denied.reason);
             tracing::error!("{reason}");
-            return Err(ClientError::AuthDenied(reason.to_string()).into());
+            Err(ClientError::AuthDenied(reason.to_string()).into())
         }
-        return Err(
+        _ => Err(
             ClientError::Protocol("expected AuthOk but got an unexpected message".into()).into(),
-        );
-    };
-
-    let params = parse_auth_ok(&ok)?;
-    Ok((endpoint, conn, framed, params))
+        ),
+    }
 }
 
 fn setup_tun(params: &ClientTunParams) -> anyhow::Result<std::sync::Arc<tun_rs::AsyncDevice>> {
@@ -264,39 +308,54 @@ pub async fn heartbeat_loop(
     let mut send_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut timeout_tick = tokio::time::interval(Duration::from_secs(1));
     loop {
-        tokio::select! {
+        let should_break = tokio::select! {
             biased;
-            () = shutdown.cancelled() => {
-                break;
-            }
-            _ = timeout_tick.tick() => {
-                if tracker.is_dead(tokio::time::Instant::now().into_std()) {
-                    conn.close(0x100u32.into(), b"timeout");
-                    break;
-                }
-            }
-            _ = send_tick.tick() => {
-                let hb = crate::vpn::ControlMessage {
-                    msg: Some(Msg::Heartbeat(crate::vpn::Heartbeat {})),
-                };
-                if writer.send(hb).await.is_err() {
-                    break;
-                }
-            }
-            msg = reader.next() => {
-                match msg {
-                    Some(Ok(crate::vpn::ControlMessage { msg: Some(Msg::Heartbeat(_)) })) => {
-                        tracker.observe(tokio::time::Instant::now().into_std());
-                    }
-                    Some(Ok(crate::vpn::ControlMessage { msg: Some(Msg::Disconnect(d)) })) => {
-                        tracing::info!("server disconnected: {}", d.reason);
-                        break;
-                    }
-                    Some(Ok(_)) => {}
-                    _ => break,
-                }
-            }
+            () = shutdown.cancelled() => true,
+            _ = timeout_tick.tick() => close_if_dead(&conn, &tracker),
+            _ = send_tick.tick() => send_heartbeat(&mut writer).await.is_err(),
+            msg = reader.next() => !handle_heartbeat_msg(msg, &mut tracker),
+        };
+        if should_break {
+            break;
         }
+    }
+}
+
+fn close_if_dead(conn: &quinn::Connection, tracker: &HeartbeatTracker) -> bool {
+    if tracker.is_dead(tokio::time::Instant::now().into_std()) {
+        conn.close(0x100u32.into(), b"timeout");
+        true
+    } else {
+        false
+    }
+}
+
+async fn send_heartbeat(writer: &mut HeartbeatWriter) -> Result<(), ()> {
+    let hb = crate::vpn::ControlMessage {
+        msg: Some(Msg::Heartbeat(crate::vpn::Heartbeat {})),
+    };
+    writer.send(hb).await.map_err(|_| ())
+}
+
+fn handle_heartbeat_msg<E>(
+    msg: Option<std::result::Result<crate::vpn::ControlMessage, E>>,
+    tracker: &mut HeartbeatTracker,
+) -> bool {
+    match msg {
+        Some(Ok(crate::vpn::ControlMessage {
+            msg: Some(Msg::Heartbeat(_)),
+        })) => {
+            tracker.observe(tokio::time::Instant::now().into_std());
+            true
+        }
+        Some(Ok(crate::vpn::ControlMessage {
+            msg: Some(Msg::Disconnect(d)),
+        })) => {
+            tracing::info!("server disconnected: {}", d.reason);
+            false
+        }
+        Some(Ok(_)) => true,
+        _ => false,
     }
 }
 
@@ -307,46 +366,81 @@ async fn run_data_plane(
     endpoint: quinn::Endpoint,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
+    let (reader, writer) = split_control_stream(framed);
+    let mut tasks = spawn_data_tasks(conn, tun, reader, writer, &shutdown);
+    wait_for_shutdown(&shutdown).await;
+    conn.close(0u32.into(), b"client-shutdown");
+    crate::shutdown::drain_with_timeout(&mut tasks, Duration::from_secs(5), "client").await;
+    endpoint.close(0u32.into(), b"client-shutdown");
+    Ok(())
+}
+
+fn split_control_stream(framed: ControlFramed) -> (HeartbeatReader, HeartbeatWriter) {
     let parts = framed.into_parts();
     let control_stream = parts.io;
     let read_buf = parts.read_buf;
     let (send_stream, recv_stream) = control_stream.into_parts();
-
     let mut reader_parts = FramedParts::new(recv_stream, ControlCodec::new());
     reader_parts.read_buf = read_buf;
     let reader = Framed::from_parts(reader_parts);
     let writer = Framed::new(send_stream, ControlCodec::new());
+    (reader, writer)
+}
 
+fn spawn_data_tasks(
+    conn: &quinn::Connection,
+    tun: std::sync::Arc<tun_rs::AsyncDevice>,
+    reader: HeartbeatReader,
+    writer: HeartbeatWriter,
+    shutdown: &CancellationToken,
+) -> tokio::task::JoinSet<()> {
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-
     let conn_for_hb = conn.clone();
     let ctrl_shutdown = shutdown.clone();
     tasks.spawn(async move {
         heartbeat_loop(conn_for_hb, reader, writer, ctrl_shutdown.clone()).await;
         ctrl_shutdown.cancel();
     });
+    spawn_uplink(conn, tun.clone(), shutdown, &mut tasks);
+    spawn_downlink(conn, tun, shutdown, &mut tasks);
+    tasks
+}
 
+fn spawn_uplink(
+    conn: &quinn::Connection,
+    tun: std::sync::Arc<tun_rs::AsyncDevice>,
+    shutdown: &CancellationToken,
+    tasks: &mut tokio::task::JoinSet<()>,
+) {
     let uplink_conn = conn.clone();
-    let uplink_tun = tun.clone();
     let uplink_shutdown = shutdown.clone();
     tasks.spawn(async move {
-        let mut source = TunSource(uplink_tun);
+        let mut source = TunSource(tun);
         let mut sink = QuinnDatagram::new(uplink_conn.clone());
         let _ = forward(&mut source, &mut sink, &uplink_shutdown).await;
         uplink_conn.close(0x101u32.into(), b"uplink-ended");
         uplink_shutdown.cancel();
     });
+}
 
+fn spawn_downlink(
+    conn: &quinn::Connection,
+    tun: std::sync::Arc<tun_rs::AsyncDevice>,
+    shutdown: &CancellationToken,
+    tasks: &mut tokio::task::JoinSet<()>,
+) {
     let downlink_conn = conn.clone();
-    let downlink_tun = tun.clone();
     let downlink_shutdown = shutdown.clone();
     tasks.spawn(async move {
         let mut source = QuinnDatagram::new(downlink_conn.clone());
-        let mut sink = TunSink(downlink_tun);
+        let mut sink = TunSink(tun);
         let _ = forward(&mut source, &mut sink, &downlink_shutdown).await;
         downlink_conn.close(0x102u32.into(), b"downlink-ended");
         downlink_shutdown.cancel();
     });
+}
+
+async fn wait_for_shutdown(shutdown: &CancellationToken) {
     tokio::select! {
         biased;
         () = shutdown.cancelled() => {}
@@ -355,19 +449,6 @@ async fn run_data_plane(
             shutdown.cancel();
         }
     }
-
-    conn.close(0u32.into(), b"client-shutdown");
-
-    let drain = async { while tasks.join_next().await.is_some() {} };
-    if let Ok(()) = tokio::time::timeout(Duration::from_secs(5), drain).await {
-        tracing::info!("client graceful shutdown complete");
-    } else {
-        let remaining = tasks.len();
-        tasks.abort_all();
-        tracing::warn!("client graceful shutdown timed out, aborted {remaining} remaining task(s)");
-    }
-    endpoint.close(0u32.into(), b"client-shutdown");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -519,10 +600,17 @@ mod tests {
         ));
     }
 
-    #[test]
     #[allow(clippy::indexing_slicing)]
-    fn test_client_error_variants_display_are_distinct() {
-        let all = [
+    fn assert_displays_unique(all: &[String]) {
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "duplicate at {i},{j}");
+            }
+        }
+    }
+
+    fn all_client_error_displays() -> Vec<String> {
+        vec![
             ClientError::InvalidAssignedIp("x".into()).to_string(),
             ClientError::InvalidGateway("x".into()).to_string(),
             ClientError::InvalidSubnet("x".into()).to_string(),
@@ -537,12 +625,14 @@ mod tests {
             ClientError::AuthDenied("wrong password".into()).to_string(),
             ClientError::Protocol("unexpected msg".into()).to_string(),
             ClientError::InvalidRoute("not-a-cidr".into()).to_string(),
-        ];
-        for i in 0..all.len() {
-            for j in (i + 1)..all.len() {
-                assert_ne!(all[i], all[j]);
-            }
-        }
+        ]
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn test_client_error_variants_display_are_distinct() {
+        let all = all_client_error_displays();
+        assert_displays_unique(&all);
         assert!(all[0].contains("assigned_ip"));
         assert!(all[1].contains("gateway"));
         assert!(all[2].contains("subnet"));

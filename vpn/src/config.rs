@@ -60,47 +60,53 @@ impl ServerConfig {
 
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
         let server = raw.server;
-
-        if server.mtu < MIN_MTU {
-            return Err(ConfigError::MtuTooSmall(server.mtu));
-        }
-
-        let tun_subnet = server.tun_subnet;
-        IpPool::new(tun_subnet).map_err(|_| ConfigError::InvalidSubnet)?;
-
-        let routes = server.routes;
-        if routes
-            .iter()
-            .any(|r| r.network() == Ipv4Addr::UNSPECIFIED && r.prefix_len() == 0)
-        {
-            return Err(ConfigError::DefaultRouteNotAllowed);
-        }
-
-        let users: Vec<UserConfig> = raw
-            .users
-            .into_iter()
-            .map(|u| UserConfig {
-                username: u.username,
-                password_hash: u.password_hash,
-            })
-            .collect();
-
+        validate_server_fields(server.mtu, server.tun_subnet, &server.routes)?;
+        let users = build_user_configs(raw.users);
         let user_pairs: Vec<(String, String)> = users
             .iter()
             .map(|u| (u.username.clone(), u.password_hash.clone()))
             .collect();
         map_user_error(UserStore::from_users(user_pairs))?;
-
         Ok(Self {
             listen: server.listen,
-            tun_subnet,
+            tun_subnet: server.tun_subnet,
             mtu: server.mtu,
             cert: server.cert,
             key: server.key,
-            routes,
+            routes: server.routes,
             users,
         })
     }
+}
+
+fn validate_server_fields(
+    mtu: u16,
+    tun_subnet: Ipv4Net,
+    routes: &[Ipv4Net],
+) -> Result<(), ConfigError> {
+    if mtu < MIN_MTU {
+        return Err(ConfigError::MtuTooSmall(mtu));
+    }
+    IpPool::new(tun_subnet).map_err(|_| ConfigError::InvalidSubnet)?;
+    if is_default_route(routes) {
+        return Err(ConfigError::DefaultRouteNotAllowed);
+    }
+    Ok(())
+}
+
+fn is_default_route(routes: &[Ipv4Net]) -> bool {
+    routes
+        .iter()
+        .any(|r| r.network() == Ipv4Addr::UNSPECIFIED && r.prefix_len() == 0)
+}
+
+fn build_user_configs(raw: Vec<RawUser>) -> Vec<UserConfig> {
+    raw.into_iter()
+        .map(|u| UserConfig {
+            username: u.username,
+            password_hash: u.password_hash,
+        })
+        .collect()
 }
 
 fn map_user_error(res: Result<UserStore, AuthError>) -> Result<(), ConfigError> {
@@ -250,30 +256,48 @@ password_hash = "{hash}"
         )
     }
 
-    #[test]
-    fn test_config_error_display_variants_are_distinct() {
-        let io = ConfigError::Io(io_stub()).to_string();
-        let parse = ConfigError::Parse(toml::from_str::<serde::de::IgnoredAny>("x =").unwrap_err())
-            .to_string();
-        let mtu = ConfigError::MtuTooSmall(1000).to_string();
-        let subnet = ConfigError::InvalidSubnet.to_string();
-        let empty = ConfigError::EmptyUsername.to_string();
-        let dup = ConfigError::DuplicateUser("alice".into()).to_string();
-        let hash = ConfigError::InvalidHash.to_string();
-
-        let all = [&io, &parse, &mtu, &subnet, &empty, &dup, &hash];
+    #[allow(clippy::indexing_slicing)]
+    fn assert_displays_unique(all: &[String]) {
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
-                assert_ne!(all[i], all[j]);
+                assert_ne!(all[i], all[j], "duplicate at {i},{j}");
             }
         }
-        assert!(io.contains("read config file"));
-        assert!(parse.contains("parse"));
-        assert!(mtu.contains("1000") && mtu.contains("1280"));
-        assert!(subnet.contains("subnet"));
-        assert!(empty.contains("empty"));
-        assert!(dup.contains("alice"));
-        assert!(hash.contains("hash"));
+    }
+
+    fn base_config_error_displays() -> Vec<String> {
+        vec![
+            ConfigError::Io(io_stub()).to_string(),
+            ConfigError::Parse(toml::from_str::<serde::de::IgnoredAny>("x =").unwrap_err())
+                .to_string(),
+            ConfigError::MtuTooSmall(1000).to_string(),
+            ConfigError::InvalidSubnet.to_string(),
+            ConfigError::EmptyUsername.to_string(),
+            ConfigError::DuplicateUser("alice".into()).to_string(),
+            ConfigError::InvalidHash.to_string(),
+        ]
+    }
+
+    fn all_config_error_displays() -> Vec<String> {
+        let mut all = base_config_error_displays();
+        all.push(ConfigError::EmptyServerName.to_string());
+        all.push(ConfigError::EmptyCaCert.to_string());
+        all.push(ConfigError::DefaultRouteNotAllowed.to_string());
+        all
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn test_config_error_display_variants_are_distinct() {
+        let all = base_config_error_displays();
+        assert_displays_unique(&all);
+        assert!(all[0].contains("read config file"));
+        assert!(all[1].contains("parse"));
+        assert!(all[2].contains("1000") && all[2].contains("1280"));
+        assert!(all[3].contains("subnet"));
+        assert!(all[4].contains("empty"));
+        assert!(all[5].contains("alice"));
+        assert!(all[6].contains("hash"));
     }
 
     fn io_stub() -> std::io::Error {
@@ -540,30 +564,13 @@ username = "alice"
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn test_client_error_new_variants_display_distinct_from_existing() {
-        let io = ConfigError::Io(io_stub()).to_string();
-        let parse = ConfigError::Parse(toml::from_str::<serde::de::IgnoredAny>("x =").unwrap_err())
-            .to_string();
-        let mtu = ConfigError::MtuTooSmall(1000).to_string();
-        let subnet = ConfigError::InvalidSubnet.to_string();
-        let empty = ConfigError::EmptyUsername.to_string();
-        let dup = ConfigError::DuplicateUser("alice".into()).to_string();
-        let hash = ConfigError::InvalidHash.to_string();
-        let sn = ConfigError::EmptyServerName.to_string();
-        let ca = ConfigError::EmptyCaCert.to_string();
-        let dr = ConfigError::DefaultRouteNotAllowed.to_string();
-
-        let all = [
-            &io, &parse, &mtu, &subnet, &empty, &dup, &hash, &sn, &ca, &dr,
-        ];
-        for i in 0..all.len() {
-            for j in (i + 1)..all.len() {
-                assert_ne!(all[i], all[j]);
-            }
-        }
-        assert!(sn.contains("server_name"));
-        assert!(ca.contains("ca_cert"));
-        assert!(dr.contains("default route"));
+        let all = all_config_error_displays();
+        assert_displays_unique(&all);
+        assert!(all[7].contains("server_name"));
+        assert!(all[8].contains("ca_cert"));
+        assert!(all[9].contains("default route"));
     }
 
     #[test]

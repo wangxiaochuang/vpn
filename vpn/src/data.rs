@@ -280,23 +280,25 @@ mod tests {
         assert!(sink_rx.recv().await.is_none());
     }
 
+    fn spawn_downlink_pump(
+        tun_rx: mpsc::Receiver<Bytes>,
+        disp_tx: mpsc::UnboundedSender<Bytes>,
+        cancel: &CancellationToken,
+    ) -> tokio::task::JoinHandle<io::Result<()>> {
+        let mut tun = ChannelSource { rx: tun_rx };
+        let dispatcher = RecordingDispatcher { tx: disp_tx };
+        let cancel_for_task = cancel.clone();
+        tokio::spawn(async move { downlink_pump(&mut tun, &dispatcher, &cancel_for_task).await })
+    }
+
     #[tokio::test]
     async fn test_downlink_pump_cancel_when_tun_hanging_returns_ok() {
         let cancel = CancellationToken::new();
         let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(8);
         let (disp_tx, mut disp_rx) = mpsc::unbounded_channel::<Bytes>();
-        let mut tun = ChannelSource { rx: tun_rx };
-        let dispatcher = RecordingDispatcher { tx: disp_tx };
-
-        let cancel_for_task = cancel.clone();
-        let task =
-            tokio::spawn(
-                async move { downlink_pump(&mut tun, &dispatcher, &cancel_for_task).await },
-            );
-
+        let task = spawn_downlink_pump(tun_rx, disp_tx, &cancel);
         tokio::task::yield_now().await;
         cancel.cancel();
-
         let result = tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .expect("downlink_pump should return promptly after cancel")

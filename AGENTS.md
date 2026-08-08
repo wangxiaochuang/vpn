@@ -40,6 +40,12 @@ cargo fmt --check           # 格式检查
 - 证书生成参考 `vpn/examples/tlsgen.rs`；自签证书已存在于根目录 `cert.pem` / `key.pem`。
 - 本仓库为 Cargo workspace：`vpn/`（主库与主 bin，含 `src/`、`tests/`、`examples/`、`proto/`）、`xtask/`（开发/运维工具，`cargo xtask ...`）。
 
+## 代码风格硬规则（违反视为任务失败）
+
+1. 函数非空非注释行 ≤ 20（clippy too_many_lines 阈值）
+2. 认知复杂度 ≤ 15（clippy cognitive_complexity）
+3. 收尾前必须跑 cargo clippy --all-targets -- -D warnings 并确认 0 警告
+
 ## 测试策略
 
 采用敏捷测试四象限模型。每个改动先判断属于哪个象限，再决定测试方式与位置。
