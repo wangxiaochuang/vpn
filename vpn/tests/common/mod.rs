@@ -44,6 +44,7 @@ pub fn test_config() -> ServerConfig {
         mtu: 1280,
         cert: repo("cert.pem"),
         key: repo("key.pem"),
+        routes: vec![],
         users: vec![vpn::config::UserConfig {
             username: "alice".to_string(),
             password_hash: hash_password(ALICE_PASSWORD),
@@ -52,6 +53,14 @@ pub fn test_config() -> ServerConfig {
 }
 
 pub fn test_state_with_subnet(subnet: Ipv4Net, users: Vec<(String, String)>) -> SharedState {
+    test_state_with_subnet_and_routes(subnet, users, vec![])
+}
+
+pub fn test_state_with_subnet_and_routes(
+    subnet: Ipv4Net,
+    users: Vec<(String, String)>,
+    routes: Vec<Ipv4Net>,
+) -> SharedState {
     let user_pairs: Vec<(String, String)> = users;
     let store = UserStore::from_users(user_pairs).unwrap();
     let pool = IpPool::new(subnet).unwrap();
@@ -61,6 +70,7 @@ pub fn test_state_with_subnet(subnet: Ipv4Net, users: Vec<(String, String)>) -> 
         mtu: 1280,
         cert: repo("cert.pem"),
         key: repo("key.pem"),
+        routes,
         users: vec![],
     };
     Arc::new(ServerState {
@@ -186,6 +196,36 @@ pub async fn start_test_server(
 ) -> (quinn::Endpoint, SharedState) {
     let (endpoint, state, _shutdown) = start_test_server_with_shutdown(users, subnet).await;
     (endpoint, state)
+}
+
+pub async fn start_test_server_with_routes(
+    users: Vec<(String, String)>,
+    subnet: Ipv4Net,
+    routes: Vec<Ipv4Net>,
+) -> (quinn::Endpoint, SharedState, CancellationToken) {
+    let server_cfg = vpn::tls::build_quinn_server_config(&repo("cert.pem"), &repo("key.pem"))
+        .expect("server cfg");
+    let endpoint = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
+        .expect("server endpoint");
+    let state = test_state_with_subnet_and_routes(subnet, users, routes);
+
+    let shutdown = CancellationToken::new();
+    let accept_endpoint = endpoint.clone();
+    let state_clone = state.clone();
+    let shutdown_clone = shutdown.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = accept_endpoint.accept().await {
+            if let Ok(conn) = incoming.await {
+                let state = state_clone.clone();
+                let ct = shutdown_clone.clone();
+                tokio::spawn(async move {
+                    let _ = vpn::server::handle_conn(conn, state, ct).await;
+                });
+            }
+        }
+    });
+
+    (endpoint, state, shutdown)
 }
 
 pub async fn start_test_server_with_shutdown(

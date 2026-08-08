@@ -251,6 +251,12 @@ pub async fn handle_conn(
             subnet: state.config.tun_subnet.to_string(),
             gateway: gateway.to_string(),
             mtu: u32::from(state.config.mtu),
+            routes: state
+                .config
+                .routes
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
         })),
     };
     framed

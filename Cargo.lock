@@ -2170,6 +2170,7 @@ dependencies = [
  "prost-build",
  "quinn",
  "rcgen",
+ "route_manager",
  "rpassword",
  "rustls",
  "rustls-pki-types",

@@ -1,9 +1,11 @@
 [server]
 listen = "0.0.0.0:4433"
 tun_subnet = "10.0.0.0/24"
+routes = ["192.168.5.0/24"]
 mtu = 1280
 cert = "cert.pem"
 key = "key.pem"
+# routes = ["192.168.100.0/24", "10.88.0.0/16"]  # 可选：通过 VPN 访问的额外子网（split tunneling），0.0.0.0/0 不允许，缺省为空
 
 [[users]]
 username = "admin"

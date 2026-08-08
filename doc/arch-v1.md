@@ -200,7 +200,7 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
     → conn.close → 进程退出（V1 不自动重连）
 ```
 
-**方案 A 路由限制（重要）**：客户端仅把 `subnet` 内的流量导入 TUN（Linux 上执行 `ip route add <subnet> dev <dev>`，幂等；macOS/BSD 依赖 tun-rs `associate_route` 自动加/删路由）。V1 **不做全流量代理**（方案 B：默认路由 + server `/32` 例外），因此客户端只能访问 VPN 内网，不能把外网流量经由服务端转发出去。macOS 上若 `associate_route` 被环境关闭则无路由，客户端在 TUN 构造时显式开启，不依赖默认值。
+**方案 A 路由说明（split tunneling）**：客户端把 `subnet` 内的流量导入 TUN（Linux 上执行 `ip route add <subnet> dev <dev>`，幂等；macOS/BSD 依赖 tun-rs `associate_route` 自动加/删路由）。此外服务端可通过配置 `routes` 字段声明需通过 VPN 访问的额外子网（如服务端背后的办公内网 `192.168.100.0/24`），认证成功后随 `AuthOk` 下发给客户端；客户端用 `route_manager` crate 程序化将这些路由绑定到 TUN 接口（跨平台：Linux netlink / macOS-BSD PF_ROUTE / Windows IP Helper），不 shell out 调用系统命令。`0.0.0.0/0`（默认路由）被配置阶段拒绝。V1 **不做全流量代理**（方案 B：默认路由 + server `/32` 例外），因此外网流量不经由服务端转发。macOS 上若 `associate_route` 被环境关闭则无路由，客户端在 TUN 构造时显式开启，不依赖默认值。
 
 ## 9. 配置形态（示意）
 
@@ -213,6 +213,7 @@ tun_subnet = "10.0.0.0/24"
 mtu = 1280
 cert = "server.crt"   # 由 CA 签发的服务端证书
 key = "server.key"    # 对应私钥
+routes = ["192.168.100.0/24", "10.88.0.0/16"]  # 可选：需通过 VPN 访问的额外子网（split tunneling），缺省为空
 
 [[users]]
 username = "alice"
@@ -260,6 +261,7 @@ username = "alice"
 - 被动 NAT rebinding（quinn 默认行为：客户端底层地址变化时连接不断、虚拟 IP 不释放）
 - 客户端交互式密码输入（rpassword，不回显，不落盘）
 - 客户端方案 A 路由：仅 subnet 内流量导入 TUN（Linux `ip route add`，macOS `associate_route`）
+- 服务端可配置 `routes` 字段声明额外子网，认证时随 `AuthOk` 下发，客户端用 `route_manager` 程序化添加 split tunneling 路由到 TUN 接口
 
 **V1 不包含（后续迭代）**：
 - 动态 MTU 协商 / 路径 MTU 发现 / 分片处理
@@ -269,7 +271,7 @@ username = "alice"
 - 更复杂的认证（如 token、证书认证、MFA）
 - 流量统计 / 计费
 - 主动 connection migration（客户端检测网络变化并主动 `Endpoint::rebind` 切换路径；虚拟 IP 绑定原则已就位，V2 为纯增量）
-- **客户端全流量代理（方案 B：默认路由 + server `/32` 例外）**——V1 客户端仅能访问 VPN 内网，不把外网流量经服务端转发
+- **客户端全流量代理（方案 B：默认路由 + server `/32` 例外）**——V1 支持可配置的 split tunneling（`routes` 字段下发额外子网），但不做 `0.0.0.0/0` 全流量代理（配置阶段拒绝默认路由）
 - **客户端自动重连**——V1 断开即退出，重连视为全新会话（与服务端语义一致）
 
 ## 12. 决策记录

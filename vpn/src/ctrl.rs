@@ -113,6 +113,7 @@ mod tests {
                 subnet: "10.0.0.0/24".to_string(),
                 gateway: "10.0.0.1".to_string(),
                 mtu: 1280,
+                routes: vec!["192.168.100.0/24".to_string()],
             })),
         };
         assert_eq!(roundtrip(&msg), msg);
@@ -178,9 +179,63 @@ mod tests {
                 subnet: "10.0.0.0/24".to_string(),
                 gateway: "10.0.0.1".to_string(),
                 mtu: 1280,
+                routes: vec![],
             })),
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn test_auth_ok_with_multiple_routes_roundtrip_preserves_routes() {
+        let msg = ControlMessage {
+            msg: Some(Msg::AuthOk(AuthOk {
+                assigned_ip: "10.0.0.2".to_string(),
+                subnet: "10.0.0.0/24".to_string(),
+                gateway: "10.0.0.1".to_string(),
+                mtu: 1280,
+                routes: vec!["192.168.100.0/24".to_string(), "10.88.0.0/16".to_string()],
+            })),
+        };
+        let decoded = roundtrip(&msg);
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_auth_ok_with_empty_routes_roundtrip_preserves_routes() {
+        let msg = ControlMessage {
+            msg: Some(Msg::AuthOk(AuthOk {
+                assigned_ip: "10.0.0.2".to_string(),
+                subnet: "10.0.0.0/24".to_string(),
+                gateway: "10.0.0.1".to_string(),
+                mtu: 1280,
+                routes: vec![],
+            })),
+        };
+        let decoded = roundtrip(&msg);
+        assert_eq!(decoded, msg);
+        let Msg::AuthOk(ok) = decoded.msg.unwrap() else {
+            unreachable!()
+        };
+        assert!(ok.routes.is_empty());
+    }
+
+    #[test]
+    fn test_auth_ok_with_single_route_roundtrip_preserves_routes() {
+        let msg = ControlMessage {
+            msg: Some(Msg::AuthOk(AuthOk {
+                assigned_ip: "10.0.0.2".to_string(),
+                subnet: "10.0.0.0/24".to_string(),
+                gateway: "10.0.0.1".to_string(),
+                mtu: 1280,
+                routes: vec!["172.16.0.0/12".to_string()],
+            })),
+        };
+        let decoded = roundtrip(&msg);
+        assert_eq!(decoded, msg);
+        let Msg::AuthOk(ok) = decoded.msg.unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(ok.routes, vec!["172.16.0.0/12".to_string()]);
     }
 
     #[test]

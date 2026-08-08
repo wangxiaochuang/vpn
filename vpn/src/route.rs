@@ -141,6 +141,25 @@ pub fn ensure_subnet_route(dev_name: &str, subnet: Ipv4Net) -> io::Result<()> {
     }
 }
 
+pub fn add_routes(dev_name: &str, routes: &[Ipv4Net]) -> io::Result<()> {
+    if routes.is_empty() {
+        return Ok(());
+    }
+
+    let mut mgr = route_manager::RouteManager::new()?;
+    for route in routes {
+        let entry =
+            route_manager::Route::new(std::net::IpAddr::V4(route.network()), route.prefix_len())
+                .with_if_name(dev_name.to_string());
+        if let Err(e) = mgr.add(&entry)
+            && e.raw_os_error() != Some(libc::EEXIST)
+        {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -310,5 +329,10 @@ mod tests {
     fn test_default_creates_empty_registry() {
         let reg = SessionRegistry::<u32>::default();
         assert_eq!(reg.lookup(ip(2)), None);
+    }
+
+    #[test]
+    fn test_add_routes_when_empty_returns_ok_without_route_manager() {
+        assert!(add_routes("utun99", &[]).is_ok());
     }
 }

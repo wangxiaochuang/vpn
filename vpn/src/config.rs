@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use ipnet::Ipv4Net;
@@ -30,6 +30,8 @@ pub enum ConfigError {
     EmptyServerName,
     #[error("ca_cert must not be empty")]
     EmptyCaCert,
+    #[error("routes must not contain the default route 0.0.0.0/0")]
+    DefaultRouteNotAllowed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +47,7 @@ pub struct ServerConfig {
     pub mtu: u16,
     pub cert: PathBuf,
     pub key: PathBuf,
+    pub routes: Vec<Ipv4Net>,
     pub users: Vec<UserConfig>,
 }
 
@@ -64,6 +67,14 @@ impl ServerConfig {
 
         let tun_subnet = server.tun_subnet;
         IpPool::new(tun_subnet).map_err(|_| ConfigError::InvalidSubnet)?;
+
+        let routes = server.routes;
+        if routes
+            .iter()
+            .any(|r| r.network() == Ipv4Addr::UNSPECIFIED && r.prefix_len() == 0)
+        {
+            return Err(ConfigError::DefaultRouteNotAllowed);
+        }
 
         let users: Vec<UserConfig> = raw
             .users
@@ -86,6 +97,7 @@ impl ServerConfig {
             mtu: server.mtu,
             cert: server.cert,
             key: server.key,
+            routes,
             users,
         })
     }
@@ -146,6 +158,8 @@ struct RawServer {
     mtu: u16,
     cert: PathBuf,
     key: PathBuf,
+    #[serde(default, deserialize_with = "deserialize_ipv4_net_vec")]
+    routes: Vec<Ipv4Net>,
 }
 
 fn deserialize_ipv4_net<'de, D>(deserializer: D) -> Result<Ipv4Net, D::Error>
@@ -155,6 +169,17 @@ where
     use serde::Deserialize;
     let s = String::deserialize(deserializer)?;
     s.parse().map_err(serde::de::Error::custom)
+}
+
+fn deserialize_ipv4_net_vec<'de, D>(deserializer: D) -> Result<Vec<Ipv4Net>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let seq = Vec::<String>::deserialize(deserializer)?;
+    seq.into_iter()
+        .map(|s| s.parse().map_err(serde::de::Error::custom))
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,6 +292,76 @@ password_hash = "{hash}"
         assert_eq!(cfg.key, PathBuf::from("server.key"));
         assert_eq!(cfg.users.len(), 1);
         assert_eq!(cfg.users[0].username, "alice");
+        assert!(cfg.routes.is_empty());
+    }
+
+    fn config_body_with_routes(hash: &str, routes: &str) -> String {
+        let body = minimal_config_body(hash);
+        body.replacen(
+            "\n\n[[users]]",
+            &format!("\nroutes = {routes}\n\n[[users]]"),
+            1,
+        )
+    }
+
+    #[test]
+    fn test_load_when_routes_present_returns_ok_with_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = config_body_with_routes(VALID_HASH, r#"["192.168.100.0/24", "10.88.0.0/16"]"#);
+        let path = write_config(&dir, "routes.toml", &body);
+        let cfg = ServerConfig::load(&path).unwrap();
+        assert_eq!(cfg.routes.len(), 2);
+        assert_eq!(
+            cfg.routes[0],
+            "192.168.100.0/24".parse::<Ipv4Net>().unwrap()
+        );
+        assert_eq!(cfg.routes[1], "10.88.0.0/16".parse::<Ipv4Net>().unwrap());
+    }
+
+    #[test]
+    fn test_load_when_routes_absent_defaults_to_empty_vec() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "no_routes.toml", &minimal_config_body(VALID_HASH));
+        let cfg = ServerConfig::load(&path).unwrap();
+        assert_eq!(cfg.routes, Vec::<Ipv4Net>::new());
+    }
+
+    #[test]
+    fn test_load_when_routes_contains_default_route_returns_default_route_not_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = config_body_with_routes(VALID_HASH, r#"["0.0.0.0/0"]"#);
+        let path = write_config(&dir, "default_route.toml", &body);
+        let err = ServerConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::DefaultRouteNotAllowed));
+    }
+
+    #[test]
+    fn test_load_when_routes_overlap_tun_subnet_returns_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = config_body_with_routes(VALID_HASH, r#"["10.0.0.0/16"]"#);
+        let path = write_config(&dir, "overlap.toml", &body);
+        assert!(ServerConfig::load(&path).is_ok());
+    }
+
+    #[test]
+    fn test_default_route_not_allowed_display_is_distinct() {
+        let default_route = ConfigError::DefaultRouteNotAllowed.to_string();
+        let all_others = [
+            ConfigError::Io(io_stub()).to_string(),
+            ConfigError::Parse(toml::from_str::<serde::de::IgnoredAny>("x =").unwrap_err())
+                .to_string(),
+            ConfigError::MtuTooSmall(1000).to_string(),
+            ConfigError::InvalidSubnet.to_string(),
+            ConfigError::EmptyUsername.to_string(),
+            ConfigError::DuplicateUser("alice".into()).to_string(),
+            ConfigError::InvalidHash.to_string(),
+            ConfigError::EmptyServerName.to_string(),
+            ConfigError::EmptyCaCert.to_string(),
+        ];
+        for other in &all_others {
+            assert_ne!(&default_route, other);
+        }
+        assert!(default_route.contains("default route") || default_route.contains("0.0.0.0/0"));
     }
 
     #[test]
@@ -456,8 +551,11 @@ username = "alice"
         let hash = ConfigError::InvalidHash.to_string();
         let sn = ConfigError::EmptyServerName.to_string();
         let ca = ConfigError::EmptyCaCert.to_string();
+        let dr = ConfigError::DefaultRouteNotAllowed.to_string();
 
-        let all = [&io, &parse, &mtu, &subnet, &empty, &dup, &hash, &sn, &ca];
+        let all = [
+            &io, &parse, &mtu, &subnet, &empty, &dup, &hash, &sn, &ca, &dr,
+        ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
                 assert_ne!(all[i], all[j]);
@@ -465,6 +563,7 @@ username = "alice"
         }
         assert!(sn.contains("server_name"));
         assert!(ca.contains("ca_cert"));
+        assert!(dr.contains("default route"));
     }
 
     #[test]

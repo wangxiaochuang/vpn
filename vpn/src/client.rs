@@ -50,6 +50,7 @@ pub struct ClientTunParams {
     pub subnet: Ipv4Net,
     pub gateway: Ipv4Addr,
     pub mtu: u16,
+    pub routes: Vec<Ipv4Net>,
 }
 
 #[derive(Debug, Error)]
@@ -68,6 +69,8 @@ pub enum ClientError {
     GatewayOutsideSubnet(Ipv4Addr, Ipv4Net),
     #[error("AuthOk gateway {0} equals the subnet network address")]
     GatewayIsNetworkAddr(Ipv4Addr),
+    #[error("AuthOk contains invalid route CIDR: {0}")]
+    InvalidRoute(String),
     #[error("authentication failed: {0}")]
     AuthDenied(String),
     #[error("protocol error: {0}")]
@@ -102,11 +105,20 @@ pub fn parse_auth_ok(ok: &AuthOk) -> Result<ClientTunParams, ClientError> {
         return Err(ClientError::GatewayIsNetworkAddr(gateway));
     }
 
+    let mut routes = Vec::with_capacity(ok.routes.len());
+    for r in &ok.routes {
+        let net: Ipv4Net = r
+            .parse()
+            .map_err(|_| ClientError::InvalidRoute(r.clone()))?;
+        routes.push(net);
+    }
+
     Ok(ClientTunParams {
         assigned_ip,
         subnet,
         gateway,
         mtu,
+        routes,
     })
 }
 
@@ -232,6 +244,7 @@ fn setup_tun(params: &ClientTunParams) -> anyhow::Result<std::sync::Arc<tun_rs::
     let dev_name = tun.name().unwrap_or_default();
     crate::route::ensure_subnet_route(&dev_name, params.subnet)
         .context("failed to configure subnet route")?;
+    crate::route::add_routes(&dev_name, &params.routes).context("failed to add extra routes")?;
     Ok(std::sync::Arc::new(tun))
 }
 
@@ -372,6 +385,7 @@ mod tests {
             subnet: "10.0.0.0/24".to_string(),
             gateway: "10.0.0.1".to_string(),
             mtu: 1280,
+            routes: vec![],
         }
     }
 
@@ -396,6 +410,7 @@ mod tests {
         assert_eq!(params.subnet, "10.0.0.0/24".parse::<Ipv4Net>().unwrap());
         assert_eq!(params.gateway, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(params.mtu, 1280);
+        assert!(params.routes.is_empty());
     }
 
     #[test]
@@ -476,6 +491,35 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_auth_ok_when_routes_present_returns_params_with_routes() {
+        let mut ok = auth_ok();
+        ok.routes = vec!["192.168.100.0/24".to_string()];
+        let params = parse_auth_ok(&ok).unwrap();
+        assert_eq!(
+            params.routes,
+            vec!["192.168.100.0/24".parse::<Ipv4Net>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_routes_empty_returns_params_with_empty_routes() {
+        let mut ok = auth_ok();
+        ok.routes = vec![];
+        let params = parse_auth_ok(&ok).unwrap();
+        assert!(params.routes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_auth_ok_when_routes_contains_invalid_cidr_returns_invalid_route() {
+        let mut ok = auth_ok();
+        ok.routes = vec!["not-a-cidr".to_string()];
+        assert!(matches!(
+            parse_auth_ok(&ok),
+            Err(ClientError::InvalidRoute(_))
+        ));
+    }
+
+    #[test]
     #[allow(clippy::indexing_slicing)]
     fn test_client_error_variants_display_are_distinct() {
         let all = [
@@ -492,6 +536,7 @@ mod tests {
             ClientError::GatewayIsNetworkAddr(Ipv4Addr::new(10, 0, 0, 0)).to_string(),
             ClientError::AuthDenied("wrong password".into()).to_string(),
             ClientError::Protocol("unexpected msg".into()).to_string(),
+            ClientError::InvalidRoute("not-a-cidr".into()).to_string(),
         ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
@@ -505,6 +550,7 @@ mod tests {
         assert!(all[4].contains("65535"));
         assert!(all[7].contains("authentication failed"));
         assert!(all[8].contains("protocol"));
+        assert!(all[9].contains("route"));
     }
 
     #[test]

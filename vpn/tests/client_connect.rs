@@ -107,6 +107,7 @@ fn test_parse_auth_ok_malformed_returns_client_error() {
             subnet: "10.0.0.0/24".to_string(),
             gateway: "10.0.0.1".to_string(),
             mtu: 1280,
+            routes: vec![],
         })),
     };
     let Msg::AuthOk(ok) = bad.msg.unwrap() else {
