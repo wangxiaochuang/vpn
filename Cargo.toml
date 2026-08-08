@@ -22,13 +22,17 @@ bytes = "1"
 thiserror = "2"
 tokio-util = { version = "0.7", features = ["codec"] }
 ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 prost = "0.13"
 getrandom = "0.2"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
+futures = "0.3"
 
 [build-dependencies]
 prost-build = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }

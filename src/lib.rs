@@ -16,11 +16,15 @@
 )]
 
 pub mod auth;
+pub mod config;
 pub mod ctrl;
 pub mod data;
 pub mod framing;
 pub mod ipam;
 pub mod route;
+pub mod server;
+pub mod tls;
+pub mod tun_setup;
 
 pub mod vpn {
     #![allow(clippy::doc_markdown)]
