@@ -14,7 +14,6 @@ rules:
   spec:
     - 每个需求必须写成 Given/When/Then 格式
     - 每个场景必须对应 tests/ 下一个自动化测试
-    - spec 文件名 = capability 名（如 ipam.md、session.md）
   design:
     - 涉并发的部分必须说明 cancel-safety
     - 引入新依赖前先确认无既有方案
