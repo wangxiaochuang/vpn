@@ -16,3 +16,4 @@
 
 pub mod auth;
 pub mod ipam;
+pub mod route;
