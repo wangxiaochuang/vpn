@@ -14,4 +14,5 @@
     clippy::missing_panics_doc
 )]
 
+pub mod auth;
 pub mod ipam;

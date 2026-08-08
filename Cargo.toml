@@ -24,6 +24,8 @@ tokio-util = "0.7"
 ipnet = "2"
 prost = "0.13"
 getrandom = "0.2"
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["getrandom"] }
 
 [build-dependencies]
 prost-build = "0.13"
