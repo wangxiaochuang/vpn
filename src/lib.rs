@@ -18,6 +18,7 @@
 pub mod auth;
 pub mod ctrl;
 pub mod data;
+pub mod framing;
 pub mod ipam;
 pub mod route;
 

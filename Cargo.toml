@@ -20,7 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rcgen = "0.14.8"
 bytes = "1"
 thiserror = "2"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["codec"] }
 ipnet = "2"
 prost = "0.13"
 getrandom = "0.2"
