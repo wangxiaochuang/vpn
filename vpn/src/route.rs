@@ -141,13 +141,10 @@ fn add_route_or_verify(dev_name: &str, subnet: Ipv4Net) -> io::Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "failed to add route {subnet} dev {dev_name}: ip exited with {}",
-                status.code().unwrap_or(-1)
-            ),
-        ))
+        Err(io::Error::other(format!(
+            "failed to add route {subnet} dev {dev_name}: ip exited with {}",
+            status.code().unwrap_or(-1)
+        )))
     }
 }
 
@@ -197,9 +194,8 @@ mod tests {
     #[test]
     fn test_ensure_subnet_route_linux_builds_correct_command() {
         let subnet: Ipv4Net = "10.0.0.0/24".parse().unwrap();
-        let cmd = std::process::Command::new("ip")
-            .args(["route", "add", &subnet.to_string(), "dev", "tun0"])
-            .to_owned();
+        let mut cmd = std::process::Command::new("ip");
+        cmd.args(["route", "add", &subnet.to_string(), "dev", "tun0"]);
         let args: Vec<&str> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(args, vec!["route", "add", "10.0.0.0/24", "dev", "tun0"]);
     }
