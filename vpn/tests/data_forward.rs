@@ -5,8 +5,11 @@ use std::io;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use vpn::data::{PacketSink, PacketSource, forward};
+
+fn sd_handle() -> shutdown::ShutdownHandle {
+    shutdown::Shutdown::new(std::time::Duration::from_secs(5)).handle()
+}
 
 struct ChannelSource {
     rx: mpsc::Receiver<Bytes>,
@@ -58,7 +61,7 @@ async fn test_forward_relays_packets_in_order_until_source_closes() {
     let result = {
         let mut source = ChannelSource { rx: src_rx };
         let mut sink = ChannelSink { tx: sink_tx };
-        forward(&mut source, &mut sink, &CancellationToken::new()).await
+        forward(&mut source, &mut sink, &sd_handle()).await
     };
     assert!(result.is_err());
 
@@ -78,7 +81,7 @@ async fn test_forward_source_first_error_forwards_no_packets() {
     let result = {
         let mut source = ChannelSource { rx: src_rx };
         let mut sink = ChannelSink { tx: sink_tx };
-        forward(&mut source, &mut sink, &CancellationToken::new()).await
+        forward(&mut source, &mut sink, &sd_handle()).await
     };
     assert!(result.is_err());
     assert!(sink_rx.recv().await.is_none());

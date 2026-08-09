@@ -34,7 +34,7 @@
 
 ### Requirement: handle_conn 认证成功路径下发完整配置
 
-系统 SHALL 为每个接受的连接执行：`conn.accept_bi()` 获取控制 stream；用 `Framed<(SendStream, RecvStream), ControlCodec>` 解码读取首个 `ControlMessage`；若首条消息为 `AuthRequest`，SHALL 调用 `ctrl::authenticate(&users, &mut pool, &req)`。成功时 SHALL 构造 `ConnectionHandle{ id: conn.stable_id(), conn: conn.clone(), ip }`，调用 `registry.insert(&username, ip, handle)`（拿 `Option<Evicted>`），随后 SHALL 通过控制 stream 发送 `AuthOk{ assigned_ip: ip.to_string(), subnet: config.tun_subnet.to_string(), gateway: <网关 IP>.to_string(), mtu: config.mtu }`。`AuthOk` 的字段 SHALL 与客户端用于配置 TUN 的参数一致。
+系统 SHALL 为每个接受的连接执行：通过 `msgx` quinn 适配接受控制 stream（`msgx::accept_bi::<ControlMessage>(&conn)`，底层将 `SendStream` + `RecvStream` 组合为 `AsyncRead + AsyncWrite` 的 `Channel`）；用 `Channel::recv` 解码读取首个 `ControlMessage`（SHALL 以 `recv_timeout` 限制等待时长，超时 SHALL 视为协议错误关闭连接）；若首条消息为 `AuthRequest`，SHALL 调用 `ctrl::authenticate(&users, &mut pool, &req)`。成功时 SHALL 构造 `ConnectionHandle{ id: conn.stable_id(), conn: conn.clone(), ip }`，调用 `registry.insert(&username, ip, handle)`（拿 `Option<Evicted>`），随后 SHALL 通过控制 stream 发送 `AuthOk{ assigned_ip: ip.to_string(), subnet: config.tun_subnet.to_string(), gateway: <网关 IP>.to_string(), mtu: config.mtu }`。`AuthOk` 的字段 SHALL 与客户端用于配置 TUN 的参数一致。
 
 #### Scenario: 合法凭证认证成功并收到 AuthOk
 
@@ -44,7 +44,12 @@
 #### Scenario: 首 message 非 AuthRequest 关闭连接
 
 - **WHEN** 客户端连接后首条控制消息为 `Heartbeat` 而非 `AuthRequest`
-- **THEN** 服务端关闭连接（不发 AuthOk、不发 AuthDenied，连接终止），客户端 `accept_bi` 后的 stream 读收到 EOF 或连接关闭
+- **THEN** 服务端关闭连接（不发 AuthOk、不发 AuthDenied，连接终止），客户端 stream 读收到 EOF 或连接关闭
+
+#### Scenario: 认证阶段超时未收到首条消息关闭连接
+
+- **WHEN** 客户端连接后在 `recv_timeout` 设定的等待时长内未发送任何控制消息
+- **THEN** 服务端按超时处理关闭连接，不进入认证路径
 
 ### Requirement: handle_conn 认证失败路径下发 AuthDenied 并关闭
 
@@ -76,16 +81,16 @@
 
 ### Requirement: per-conn 心跳保活与超时检测
 
-系统 SHALL 为每个已认证连接启动一个 task，接收一个 `CancellationToken`（由 `handle_conn` 传入），循环执行：(a) 每 `HEARTBEAT_INTERVAL`（10s）通过控制 stream 发送 `Heartbeat` 消息；(b) 收到对端 `Heartbeat` 时调用 `HeartbeatTracker::observe(Instant::now())` 更新判活时间戳；(c) 每 1 秒检查 `HeartbeatTracker::is_dead(Instant::now())`，若为真 SHALL 调用 `conn.close(0x100, b"timeout")` 关闭连接；(d) 当 cancel 被触发时，SHALL 通过控制 stream 发送 `Disconnect { reason: "server-shutdown" }` 消息（best-effort，发送失败 SHALL NOT 阻塞退出），随后 break 退出循环。四件事 SHALL 在同一 task 内的 `tokio::select!` 中以 `biased` 优先级编排（cancel 最高），使 `HeartbeatTracker` 在该 task 内 `&mut` 可变、无需跨 task 加锁。`cancel.cancelled()` SHALL 为 biased 最高优先级分支，确保取消信号不被遗漏。
+系统 SHALL 为每个已认证连接启动一个 task，接收一个 `CancellationToken`（由 `handle_conn` 传入），循环执行：(a) 每 `KEEPALIVE_INTERVAL`（10s）通过控制 stream 发送 `Heartbeat` 消息；(b) 收到对端**任何** `ControlMessage` 时调用 `msgx::KeepaliveTracker::observe(Instant::now())` 更新判活时间戳（observe 语义为收到对端任意消息即续命）；(c) 每 1 秒检查 `KeepaliveTracker::is_dead(Instant::now())`，若为真 SHALL 调用 `conn.close(0x100, b"timeout")` 关闭连接；(d) 当 cancel 被触发时，SHALL 通过控制 stream 发送 `Disconnect { reason: "server-shutdown" }` 消息（best-effort，发送失败 SHALL NOT 阻塞退出），随后 break 退出循环。四件事 SHALL 在同一 task 内的 `tokio::select!` 中以 `biased` 优先级编排（cancel 最高），使 `KeepaliveTracker` 在该 task 内 `&mut` 可变、无需跨 task 加锁。`cancel.cancelled()` SHALL 为 biased 最高优先级分支，确保取消信号不被遗漏。
 
 #### Scenario: 客户端定期发心跳连接保持
 
 - **WHEN** 已认证连接的客户端每 5 秒发送一个 `Heartbeat`
-- **THEN** 服务端连接保持打开，30 秒后仍存活（每次 `observe` 续命）
+- **THEN** 服务端连接保持打开，30 秒后仍存活（每次收到消息 `observe` 续命）
 
-#### Scenario: 客户端 30 秒无心跳连接被关
+#### Scenario: 客户端 30 秒无消息连接被关
 
-- **WHEN** 已认证连接的客户端在认证后停止发送任何消息超过 `HEARTBEAT_TIMEOUT`（30 秒）
+- **WHEN** 已认证连接的客户端在认证后停止发送任何消息超过 `KEEPALIVE_TIMEOUT`（30 秒）
 - **THEN** 服务端在约 30 秒后（next 1s tick）`close` 该连接；客户端的 QUIC 操作（`read_datagram`、stream 读）观察到连接错误
 
 #### Scenario: 服务端定期发心跳
@@ -100,8 +105,13 @@
 
 #### Scenario: cancel 与 timeout 同时就绪时 cancel 优先
 
-- **WHEN** 心跳 task 的 `HeartbeatTracker::is_dead` 为真且 cancel 在同一轮 poll 中被触发
+- **WHEN** 心跳 task 的 `KeepaliveTracker::is_dead` 为真且 cancel 在同一轮 poll 中被触发
 - **THEN** `biased` select! 优先处理 cancel，发送 Disconnect 后退出（而非走 timeout 的 conn.close 路径）
+
+#### Scenario: 收到非心跳业务消息同样续命
+
+- **WHEN** 客户端在心跳周期内发送一条非 `Heartbeat` 的控制消息（如未来上报告警/采集信息）
+- **THEN** 服务端判活状态机 `observe` 被调用，连接持续存活（不因只有业务消息而无心跳被误判超时）
 
 ### Requirement: per-conn 数据面上行泵
 
@@ -176,12 +186,17 @@
 
 ### Requirement: 服务端优雅关闭
 
-系统 SHALL 在收到 Ctrl-C（SIGINT）时启动优雅关闭流程：(1) 打印关闭日志；(2) 通过 `CancellationToken::cancel()` 广播取消信号；(3) 调用 `endpoint.close(...)` 停止接受新连接并通知现有连接；(4) 等待所有活跃 `handle_conn` task 完成清理（每个 task free IP、移除 registry），等待 SHALL 有超时保护（默认 5 秒）；(5) 超时后 SHALL `abort_all()` 强杀残留 task 以保证进程退出；(6) 打印关闭完成日志后返回。系统 SHALL 用 `tokio::task::JoinSet` 追踪所有 `handle_conn` task（替代当前的 detached `tokio::spawn`），使关闭时可以 await 全部完成。
+系统 SHALL 在收到 Ctrl-C（SIGINT）或 SIGTERM 时启动优雅关闭流程（SIGINT/SIGTERM 由 `shutdown` crate 的信号处理覆盖）：(1) 打印关闭日志；(2) 通过 `Shutdown::trigger()` 广播取消信号；(3) 调用 `endpoint.close(...)` 停止接受新连接并通知现有连接；(4) 调用 `sd.drain(&mut conn_set)` 等待所有活跃 `handle_conn` task 完成清理（每个 task free IP、移除 registry），drain 内部含超时保护（`Shutdown` 构造时传入，默认 5 秒）；(5) 超时后 drain 内部 SHALL `abort_all()` 强杀残留 task 以保证进程退出；(6) 打印关闭完成日志后返回。系统 SHALL 用 `tokio::task::JoinSet` 追踪所有 `handle_conn` task，使关闭时可以 await 全部完成。`server::run` SHALL 在入口构造 `shutdown::Shutdown`（含 drain 超时），在 accept loop 侧用 `shutdown::wait_for_interrupt(&sd)` 或 `spawn_signal_watchdog` 等价方式等待中断信号。
 
 #### Scenario: Ctrl-C 后等连接清理再退出
 
 - **WHEN** 服务端有一个活跃连接（alice，IP 10.0.0.2），用户按 Ctrl-C
 - **THEN** 服务端打印关闭日志，alice 的 handle_conn task 收到 cancel 信号后退出并归还 IP，服务端在 alice 清理完成后退出；alice 的 IP 10.0.0.2 被 pool.free 归还
+
+#### Scenario: SIGTERM 触发优雅关闭
+
+- **WHEN** 服务端有一个活跃连接，向进程发送 SIGTERM
+- **THEN** 服务端打印关闭日志并走与 Ctrl-C 相同的优雅关闭流程（cancel 广播 → endpoint.close → drain conn_set → 退出）
 
 #### Scenario: 无活跃连接时 Ctrl-C 立即退出
 

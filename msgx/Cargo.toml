@@ -1,0 +1,16 @@
+[package]
+name = "msgx"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["io-util", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+prost = "0.13"
+bytes = "1"
+thiserror = "2"
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

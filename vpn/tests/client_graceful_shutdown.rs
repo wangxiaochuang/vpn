@@ -4,13 +4,9 @@ mod common;
 
 use std::time::Duration;
 
-use futures::SinkExt;
-use tokio_util::codec::Framed;
-use tokio_util::sync::CancellationToken;
 use vpn::client::heartbeat_loop;
 use vpn::ctrl::control_message::Msg;
 use vpn::ctrl::{ControlMessage, Disconnect, Heartbeat};
-use vpn::framing::ControlCodec;
 
 fn hb() -> ControlMessage {
     ControlMessage {
@@ -18,35 +14,43 @@ fn hb() -> ControlMessage {
     }
 }
 
-async fn open_control_streams(
-    pair: &common::ConnectionPair,
-) -> (
-    Framed<quinn::SendStream, ControlCodec>,
-    Framed<quinn::RecvStream, ControlCodec>,
-    Framed<quinn::SendStream, ControlCodec>,
-    Framed<quinn::RecvStream, ControlCodec>,
-) {
+type Halves = (
+    msgx::channel::Sender<ControlMessage>,
+    msgx::channel::Receiver<ControlMessage>,
+    msgx::channel::Sender<ControlMessage>,
+    msgx::channel::Receiver<ControlMessage>,
+);
+
+async fn open_control_halves(pair: &common::ConnectionPair) -> Halves {
     let (csend, crecv) = pair.client.open_bi().await.unwrap();
-    let mut client_writer = Framed::new(csend, ControlCodec::new());
-    client_writer.send(hb()).await.unwrap();
+    let client_channel = msgx::Channel::from_io(msgx::ByteStream::new(crecv, csend));
+    let (mut client_sender, client_receiver) = client_channel.split();
+    client_sender.send(hb()).await.unwrap();
+
     let (ssend, srecv) = pair.server.accept_bi().await.unwrap();
-    let client_reader = Framed::new(crecv, ControlCodec::new());
-    let server_writer = Framed::new(ssend, ControlCodec::new());
-    let server_reader = Framed::new(srecv, ControlCodec::new());
-    (client_writer, client_reader, server_writer, server_reader)
+    let server_channel = msgx::Channel::from_io(msgx::ByteStream::new(srecv, ssend));
+    let (server_sender, mut server_receiver) = server_channel.split();
+    let _ = server_receiver.recv().await.unwrap();
+
+    (
+        client_sender,
+        client_receiver,
+        server_sender,
+        server_receiver,
+    )
 }
 
 #[tokio::test]
 async fn test_client_exits_immediately_on_server_disconnect() {
     let pair = common::make_connected_pair().await;
-    let (client_writer, client_reader, mut server_writer, _server_reader) =
-        open_control_streams(&pair).await;
+    let (client_sender, client_reader, mut server_writer, _server_reader) =
+        open_control_halves(&pair).await;
 
     let hb_task = tokio::spawn(heartbeat_loop(
         pair.client.clone(),
         client_reader,
-        client_writer,
-        CancellationToken::new(),
+        client_sender,
+        shutdown::Shutdown::new(Duration::from_secs(5)).handle(),
     ));
 
     server_writer
@@ -57,7 +61,6 @@ async fn test_client_exits_immediately_on_server_disconnect() {
         })
         .await
         .expect("send disconnect");
-    let _ = server_writer.close().await;
 
     let result = tokio::time::timeout(Duration::from_secs(3), hb_task).await;
     assert!(
@@ -69,19 +72,19 @@ async fn test_client_exits_immediately_on_server_disconnect() {
 #[tokio::test]
 async fn test_client_heartbeat_exits_on_cancel() {
     let pair = common::make_connected_pair().await;
-    let (client_writer, client_reader, server_writer, server_reader) =
-        open_control_streams(&pair).await;
+    let (client_sender, client_reader, server_writer, server_reader) =
+        open_control_halves(&pair).await;
 
-    let shutdown = CancellationToken::new();
+    let sd = shutdown::Shutdown::new(Duration::from_secs(5));
     let hb_task = tokio::spawn(heartbeat_loop(
         pair.client.clone(),
         client_reader,
-        client_writer,
-        shutdown.clone(),
+        client_sender,
+        sd.handle(),
     ));
 
     tokio::task::yield_now().await;
-    shutdown.cancel();
+    sd.trigger();
 
     let result = tokio::time::timeout(Duration::from_secs(3), hb_task).await;
     assert!(
@@ -89,5 +92,5 @@ async fn test_client_heartbeat_exits_on_cancel() {
         "heartbeat loop should exit promptly when shutdown token is cancelled"
     );
     drop(server_writer);
-    let _ = server_reader;
+    drop(server_reader);
 }

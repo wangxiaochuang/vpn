@@ -141,18 +141,23 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
     → IP 立即归还池 → 路由表与 username→连接表清除 → 数据泵停止
 
 主动关闭 (V1):
-  - 服务端 Ctrl-C/SIGTERM: 广播 CancellationToken 取消信号 → 停止 accept →
-    各 handle_conn 清理 (释放 IP、移除 registry)；心跳 task 在 cancel 分支
+  - "信号 → 取消令牌 → JoinSet 带超时 drain"的协调逻辑抽为独立 workspace crate
+    `shutdown`（`Shutdown` 持有 `CancellationToken` + drain 超时；`spawn_signal_watchdog`
+    注册 SIGINT/SIGTERM → `trigger`；`wait_for_interrupt` 内联 select 兜底 ctrl_c）。
+    调用方负责 conn/endpoint 的 close 顺序编排，crate 不持有传输资源。
+  - 服务端 Ctrl-C/SIGTERM: `spawn_signal_watchdog` 捕获信号 → `Shutdown::trigger()` 广播
+    取消 → 停止 accept → 各 handle_conn 清理 (释放 IP、移除 registry)；心跳 task 在 cancel 分支
     向客户端 best-effort 发送 Disconnect { reason: "server-shutdown" }；
-    endpoint.close → 等所有连接清理 (带 5s 超时保护) → 超时 abort_all 兜底退出。
+    endpoint.close → `sd.drain(conn_set)` 等所有连接清理 (带 5s 超时保护) → 超时 abort_all 兜底退出。
     用 JoinSet 追踪所有 handle_conn task，使关闭时可 await 全部完成。
   - 客户端 Ctrl-C 或任一 task 结束: 广播 cancel → conn.close → 等三个 task
-    (心跳/上行/下行) 清理 (带 5s 超时保护) → 超时 abort 兜底 → endpoint.close
+    (心跳/上行/下行) 清理 (`sd.drain`，带 5s 超时保护) → 超时 abort 兜底 → endpoint.close
     (endpoint 生命周期由 establish_connection 返回，延长到数据面结束)。
-  - 客户端在 `run()` 入口即 spawn signal watchdog 注册 SIGINT 捕获，避免密码输入期间
-    rpassword 的 raise(SIGINT) 触发 SIG_DFL 杀死进程导致终端 ISIG 残留关闭
-    (之后 Ctrl-C 只产生字节不产生信号)；密码读取用 spawn_blocking 让出 runtime
-    保证 handler 尽快注册。收到 Ctrl-C 后 watchdog 打印关闭日志并 cancel token。
+  - 客户端在 `run()` 入口即 `shutdown::spawn_signal_watchdog` 注册 SIGINT/SIGTERM 捕获（await
+    ready 握手确保 handler 注册完成），避免密码输入期间 rpassword 的 raise(SIGINT) 触发 SIG_DFL
+    杀死进程导致终端 ISIG 残留关闭 (之后 Ctrl-C 只产生字节不产生信号)；密码读取用 spawn_blocking
+    让出 runtime 保证 handler 尽快注册。收到信号后 watchdog 打印关闭日志并 trigger。
+    `run_data_plane` 另保留 `wait_for_interrupt` 兜底 ctrl_c 分支（watchdog 注册失败时仍可响应）。
   - 客户端收到服务端 Disconnect: 心跳 task 打印原因后立即退出 (不等 30s 心跳超时)，
     触发优雅关闭流程。
   - 所有 select! 以 biased 优先 cancel 分支，CancellationToken.cancelled() 为
@@ -305,3 +310,12 @@ vpn client --config client.toml   # 以客户端模式运行
 `vpn client --config <PATH>` 启动流程：加载 `ClientConfig` → 交互式提示输入密码（不回显）→ 连接、认证、建 TUN、转发。任一步骤失败以非零退出码退出并打印错误；认证失败会打印 `AuthDenied` 的可读原因（认证失败 / 服务端繁忙）。
 
 协议定义、加密、配置解析、数据泵等共享代码置于 `vpn` crate 的 library（`vpn/src/lib.rs`），两个子命令复用。
+
+Cargo workspace 成员：
+
+| crate | 职责 |
+|-------|------|
+| `vpn` | 主库与主二进制：QUIC 控制面/数据面、TUN、路由、配置、认证 |
+| `msgx` | 控制面 framing + length-prefixed codec + 心跳 tracker（QUIC stream 适配） |
+| `shutdown` | 通用的 tokio 长驻服务优雅关闭协调（`Shutdown`：信号 → token → drain，含超时/abort 兜底） |
+| `xtask` | 开发/运维工具（如 `cargo xtask users ...` 哈希用户密码） |

@@ -1,15 +1,14 @@
 use std::net::Ipv4Addr;
-use std::time::Duration;
-use std::time::Instant;
 
 use crate::auth::{AuthError, UserStore};
 use crate::ipam::IpPool;
 
 pub use crate::vpn::*;
+pub use msgx::KEEPALIVE_INTERVAL as HEARTBEAT_INTERVAL;
+pub use msgx::KEEPALIVE_TIMEOUT as HEARTBEAT_TIMEOUT;
+pub use msgx::{KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, KeepaliveTracker, MAX_FRAME_LENGTH};
 
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
-pub const MAX_FRAME_LENGTH: usize = 65_536;
+pub type HeartbeatTracker = KeepaliveTracker;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerSideError {
@@ -35,29 +34,6 @@ pub fn authenticate(
     pool.alloc().map_err(|_| ServerSideError::PoolExhausted)
 }
 
-#[derive(Debug)]
-pub struct HeartbeatTracker {
-    last_seen: Instant,
-}
-
-impl HeartbeatTracker {
-    pub fn new(now: Instant) -> Self {
-        Self { last_seen: now }
-    }
-
-    pub fn observe(&mut self, now: Instant) {
-        self.last_seen = now;
-    }
-
-    pub fn is_dead(&self, now: Instant) -> bool {
-        now.duration_since(self.last_seen) >= HEARTBEAT_TIMEOUT
-    }
-
-    pub fn next_deadline(&self) -> Instant {
-        self.last_seen + HEARTBEAT_TIMEOUT
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -71,7 +47,7 @@ mod tests {
     use ipnet::Ipv4Net;
     use prost::Message;
     use std::net::Ipv4Addr;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn hash_password(pw: &str) -> String {
         let salt = SaltString::generate(&mut OsRng);

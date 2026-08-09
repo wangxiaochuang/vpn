@@ -4,14 +4,13 @@ mod common;
 
 use std::time::Duration;
 
-use futures::SinkExt;
-use futures::StreamExt;
-use tokio_util::codec::Framed;
-use tokio_util::sync::CancellationToken;
 use vpn::client::heartbeat_loop;
 use vpn::ctrl::control_message::Msg;
-use vpn::ctrl::{ControlMessage, Heartbeat};
-use vpn::framing::ControlCodec;
+use vpn::ctrl::{ControlMessage, Disconnect, Heartbeat};
+
+fn sd_handle() -> shutdown::ShutdownHandle {
+    shutdown::Shutdown::new(Duration::from_secs(5)).handle()
+}
 
 fn hb() -> ControlMessage {
     ControlMessage {
@@ -19,41 +18,49 @@ fn hb() -> ControlMessage {
     }
 }
 
-async fn open_control_streams(
-    pair: &common::ConnectionPair,
-) -> (
-    Framed<quinn::SendStream, ControlCodec>,
-    Framed<quinn::RecvStream, ControlCodec>,
-    Framed<quinn::SendStream, ControlCodec>,
-    Framed<quinn::RecvStream, ControlCodec>,
-) {
+type Halves = (
+    msgx::channel::Sender<ControlMessage>,
+    msgx::channel::Receiver<ControlMessage>,
+    msgx::channel::Sender<ControlMessage>,
+    msgx::channel::Receiver<ControlMessage>,
+);
+
+async fn open_control_halves(pair: &common::ConnectionPair) -> Halves {
     let (csend, crecv) = pair.client.open_bi().await.unwrap();
-    let mut client_writer = Framed::new(csend, ControlCodec::new());
-    client_writer.send(hb()).await.unwrap();
+    let client_channel = msgx::Channel::from_io(msgx::ByteStream::new(crecv, csend));
+    let (mut client_sender, client_receiver) = client_channel.split();
+    client_sender.send(hb()).await.unwrap();
+
     let (ssend, srecv) = pair.server.accept_bi().await.unwrap();
-    let client_reader = Framed::new(crecv, ControlCodec::new());
-    let server_writer = Framed::new(ssend, ControlCodec::new());
-    let server_reader = Framed::new(srecv, ControlCodec::new());
-    (client_writer, client_reader, server_writer, server_reader)
+    let server_channel = msgx::Channel::from_io(msgx::ByteStream::new(srecv, ssend));
+    let (server_sender, mut server_receiver) = server_channel.split();
+    let _ = server_receiver.recv().await.unwrap();
+
+    (
+        client_sender,
+        client_receiver,
+        server_sender,
+        server_receiver,
+    )
 }
 
 #[tokio::test]
 async fn test_client_heartbeats_from_server_keep_connection_alive() {
     let pair = common::make_connected_pair().await;
-    let (client_writer, client_reader, mut server_writer, mut server_reader) =
-        open_control_streams(&pair).await;
+    let (client_sender, client_reader, mut server_writer, mut server_reader) =
+        open_control_halves(&pair).await;
 
     let hb_task = tokio::spawn(heartbeat_loop(
         pair.client.clone(),
         client_reader,
-        client_writer,
-        CancellationToken::new(),
+        client_sender,
+        sd_handle(),
     ));
 
     tokio::time::pause();
     for _ in 0..15 {
         server_writer.send(hb()).await.unwrap();
-        let _ = tokio::time::timeout(Duration::from_millis(50), server_reader.next()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(50), server_reader.recv()).await;
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
     tokio::time::resume();
@@ -68,14 +75,14 @@ async fn test_client_heartbeats_from_server_keep_connection_alive() {
 #[tokio::test]
 async fn test_client_closes_connection_after_heartbeat_timeout() {
     let pair = common::make_connected_pair().await;
-    let (client_writer, client_reader, server_writer, server_reader) =
-        open_control_streams(&pair).await;
+    let (client_sender, client_reader, server_writer, server_reader) =
+        open_control_halves(&pair).await;
 
     let hb_task = tokio::spawn(heartbeat_loop(
         pair.client.clone(),
         client_reader,
-        client_writer,
-        CancellationToken::new(),
+        client_sender,
+        sd_handle(),
     ));
 
     tokio::time::pause();
@@ -89,23 +96,29 @@ async fn test_client_closes_connection_after_heartbeat_timeout() {
         "client should close the connection after 30s without heartbeats"
     );
     drop(server_writer);
-    let _ = server_reader;
+    drop(server_reader);
 }
 
 #[tokio::test]
 async fn test_client_exits_when_connection_closed_by_server() {
     let pair = common::make_connected_pair().await;
-    let (client_writer, client_reader, mut server_writer, server_reader) =
-        open_control_streams(&pair).await;
+    let (client_sender, client_reader, mut server_writer, _server_reader) =
+        open_control_halves(&pair).await;
 
     let hb_task = tokio::spawn(heartbeat_loop(
         pair.client.clone(),
         client_reader,
-        client_writer,
-        CancellationToken::new(),
+        client_sender,
+        sd_handle(),
     ));
 
-    let _ = server_writer.close().await;
+    let _ = server_writer
+        .send(ControlMessage {
+            msg: Some(Msg::Disconnect(Disconnect {
+                reason: "bye".to_string(),
+            })),
+        })
+        .await;
     pair.server.close(0u32.into(), b"bye");
 
     let result = tokio::time::timeout(Duration::from_secs(3), hb_task).await;
@@ -113,5 +126,4 @@ async fn test_client_exits_when_connection_closed_by_server() {
         result.is_ok(),
         "heartbeat loop should exit when server closes the connection"
     );
-    let _ = server_reader;
 }

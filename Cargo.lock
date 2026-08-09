@@ -968,6 +968,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "msgx"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "prost",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1753,6 +1765,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "shutdown"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1984,6 +2006,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -2165,6 +2188,7 @@ dependencies = [
  "getrandom 0.2.17",
  "ipnet",
  "libc",
+ "msgx",
  "password-hash",
  "prost",
  "prost-build",
@@ -2175,6 +2199,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde",
+ "shutdown",
  "tempfile",
  "thiserror",
  "tokio",

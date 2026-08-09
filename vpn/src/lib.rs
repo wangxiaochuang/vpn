@@ -22,9 +22,9 @@ pub mod ctrl;
 pub mod data;
 pub mod framing;
 pub mod ipam;
+pub mod quinn_stream;
 pub mod route;
 pub mod server;
-pub mod shutdown;
 pub mod tls;
 pub mod tun_setup;
 

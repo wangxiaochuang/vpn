@@ -1,9 +1,10 @@
 use std::future::Future;
 use std::io;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio_util::sync::CancellationToken;
+use shutdown::ShutdownHandle;
 
 pub fn dst_ipv4_addr(pkt: &[u8]) -> Option<Ipv4Addr> {
     let first = *pkt.first()?;
@@ -29,7 +30,7 @@ pub trait DownlinkDispatcher {
 pub async fn forward<S: PacketSource + Unpin, K: PacketSink + Unpin>(
     source: &mut S,
     sink: &mut K,
-    cancel: &CancellationToken,
+    cancel: &ShutdownHandle,
 ) -> io::Result<()> {
     loop {
         let pkt = tokio::select! {
@@ -44,7 +45,7 @@ pub async fn forward<S: PacketSource + Unpin, K: PacketSink + Unpin>(
 pub async fn downlink_pump<S: PacketSource + Unpin, D: DownlinkDispatcher>(
     tun: &mut S,
     dispatcher: &D,
-    cancel: &CancellationToken,
+    cancel: &ShutdownHandle,
 ) -> io::Result<()> {
     loop {
         let pkt = tokio::select! {
@@ -56,23 +57,32 @@ pub async fn downlink_pump<S: PacketSource + Unpin, D: DownlinkDispatcher>(
     }
 }
 
-const TUN_RECV_BUF_SIZE: usize = 1280;
+pub const TUN_RECV_BUF_SIZE: usize = 65_535;
 
-impl PacketSource for tun_rs::AsyncDevice {
+#[derive(Clone)]
+pub struct Tun(pub Arc<tun_rs::AsyncDevice>);
+
+impl std::fmt::Debug for Tun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Tun").finish_non_exhaustive()
+    }
+}
+
+impl PacketSource for Tun {
     fn recv(&mut self) -> impl Future<Output = io::Result<Bytes>> + Send {
         async move {
             let mut buf = vec![0u8; TUN_RECV_BUF_SIZE];
-            let n = tun_rs::AsyncDevice::recv(self, &mut buf).await?;
+            let n = tun_rs::AsyncDevice::recv(&self.0, &mut buf).await?;
             buf.truncate(n);
             Ok(Bytes::from(buf))
         }
     }
 }
 
-impl PacketSink for tun_rs::AsyncDevice {
+impl PacketSink for Tun {
     fn send(&mut self, pkt: Bytes) -> impl Future<Output = io::Result<()>> + Send {
         async move {
-            tun_rs::AsyncDevice::send(self, &pkt).await?;
+            tun_rs::AsyncDevice::send(&self.0, &pkt).await?;
             Ok(())
         }
     }
@@ -118,6 +128,10 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    fn sd_handle() -> ShutdownHandle {
+        shutdown::Shutdown::new(Duration::from_secs(5)).handle()
+    }
 
     struct ChannelSource {
         rx: mpsc::Receiver<Bytes>,
@@ -207,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_forward_cancel_when_source_hanging_returns_ok() {
-        let cancel = CancellationToken::new();
+        let cancel = sd_handle();
         let (src_tx, src_rx) = mpsc::channel::<Bytes>(8);
         let (sink_tx, mut sink_rx) = mpsc::channel::<Bytes>(8);
         let mut source = ChannelSource { rx: src_rx };
@@ -234,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_forward_cancel_biased_priority_over_ready_recv() {
-        let cancel = CancellationToken::new();
+        let cancel = sd_handle();
         let (src_tx, src_rx) = mpsc::channel::<Bytes>(8);
         let (sink_tx, mut sink_rx) = mpsc::channel::<Bytes>(8);
 
@@ -260,7 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_forward_uncancelled_relays_packets_until_source_error() {
-        let cancel = CancellationToken::new();
+        let cancel = sd_handle();
         let (src_tx, src_rx) = mpsc::channel::<Bytes>(8);
         let (sink_tx, mut sink_rx) = mpsc::channel::<Bytes>(8);
 
@@ -283,7 +297,7 @@ mod tests {
     fn spawn_downlink_pump(
         tun_rx: mpsc::Receiver<Bytes>,
         disp_tx: mpsc::UnboundedSender<Bytes>,
-        cancel: &CancellationToken,
+        cancel: &ShutdownHandle,
     ) -> tokio::task::JoinHandle<io::Result<()>> {
         let mut tun = ChannelSource { rx: tun_rx };
         let dispatcher = RecordingDispatcher { tx: disp_tx };
@@ -293,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_downlink_pump_cancel_when_tun_hanging_returns_ok() {
-        let cancel = CancellationToken::new();
+        let cancel = sd_handle();
         let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(8);
         let (disp_tx, mut disp_rx) = mpsc::unbounded_channel::<Bytes>();
         let task = spawn_downlink_pump(tun_rx, disp_tx, &cancel);
@@ -313,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_downlink_pump_uncancelled_relays_until_tun_error() {
-        let cancel = CancellationToken::new();
+        let cancel = sd_handle();
         let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(8);
         let (disp_tx, mut disp_rx) = mpsc::unbounded_channel::<Bytes>();
 
@@ -329,5 +343,25 @@ mod tests {
 
         assert_eq!(disp_rx.recv().await.unwrap(), Bytes::from_static(b"p1"));
         assert!(disp_rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn test_tun_impls_packet_source_sink_and_clone() {
+        fn assert_traits<T: PacketSource + PacketSink + Clone>() {}
+        assert_traits::<Tun>();
+    }
+
+    #[test]
+    fn test_tun_recv_buf_size_covers_max_ipv4_packet_length() {
+        use crate::config::MIN_MTU;
+        assert_eq!(TUN_RECV_BUF_SIZE, 65_535);
+        assert!(TUN_RECV_BUF_SIZE >= usize::from(MIN_MTU));
+    }
+
+    /// Spec scenario: `TUN_RECV_BUF_SIZE 覆盖最大 IPv4 包长度` —
+    /// 该常量 SHALL 等于 65535（`u16::MAX`），覆盖 IPv4 total length 字段最大值。
+    #[test]
+    fn test_tun_recv_buf_size_equals_u16_max() {
+        assert_eq!(TUN_RECV_BUF_SIZE, u16::MAX as usize);
     }
 }

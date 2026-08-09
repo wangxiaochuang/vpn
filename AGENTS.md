@@ -36,7 +36,7 @@ cargo fmt --check           # 格式检查
 
 - **不要添加注释**，除非被明确要求。
 - 遵循仓库现有的代码风格与依赖选择；引入新 crate 前先确认是否已有合适方案。
-- 修改架构相关代码前，对照 `doc/arch-v1.md` 中的决策记录，确保一致；如有架构变更，同步更新该文档。
+- 修改架构相关代码前，对照 `doc/arch-v2.md` 中的决策记录，确保一致；如有架构变更，同步更新该文档。
 - 证书生成参考 `vpn/examples/tlsgen.rs`；自签证书已存在于根目录 `cert.pem` / `key.pem`。
 - 本仓库为 Cargo workspace：`vpn/`（主库与主 bin，含 `src/`、`tests/`、`examples/`、`proto/`）、`xtask/`（开发/运维工具，`cargo xtask ...`）。
 
@@ -45,6 +45,7 @@ cargo fmt --check           # 格式检查
 1. 函数非空非注释行 ≤ 20（clippy too_many_lines 阈值）
 2. 认知复杂度 ≤ 15（clippy cognitive_complexity）
 3. 收尾前必须跑 cargo clippy --all-targets -- -D warnings 并确认 0 警告
+4. 尽可能使用函数式编程风格，避免使用状态变量。
 
 ## 测试策略
 

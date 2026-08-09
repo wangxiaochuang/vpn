@@ -25,7 +25,7 @@ async fn auth_alice(
 
 #[tokio::test]
 async fn test_shutdown_cancel_frees_ip_and_clears_registry() {
-    let (endpoint, state, shutdown) = common::start_test_server_with_shutdown(
+    let (endpoint, state, sd) = common::start_test_server_with_shutdown(
         common::alice_users(),
         Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap(),
     )
@@ -45,7 +45,7 @@ async fn test_shutdown_cancel_frees_ip_and_clears_registry() {
         "alice should be in registry while connected"
     );
 
-    shutdown.cancel();
+    sd.trigger();
 
     let cleaned = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -71,7 +71,7 @@ async fn test_shutdown_cancel_frees_ip_and_clears_registry() {
 
 #[tokio::test]
 async fn test_shutdown_cancel_sends_disconnect_to_client() {
-    let (endpoint, _state, shutdown) = common::start_test_server_with_shutdown(
+    let (endpoint, _state, sd) = common::start_test_server_with_shutdown(
         common::alice_users(),
         Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap(),
     )
@@ -80,7 +80,7 @@ async fn test_shutdown_cancel_sends_disconnect_to_client() {
 
     let (_conn, mut framed, _ip) = auth_alice(addr).await;
 
-    shutdown.cancel();
+    sd.trigger();
 
     let mut got_disconnect = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -99,5 +99,44 @@ async fn test_shutdown_cancel_sends_disconnect_to_client() {
     assert!(
         got_disconnect,
         "client should receive a Disconnect {{ reason: \"server-shutdown\" }} after server shutdown"
+    );
+}
+
+#[tokio::test]
+async fn test_shutdown_on_sigterm_sends_disconnect_to_client() {
+    let (endpoint, _state, sd) = common::start_test_server_with_shutdown(
+        common::alice_users(),
+        Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap(),
+    )
+    .await;
+    let ready = shutdown::spawn_signal_watchdog(sd.clone());
+    ready
+        .await
+        .expect("watchdog should finish registering signal handlers");
+    let addr = endpoint.local_addr().unwrap();
+
+    let (_conn, mut framed, _ip) = auth_alice(addr).await;
+
+    unsafe {
+        libc::kill(libc::getpid(), libc::SIGTERM);
+    }
+
+    let mut got_disconnect = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), framed.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Some(Msg::Disconnect(ref d)) = msg.msg {
+                    assert_eq!(d.reason, "server-shutdown");
+                    got_disconnect = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        got_disconnect,
+        "client should receive Disconnect after SIGTERM triggers graceful shutdown"
     );
 }

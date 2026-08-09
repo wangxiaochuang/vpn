@@ -7,42 +7,15 @@ use thiserror::Error;
 
 use crate::config::ClientConfig;
 use crate::config::MIN_MTU;
-use crate::ctrl::{HEARTBEAT_INTERVAL, HeartbeatTracker};
-use crate::data::{PacketSink, PacketSource, QuinnDatagram, forward};
-use crate::framing::ControlCodec;
-use crate::server::ControlStream;
+use crate::ctrl::KeepaliveTracker;
+use crate::data::{QuinnDatagram, Tun, forward};
 use crate::vpn::AuthOk;
+use crate::vpn::ControlMessage;
 use crate::vpn::control_message::Msg;
-use futures::{SinkExt, StreamExt};
-use tokio_util::codec::{Framed, FramedParts};
-use tokio_util::sync::CancellationToken;
-
-pub struct TunSource(pub std::sync::Arc<tun_rs::AsyncDevice>);
-
-impl PacketSource for TunSource {
-    fn recv(&mut self) -> impl std::future::Future<Output = std::io::Result<bytes::Bytes>> + Send {
-        async move {
-            let mut buf = vec![0u8; 1280];
-            let n = tun_rs::AsyncDevice::recv(&self.0, &mut buf).await?;
-            buf.truncate(n);
-            Ok(bytes::Bytes::from(buf))
-        }
-    }
-}
-
-pub struct TunSink(pub std::sync::Arc<tun_rs::AsyncDevice>);
-
-impl PacketSink for TunSink {
-    fn send(
-        &mut self,
-        pkt: bytes::Bytes,
-    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-        async move {
-            tun_rs::AsyncDevice::send(&self.0, &pkt).await?;
-            Ok(())
-        }
-    }
-}
+use msgx::channel::{Receiver, Sender};
+use msgx::{Channel, KEEPALIVE_INTERVAL};
+use shutdown::Shutdown;
+use shutdown::ShutdownHandle;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientTunParams {
@@ -146,46 +119,22 @@ fn deny_reason_text(reason: i32) -> &'static str {
     }
 }
 
-pub fn spawn_signal_watchdog() -> CancellationToken {
-    spawn_signal_watchdog_inner().0
-}
-
-fn spawn_signal_watchdog_inner() -> (CancellationToken, tokio::sync::oneshot::Receiver<()>) {
-    let shutdown = CancellationToken::new();
-    let ctrl_shutdown = shutdown.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        {
-            Ok(sig) => sig,
-            Err(e) => {
-                tracing::warn!("failed to register SIGINT handler: {e}");
-                return;
-            }
-        };
-        let _ = ready_tx.send(());
-        if sig.recv().await.is_some() {
-            tracing::info!("received Ctrl+C, initiating graceful shutdown");
-            ctrl_shutdown.cancel();
-        }
-    });
-    (shutdown, ready_rx)
-}
-
 pub async fn run(config: ClientConfig) -> anyhow::Result<()> {
-    let shutdown = spawn_signal_watchdog();
+    let sd = Shutdown::new(Duration::from_secs(5));
+    let ready = shutdown::spawn_signal_watchdog(sd.clone());
+    let _ = ready.await;
     let password = tokio::task::spawn_blocking(move || rpassword::prompt_password("请输入密码："))
         .await
         .context("password prompt task panicked")??;
-    run_with_credentials(config, password, shutdown).await
+    run_with_credentials(config, password, sd).await
 }
 
 pub async fn run_with_credentials(
     config: ClientConfig,
     password: String,
-    shutdown: CancellationToken,
+    sd: Shutdown,
 ) -> anyhow::Result<()> {
-    let (endpoint, conn, framed, params) = establish_connection(&config, password).await?;
+    let (endpoint, conn, channel, params) = establish_connection(&config, password).await?;
     let tun = setup_tun(&params)?;
     tracing::info!(
         "authenticated as {}, assigned_ip={}, subnet={}, mtu={}",
@@ -194,7 +143,7 @@ pub async fn run_with_credentials(
         params.subnet,
         params.mtu
     );
-    run_data_plane(&conn, tun, framed, endpoint, shutdown).await
+    run_data_plane(&conn, tun, channel, endpoint, sd).await
 }
 
 async fn establish_connection(
@@ -203,7 +152,7 @@ async fn establish_connection(
 ) -> anyhow::Result<(
     quinn::Endpoint,
     quinn::Connection,
-    ControlFramed,
+    Channel<ControlMessage>,
     ClientTunParams,
 )> {
     let endpoint = connect_quic()?;
@@ -218,47 +167,42 @@ async fn establish_connection(
         .await
         .context("failed to connect to server")?;
     tracing::info!("connected to {}", config.server);
-    let mut framed = open_control_stream(&conn).await?;
-    let params = authenticate(&mut framed, &config.username, password).await?;
-    Ok((endpoint, conn, framed, params))
+    let mut channel = open_control_stream(&conn).await?;
+    let params = authenticate(&mut channel, &config.username, password).await?;
+    Ok((endpoint, conn, channel, params))
 }
 
 fn connect_quic() -> anyhow::Result<quinn::Endpoint> {
     quinn::Endpoint::client("0.0.0.0:0".parse()?).context("failed to bind client endpoint")
 }
 
-async fn open_control_stream(conn: &quinn::Connection) -> anyhow::Result<ControlFramed> {
-    let (send, recv) = conn
-        .open_bi()
+async fn open_control_stream(conn: &quinn::Connection) -> anyhow::Result<Channel<ControlMessage>> {
+    crate::quinn_stream::open_bi(conn)
         .await
-        .context("failed to open control stream")?;
-    Ok(Framed::new(
-        ControlStream::new(send, recv),
-        ControlCodec::new(),
-    ))
+        .context("failed to open control stream")
 }
 
 async fn authenticate(
-    framed: &mut ControlFramed,
+    channel: &mut Channel<ControlMessage>,
     username: &str,
     password: String,
 ) -> anyhow::Result<ClientTunParams> {
-    send_auth_request(framed, username, password).await?;
-    let first = framed
-        .next()
+    send_auth_request(channel, username, password).await?;
+    let first = channel
+        .recv()
         .await
-        .ok_or_else(|| anyhow!("control stream closed before AuthOk"))?
-        .context("failed to decode first response")?;
+        .map_err(|e| anyhow!("failed to decode first response: {e}"))?
+        .ok_or_else(|| anyhow!("control stream closed before AuthOk"))?;
     interpret_auth_response(first)
 }
 
 async fn send_auth_request(
-    framed: &mut ControlFramed,
+    channel: &mut Channel<ControlMessage>,
     username: &str,
     password: String,
 ) -> anyhow::Result<()> {
-    framed
-        .send(crate::vpn::ControlMessage {
+    channel
+        .send(ControlMessage {
             msg: Some(Msg::AuthRequest(crate::vpn::AuthRequest {
                 username: username.to_string(),
                 password,
@@ -268,7 +212,7 @@ async fn send_auth_request(
         .context("failed to send AuthRequest")
 }
 
-fn interpret_auth_response(first: crate::vpn::ControlMessage) -> anyhow::Result<ClientTunParams> {
+fn interpret_auth_response(first: ControlMessage) -> anyhow::Result<ClientTunParams> {
     match first.msg {
         Some(Msg::AuthOk(ok)) => parse_auth_ok(&ok).map_err(Into::into),
         Some(Msg::AuthDenied(denied)) => {
@@ -292,20 +236,14 @@ fn setup_tun(params: &ClientTunParams) -> anyhow::Result<std::sync::Arc<tun_rs::
     Ok(std::sync::Arc::new(tun))
 }
 
-type ControlFramed = Framed<ControlStream, ControlCodec>;
-type HeartbeatReader = Framed<quinn::RecvStream, ControlCodec>;
-type HeartbeatWriter = Framed<quinn::SendStream, ControlCodec>;
-
 pub async fn heartbeat_loop(
     conn: quinn::Connection,
-    reader: HeartbeatReader,
-    writer: HeartbeatWriter,
-    shutdown: CancellationToken,
+    mut reader: Receiver<ControlMessage>,
+    mut writer: Sender<ControlMessage>,
+    shutdown: ShutdownHandle,
 ) {
-    let mut reader = reader;
-    let mut writer = writer;
-    let mut tracker = HeartbeatTracker::new(tokio::time::Instant::now().into_std());
-    let mut send_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut tracker = KeepaliveTracker::new(now());
+    let mut send_tick = tokio::time::interval(KEEPALIVE_INTERVAL);
     let mut timeout_tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         let should_break = tokio::select! {
@@ -313,7 +251,7 @@ pub async fn heartbeat_loop(
             () = shutdown.cancelled() => true,
             _ = timeout_tick.tick() => close_if_dead(&conn, &tracker),
             _ = send_tick.tick() => send_heartbeat(&mut writer).await.is_err(),
-            msg = reader.next() => !handle_heartbeat_msg(msg, &mut tracker),
+            msg = reader.recv() => !handle_control_msg(msg, &mut tracker),
         };
         if should_break {
             break;
@@ -321,8 +259,12 @@ pub async fn heartbeat_loop(
     }
 }
 
-fn close_if_dead(conn: &quinn::Connection, tracker: &HeartbeatTracker) -> bool {
-    if tracker.is_dead(tokio::time::Instant::now().into_std()) {
+fn now() -> std::time::Instant {
+    tokio::time::Instant::now().into_std()
+}
+
+fn close_if_dead(conn: &quinn::Connection, tracker: &KeepaliveTracker) -> bool {
+    if tracker.is_dead(now()) {
         conn.close(0x100u32.into(), b"timeout");
         true
     } else {
@@ -330,31 +272,28 @@ fn close_if_dead(conn: &quinn::Connection, tracker: &HeartbeatTracker) -> bool {
     }
 }
 
-async fn send_heartbeat(writer: &mut HeartbeatWriter) -> Result<(), ()> {
-    let hb = crate::vpn::ControlMessage {
+async fn send_heartbeat(writer: &mut Sender<ControlMessage>) -> Result<(), ()> {
+    let hb = ControlMessage {
         msg: Some(Msg::Heartbeat(crate::vpn::Heartbeat {})),
     };
     writer.send(hb).await.map_err(|_| ())
 }
 
-fn handle_heartbeat_msg<E>(
-    msg: Option<std::result::Result<crate::vpn::ControlMessage, E>>,
-    tracker: &mut HeartbeatTracker,
+fn handle_control_msg(
+    msg: Result<Option<ControlMessage>, msgx::RecvError>,
+    tracker: &mut KeepaliveTracker,
 ) -> bool {
     match msg {
-        Some(Ok(crate::vpn::ControlMessage {
-            msg: Some(Msg::Heartbeat(_)),
-        })) => {
-            tracker.observe(tokio::time::Instant::now().into_std());
-            true
-        }
-        Some(Ok(crate::vpn::ControlMessage {
+        Ok(Some(ControlMessage {
             msg: Some(Msg::Disconnect(d)),
         })) => {
             tracing::info!("server disconnected: {}", d.reason);
             false
         }
-        Some(Ok(_)) => true,
+        Ok(Some(_)) => {
+            tracker.observe(now());
+            true
+        }
         _ => false,
     }
 }
@@ -362,93 +301,68 @@ fn handle_heartbeat_msg<E>(
 async fn run_data_plane(
     conn: &quinn::Connection,
     tun: std::sync::Arc<tun_rs::AsyncDevice>,
-    framed: ControlFramed,
+    channel: Channel<ControlMessage>,
     endpoint: quinn::Endpoint,
-    shutdown: CancellationToken,
+    sd: Shutdown,
 ) -> anyhow::Result<()> {
-    let (reader, writer) = split_control_stream(framed);
-    let mut tasks = spawn_data_tasks(conn, tun, reader, writer, &shutdown);
-    wait_for_shutdown(&shutdown).await;
+    let (writer, reader) = channel.split();
+    let mut tasks = spawn_data_tasks(conn, tun, reader, writer, &sd);
+    shutdown::wait_for_interrupt(&sd).await;
     conn.close(0u32.into(), b"client-shutdown");
-    crate::shutdown::drain_with_timeout(&mut tasks, Duration::from_secs(5), "client").await;
+    sd.drain(&mut tasks, "client").await;
     endpoint.close(0u32.into(), b"client-shutdown");
     Ok(())
-}
-
-fn split_control_stream(framed: ControlFramed) -> (HeartbeatReader, HeartbeatWriter) {
-    let parts = framed.into_parts();
-    let control_stream = parts.io;
-    let read_buf = parts.read_buf;
-    let (send_stream, recv_stream) = control_stream.into_parts();
-    let mut reader_parts = FramedParts::new(recv_stream, ControlCodec::new());
-    reader_parts.read_buf = read_buf;
-    let reader = Framed::from_parts(reader_parts);
-    let writer = Framed::new(send_stream, ControlCodec::new());
-    (reader, writer)
 }
 
 fn spawn_data_tasks(
     conn: &quinn::Connection,
     tun: std::sync::Arc<tun_rs::AsyncDevice>,
-    reader: HeartbeatReader,
-    writer: HeartbeatWriter,
-    shutdown: &CancellationToken,
+    reader: Receiver<ControlMessage>,
+    writer: Sender<ControlMessage>,
+    sd: &Shutdown,
 ) -> tokio::task::JoinSet<()> {
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     let conn_for_hb = conn.clone();
-    let ctrl_shutdown = shutdown.clone();
+    let hb_handle = sd.handle();
     tasks.spawn(async move {
-        heartbeat_loop(conn_for_hb, reader, writer, ctrl_shutdown.clone()).await;
-        ctrl_shutdown.cancel();
+        heartbeat_loop(conn_for_hb, reader, writer, hb_handle.clone()).await;
+        hb_handle.cancel();
     });
-    spawn_uplink(conn, tun.clone(), shutdown, &mut tasks);
-    spawn_downlink(conn, tun, shutdown, &mut tasks);
+    spawn_uplink(conn, tun.clone(), sd.handle(), &mut tasks);
+    spawn_downlink(conn, tun, sd.handle(), &mut tasks);
     tasks
 }
 
 fn spawn_uplink(
     conn: &quinn::Connection,
     tun: std::sync::Arc<tun_rs::AsyncDevice>,
-    shutdown: &CancellationToken,
+    shutdown: ShutdownHandle,
     tasks: &mut tokio::task::JoinSet<()>,
 ) {
     let uplink_conn = conn.clone();
-    let uplink_shutdown = shutdown.clone();
     tasks.spawn(async move {
-        let mut source = TunSource(tun);
+        let mut source = Tun(tun);
         let mut sink = QuinnDatagram::new(uplink_conn.clone());
-        let _ = forward(&mut source, &mut sink, &uplink_shutdown).await;
+        let _ = forward(&mut source, &mut sink, &shutdown).await;
         uplink_conn.close(0x101u32.into(), b"uplink-ended");
-        uplink_shutdown.cancel();
+        shutdown.cancel();
     });
 }
 
 fn spawn_downlink(
     conn: &quinn::Connection,
     tun: std::sync::Arc<tun_rs::AsyncDevice>,
-    shutdown: &CancellationToken,
+    shutdown: ShutdownHandle,
     tasks: &mut tokio::task::JoinSet<()>,
 ) {
     let downlink_conn = conn.clone();
-    let downlink_shutdown = shutdown.clone();
     tasks.spawn(async move {
         let mut source = QuinnDatagram::new(downlink_conn.clone());
-        let mut sink = TunSink(tun);
-        let _ = forward(&mut source, &mut sink, &downlink_shutdown).await;
+        let mut sink = Tun(tun);
+        let _ = forward(&mut source, &mut sink, &shutdown).await;
         downlink_conn.close(0x102u32.into(), b"downlink-ended");
-        downlink_shutdown.cancel();
+        shutdown.cancel();
     });
-}
-
-async fn wait_for_shutdown(shutdown: &CancellationToken) {
-    tokio::select! {
-        biased;
-        () = shutdown.cancelled() => {}
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received Ctrl+C, initiating graceful shutdown");
-            shutdown.cancel();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -472,16 +386,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_signal_watchdog_cancels_on_sigint() {
-        let (shutdown, ready) = spawn_signal_watchdog_inner();
+        let sd = Shutdown::new(Duration::from_secs(5));
+        let ready = shutdown::spawn_signal_watchdog(sd.clone());
         ready
             .await
             .expect("watchdog should finish registering the SIGINT handler");
         unsafe {
             libc::kill(libc::getpid(), libc::SIGINT);
         }
-        tokio::time::timeout(std::time::Duration::from_secs(3), shutdown.cancelled())
+        tokio::time::timeout(Duration::from_secs(3), sd.triggered())
             .await
-            .expect("watchdog should cancel the token when SIGINT is received");
+            .expect("watchdog should trigger the Shutdown when SIGINT is received");
     }
 
     #[test]

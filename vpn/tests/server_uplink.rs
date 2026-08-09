@@ -8,8 +8,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use vpn::data::{PacketSink, QuinnDatagram, forward};
+
+fn sd_handle() -> shutdown::ShutdownHandle {
+    shutdown::Shutdown::new(Duration::from_secs(5)).handle()
+}
 
 struct ChannelSink {
     tx: mpsc::Sender<Bytes>,
@@ -42,7 +45,7 @@ async fn test_client_datagram_forwarded_to_sink() {
     let mut source = QuinnDatagram::new(pair.server.clone());
 
     let forward_task = tokio::spawn(async move {
-        let _ = forward(&mut source, &mut sink, &CancellationToken::new()).await;
+        let _ = forward(&mut source, &mut sink, &sd_handle()).await;
     });
 
     let pkt = make_ipv4_packet([10, 0, 0, 2]);
@@ -69,9 +72,7 @@ async fn test_uplink_exits_on_connection_close() {
     let mut source = QuinnDatagram::new(pair.server.clone());
 
     let forward_task =
-        tokio::spawn(
-            async move { forward(&mut source, &mut sink, &CancellationToken::new()).await },
-        );
+        tokio::spawn(async move { forward(&mut source, &mut sink, &sd_handle()).await });
 
     pair.client.close(0u32.into(), b"bye");
 

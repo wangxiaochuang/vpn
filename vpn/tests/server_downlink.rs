@@ -8,9 +8,12 @@ use std::net::Ipv4Addr;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use vpn::data::{DownlinkDispatcher, PacketSource, downlink_pump};
 use vpn::server::RegistryDispatcher;
+
+fn sd_handle() -> shutdown::ShutdownHandle {
+    shutdown::Shutdown::new(std::time::Duration::from_secs(5)).handle()
+}
 
 struct ChannelSource {
     rx: mpsc::Receiver<Bytes>,
@@ -155,7 +158,7 @@ async fn test_downlink_pump_relays_multiple_packets_in_order_and_exits_on_tun_cl
     };
     let pump_result = {
         let mut tun = ChannelSource { rx: src_rx };
-        downlink_pump(&mut tun, &dispatcher, &CancellationToken::new()).await
+        downlink_pump(&mut tun, &dispatcher, &sd_handle()).await
     };
     assert!(pump_result.is_err());
 
@@ -192,7 +195,7 @@ async fn test_downlink_pump_continues_after_miss() {
     };
     let _ = {
         let mut tun = ChannelSource { rx: src_rx };
-        downlink_pump(&mut tun, &dispatcher, &CancellationToken::new()).await
+        downlink_pump(&mut tun, &dispatcher, &sd_handle()).await
     };
 
     let r1 = pair.client.read_datagram().await.unwrap();

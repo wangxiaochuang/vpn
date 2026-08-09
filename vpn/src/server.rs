@@ -1,27 +1,22 @@
 use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::auth::UserStore;
 use crate::config::ServerConfig;
-use crate::ctrl::{self, HEARTBEAT_INTERVAL, HeartbeatTracker, deny_reason_from};
-use crate::data::{
-    DownlinkDispatcher, PacketSink, PacketSource, QuinnDatagram, downlink_pump, dst_ipv4_addr,
-    forward,
-};
-use crate::framing::ControlCodec;
+use crate::ctrl::{self, deny_reason_from};
+use crate::data::{DownlinkDispatcher, QuinnDatagram, Tun, downlink_pump, dst_ipv4_addr, forward};
 use crate::ipam::IpPool;
 use crate::route::SessionRegistry;
 use crate::tun_setup::gateway_addr;
 use crate::vpn::control_message::Msg;
 use crate::vpn::{AuthDenied, AuthOk, ControlMessage, Disconnect, Heartbeat};
-use futures::{SinkExt, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_util::codec::{Framed, FramedParts};
-use tokio_util::sync::CancellationToken;
+use msgx::channel::{Receiver, Sender};
+use msgx::{Channel, KEEPALIVE_INTERVAL, KeepaliveTracker};
+use shutdown::Shutdown;
+use shutdown::ShutdownHandle;
 
 #[derive(Debug)]
 pub struct ConnectionHandle {
@@ -78,76 +73,6 @@ pub struct ServerState {
 
 pub type SharedState = Arc<ServerState>;
 
-pub struct TunSource(pub Arc<tun_rs::AsyncDevice>);
-
-impl PacketSource for TunSource {
-    fn recv(&mut self) -> impl std::future::Future<Output = std::io::Result<bytes::Bytes>> + Send {
-        async move {
-            let mut buf = vec![0u8; 1280];
-            let n = tun_rs::AsyncDevice::recv(&self.0, &mut buf).await?;
-            buf.truncate(n);
-            Ok(bytes::Bytes::from(buf))
-        }
-    }
-}
-
-pub struct TunSink(pub Arc<tun_rs::AsyncDevice>);
-
-impl PacketSink for TunSink {
-    fn send(
-        &mut self,
-        pkt: bytes::Bytes,
-    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
-        async move {
-            tun_rs::AsyncDevice::send(&self.0, &pkt).await?;
-            Ok(())
-        }
-    }
-}
-
-pub struct ControlStream {
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
-}
-
-impl ControlStream {
-    pub fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        Self { send, recv }
-    }
-
-    pub fn into_parts(self) -> (quinn::SendStream, quinn::RecvStream) {
-        (self.send, self.recv)
-    }
-}
-
-impl AsyncRead for ControlStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        AsyncRead::poll_read(Pin::new(&mut self.recv), cx, buf)
-    }
-}
-
-impl AsyncWrite for ControlStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        AsyncWrite::poll_flush(Pin::new(&mut self.send), cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
-    }
-}
-
 pub struct RegistryDispatcher {
     pub state: SharedState,
 }
@@ -171,81 +96,156 @@ impl DownlinkDispatcher for RegistryDispatcher {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn handle_conn(
     conn: quinn::Connection,
     state: SharedState,
-    shutdown: CancellationToken,
+    shutdown: ShutdownHandle,
 ) -> anyhow::Result<()> {
-    let (send, recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to accept control stream: {e}"))?;
-    let mut framed = Framed::new(ControlStream::new(send, recv), ControlCodec::new());
-
-    let first = framed
-        .next()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("control stream closed before first message"))?
-        .map_err(|e| anyhow::anyhow!("failed to decode first message: {e}"))?;
-
-    let Some(Msg::AuthRequest(req)) = first.msg else {
-        conn.close(0u32.into(), b"protocol-error");
+    let Some((channel, ip)) = setup_session(&conn, &state).await? else {
         return Ok(());
     };
+    let (sender, receiver) = channel.split();
+    let conn_for_hb = conn.clone();
+    let shutdown_for_hb = shutdown.clone();
+    let ctrl_task = tokio::spawn(async move {
+        run_ctrl_loop(conn_for_hb, sender, receiver, shutdown_for_hb).await;
+    });
 
-    let auth_result = {
+    let uplink_task = spawn_uplink(&state, &conn, shutdown);
+    let _ = ctrl_task.await;
+    if let Some(t) = uplink_task {
+        let _ = t.await;
+    }
+    cleanup_session(&state, ip);
+    Ok(())
+}
+
+async fn setup_session(
+    conn: &quinn::Connection,
+    state: &SharedState,
+) -> anyhow::Result<Option<(Channel<ControlMessage>, Ipv4Addr)>> {
+    let mut channel = crate::quinn_stream::accept_bi::<ControlMessage>(conn)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to accept control stream: {e}"))?;
+    let Some(req) = recv_auth_request(&mut channel, conn).await? else {
+        return Ok(None);
+    };
+    let ip = match resolve_auth(state, &req) {
+        AuthResolution::Denied(reason) => {
+            finish_denied(channel, conn, reason).await;
+            return Ok(None);
+        }
+        AuthResolution::Ok(ip) => ip,
+    };
+    if !register_and_evict(state, &req.username, ip, conn) {
+        return Ok(None);
+    }
+    send_auth_ok(&mut channel, state, ip).await?;
+    Ok(Some((channel, ip)))
+}
+
+async fn recv_auth_request(
+    channel: &mut Channel<ControlMessage>,
+    conn: &quinn::Connection,
+) -> anyhow::Result<Option<crate::vpn::AuthRequest>> {
+    let first = channel
+        .recv_timeout(FIRST_MSG_TIMEOUT)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to receive first message: {e}"))?;
+    if let Some(Msg::AuthRequest(req)) = first.msg {
+        Ok(Some(req))
+    } else {
+        conn.close(0u32.into(), b"protocol-error");
+        Ok(None)
+    }
+}
+
+enum AuthResolution {
+    Ok(Ipv4Addr),
+    Denied(crate::vpn::DenyReason),
+}
+
+fn resolve_auth(state: &SharedState, req: &crate::vpn::AuthRequest) -> AuthResolution {
+    let result = {
         let mut pool = state
             .pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ctrl::authenticate(&state.users, &mut pool, &req)
+        ctrl::authenticate(&state.users, &mut pool, req)
     };
+    match result {
+        Ok(ip) => AuthResolution::Ok(ip),
+        Err(e) => AuthResolution::Denied(deny_reason_from(&e)),
+    }
+}
 
-    let ip = match auth_result {
-        Ok(ip) => ip,
-        Err(e) => {
-            let deny = ControlMessage {
-                msg: Some(Msg::AuthDenied(AuthDenied {
-                    reason: deny_reason_from(&e) as i32,
-                })),
-            };
-            let _ = framed.send(deny).await;
-            let _ = framed.close().await;
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            conn.close(0u32.into(), b"auth-denied");
-            return Ok(());
-        }
+async fn finish_denied(
+    mut channel: Channel<ControlMessage>,
+    conn: &quinn::Connection,
+    reason: crate::vpn::DenyReason,
+) {
+    let deny = ControlMessage {
+        msg: Some(Msg::AuthDenied(AuthDenied {
+            reason: reason as i32,
+        })),
     };
+    let _ = channel.send(deny).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    conn.close(0u32.into(), b"auth-denied");
+}
+
+fn register_and_evict(
+    state: &SharedState,
+    username: &str,
+    ip: Ipv4Addr,
+    conn: &quinn::Connection,
+) -> bool {
     let handle = ConnectionHandle::new(conn.clone(), ip);
     let evicted = {
         let mut reg = state
             .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reg.insert(&req.username, ip, handle)
+        reg.insert(username, ip, handle)
     };
-
     match evicted {
         Ok(Some(evicted)) => {
-            {
-                let mut pool = state
-                    .pool
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = pool.free(evicted.ip);
-            }
+            free_ip(state, evicted.ip);
             evicted.handle.conn.close(0u32.into(), b"superseded");
+            true
         }
-        Ok(None) => {}
+        Ok(None) => true,
         Err(_) => {
             conn.close(0u32.into(), b"internal-error");
-            return Ok(());
+            false
         }
     }
+}
 
+fn free_ip(state: &SharedState, ip: Ipv4Addr) {
+    let mut pool = state
+        .pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = pool.free(ip);
+}
+
+async fn send_auth_ok(
+    channel: &mut Channel<ControlMessage>,
+    state: &SharedState,
+    ip: Ipv4Addr,
+) -> anyhow::Result<()> {
+    channel
+        .send(build_auth_ok(state, ip))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to send AuthOk: {e}"))
+}
+
+fn build_auth_ok(state: &SharedState, ip: Ipv4Addr) -> ControlMessage {
     let gateway = gateway_addr(state.config.tun_subnet);
-    let auth_ok = ControlMessage {
+    ControlMessage {
         msg: Some(Msg::AuthOk(AuthOk {
             assigned_ip: ip.to_string(),
             subnet: state.config.tun_subnet.to_string(),
@@ -258,109 +258,96 @@ pub async fn handle_conn(
                 .map(std::string::ToString::to_string)
                 .collect(),
         })),
-    };
-    framed
-        .send(auth_ok)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to send AuthOk: {e}"))?;
+    }
+}
 
-    let parts = framed.into_parts();
-    let control_stream = parts.io;
-    let read_buf = parts.read_buf;
-    let (send_stream, recv_stream) = control_stream.into_parts();
+fn spawn_uplink(
+    state: &SharedState,
+    conn: &quinn::Connection,
+    shutdown: ShutdownHandle,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let tun = state.tun.clone()?;
+    let conn_for_uplink = conn.clone();
+    Some(tokio::spawn(async move {
+        let mut source = QuinnDatagram::new(conn_for_uplink.clone());
+        let mut sink = Tun(tun);
+        let _ = forward(&mut source, &mut sink, &shutdown).await;
+        conn_for_uplink.close(0x101u32.into(), b"uplink-ended");
+    }))
+}
 
-    let mut reader_parts = FramedParts::new(recv_stream, ControlCodec::new());
-    reader_parts.read_buf = read_buf;
-    let mut reader = Framed::from_parts(reader_parts);
-    let mut writer = Framed::new(send_stream, ControlCodec::new());
-
-    let conn_for_hb = conn.clone();
-    let shutdown_for_hb = shutdown.clone();
-    let ctrl_task = tokio::spawn(async move {
-        let mut tracker = HeartbeatTracker::new(tokio::time::Instant::now().into_std());
-        let mut send_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
-        let mut timeout_tick = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            tokio::select! {
-                biased;
-                () = shutdown_for_hb.cancelled() => {
-                    let disconnect = ControlMessage {
+#[allow(clippy::too_many_lines)]
+async fn run_ctrl_loop(
+    conn: quinn::Connection,
+    mut writer: Sender<ControlMessage>,
+    mut reader: Receiver<ControlMessage>,
+    shutdown: ShutdownHandle,
+) {
+    let mut tracker = KeepaliveTracker::new(now());
+    let mut send_tick = tokio::time::interval(KEEPALIVE_INTERVAL);
+    let mut timeout_tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                let _ = writer
+                    .send(ControlMessage {
                         msg: Some(Msg::Disconnect(Disconnect {
                             reason: "server-shutdown".to_string(),
                         })),
-                    };
-                    let _ = writer.send(disconnect).await;
+                    })
+                    .await;
+                break;
+            }
+            _ = timeout_tick.tick() => {
+                if tracker.is_dead(now()) {
+                    conn.close(0x100u32.into(), b"timeout");
                     break;
                 }
-                _ = timeout_tick.tick() => {
-                    if tracker.is_dead(tokio::time::Instant::now().into_std()) {
-                        conn_for_hb.close(0x100u32.into(), b"timeout");
-                        break;
-                    }
+            }
+            _ = send_tick.tick() => {
+                let hb = ControlMessage {
+                    msg: Some(Msg::Heartbeat(Heartbeat {})),
+                };
+                if writer.send(hb).await.is_err() {
+                    break;
                 }
-                _ = send_tick.tick() => {
-                    let hb = ControlMessage {
-                        msg: Some(Msg::Heartbeat(Heartbeat {})),
-                    };
-                    if writer.send(hb).await.is_err() {
-                        break;
-                    }
-                }
-                msg = reader.next() => {
-                    match msg {
-                        Some(Ok(ControlMessage { msg: Some(Msg::Heartbeat(_)) })) => {
-                            tracker.observe(tokio::time::Instant::now().into_std());
-                        }
-                        Some(Ok(_)) => {}
-                        _ => break,
-                    }
+            }
+            msg = reader.recv() => {
+                match msg {
+                    Ok(Some(_)) => tracker.observe(now()),
+                    _ => break,
                 }
             }
         }
-    });
-
-    let uplink_task = if let Some(tun) = state.tun.clone() {
-        let conn_for_uplink = conn.clone();
-        let shutdown_for_uplink = shutdown.clone();
-        Some(tokio::spawn(async move {
-            let mut source = QuinnDatagram::new(conn_for_uplink.clone());
-            let mut sink = TunSink(tun);
-            let _ = forward(&mut source, &mut sink, &shutdown_for_uplink).await;
-            conn_for_uplink.close(0x101u32.into(), b"uplink-ended");
-        }))
-    } else {
-        None
-    };
-
-    let _ = ctrl_task.await;
-    if let Some(t) = uplink_task {
-        let _ = t.await;
     }
+}
 
+fn now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
+fn cleanup_session(state: &SharedState, ip: Ipv4Addr) {
     let _ = state
         .registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove_by_ip(ip);
-    let _ = state
-        .pool
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .free(ip);
-
-    Ok(())
+    free_ip(state, ip);
 }
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let endpoint = build_server_endpoint(&config)?;
     let tun = Arc::new(crate::tun_setup::create_tun(config.tun_subnet, config.mtu)?);
     let state = build_server_state(config, tun.clone())?;
-    let shutdown = CancellationToken::new();
-    spawn_downlink(tun, state.clone(), shutdown.clone());
+    let sd = Shutdown::new(Duration::from_secs(5));
+    let ready = shutdown::spawn_signal_watchdog(sd.clone());
+    let _ = ready.await;
+    spawn_downlink(tun, state.clone(), sd.handle());
     let mut conn_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    accept_connections(&endpoint, state, shutdown.clone(), &mut conn_set).await;
+    accept_connections(&endpoint, state, &sd, &mut conn_set).await;
     endpoint.close(0u32.into(), b"shutdown");
-    crate::shutdown::drain_with_timeout(&mut conn_set, Duration::from_secs(5), "server").await;
+    sd.drain(&mut conn_set, "server").await;
     Ok(())
 }
 
@@ -395,8 +382,8 @@ fn build_server_state(
     }))
 }
 
-fn spawn_downlink(tun: Arc<tun_rs::AsyncDevice>, state: SharedState, shutdown: CancellationToken) {
-    let downlink_tun = TunSource(tun);
+fn spawn_downlink(tun: Arc<tun_rs::AsyncDevice>, state: SharedState, shutdown: ShutdownHandle) {
+    let downlink_tun = Tun(tun);
     let dispatcher = RegistryDispatcher { state };
     tokio::spawn(async move {
         let mut src = downlink_tun;
@@ -407,24 +394,20 @@ fn spawn_downlink(tun: Arc<tun_rs::AsyncDevice>, state: SharedState, shutdown: C
 async fn accept_connections(
     endpoint: &quinn::Endpoint,
     state: SharedState,
-    shutdown: CancellationToken,
+    sd: &Shutdown,
     conn_set: &mut tokio::task::JoinSet<()>,
 ) {
     let accept_endpoint = endpoint.clone();
-    let accept_shutdown = shutdown.clone();
-    let accept_loop = run_accept_loop(&accept_endpoint, &state, &accept_shutdown, conn_set);
-    tokio::select! {
-        () = accept_loop => tracing::info!("accept loop ended"),
-        _ = tokio::signal::ctrl_c() => {}
-    }
+    let handle = sd.handle();
+    run_accept_loop(&accept_endpoint, &state, &handle, conn_set).await;
     tracing::info!("initiating graceful shutdown");
-    shutdown.cancel();
+    sd.trigger();
 }
 
 async fn run_accept_loop(
     endpoint: &quinn::Endpoint,
     state: &SharedState,
-    shutdown: &CancellationToken,
+    shutdown: &ShutdownHandle,
     conn_set: &mut tokio::task::JoinSet<()>,
 ) {
     loop {
@@ -437,7 +420,7 @@ async fn run_accept_loop(
 async fn accept_one(
     endpoint: &quinn::Endpoint,
     state: &SharedState,
-    shutdown: &CancellationToken,
+    shutdown: &ShutdownHandle,
     conn_set: &mut tokio::task::JoinSet<()>,
 ) -> bool {
     tokio::select! {
@@ -459,7 +442,7 @@ async fn accept_one(
 fn spawn_handle_conn(
     conn: quinn::Connection,
     state: &SharedState,
-    shutdown: &CancellationToken,
+    shutdown: &ShutdownHandle,
     conn_set: &mut tokio::task::JoinSet<()>,
 ) {
     let st = state.clone();

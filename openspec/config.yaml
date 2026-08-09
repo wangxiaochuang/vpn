@@ -3,7 +3,7 @@ schema: spec-driven
 context: |
   基于 QUIC 的 VPN（Rust，edition 2024）。
   技术栈：quinn / rustls(aws-lc-rs) / tun-rs / tokio / prost / clap / argon2
-  架构见 doc/arch-v1.md：控制面 QUIC stream + length-prefix framing，
+  架构见 doc/arch-v2.md
   数据面 QUIC datagram 原样转发 IP 包。
   测试策略见 AGENTS.md：四象限模型，spec 场景与 vpn/tests/ 绑定。
 
