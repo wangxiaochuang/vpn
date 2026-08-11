@@ -64,8 +64,14 @@ echo "nat on en0 from 10.0.0.0/24 to any -> (en0)" | sudo pfctl -ef -
 ### 客户端优雅关闭测试
 
 1. [ ] 客户端运行中按 Ctrl+C，确认打印 `received Ctrl+C, initiating graceful shutdown`，三个 task 清理后进程退出
-2. [ ] 客户端密码输入过程中按 Ctrl+C：进程应优雅退出（打印关闭日志）而非被信号杀死，退出后该终端按 Ctrl+C 应仍正常
+2. [ ] 客户端用户名或密码输入过程中按 Ctrl+C：进程应优雅退出（打印关闭日志）而非被信号杀死，退出后该终端按 Ctrl+C 应仍正常
    - 排障：若终端按 Ctrl+C 无反应（`kill -INT <pid>` 却有效、按 Ctrl+C 时回显 `^C`），说明该终端 ISIG 已被残留清除；执行 `stty isig` 一次性恢复
+
+### 客户端启动与凭据输入
+
+1. [ ] `cargo build --release --bin vpn` 后运行 `sudo ./target/release/vpn client --config client.toml`
+2. [ ] 先提示「请输入用户名：」（不回显）；输入空行或纯空白后立即报「用户名不能为空」退出，**不**进入密码阶段、**不**读取 CA、**不**发起连接
+3. [ ] 输入正确用户名后再提示「请输入密码：」（不回显），输入正确密码后完成认证、建立 TUN
 
 ## 连接稳定性
 

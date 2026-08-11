@@ -154,8 +154,8 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
     (心跳/上行/下行) 清理 (`sd.drain`，带 5s 超时保护) → 超时 abort 兜底 → endpoint.close
     (endpoint 生命周期由 establish_connection 返回，延长到数据面结束)。
   - 客户端在 `run()` 入口即 `shutdown::spawn_signal_watchdog` 注册 SIGINT/SIGTERM 捕获（await
-    ready 握手确保 handler 注册完成），避免密码输入期间 rpassword 的 raise(SIGINT) 触发 SIG_DFL
-    杀死进程导致终端 ISIG 残留关闭 (之后 Ctrl-C 只产生字节不产生信号)；密码读取用 spawn_blocking
+    ready 握手确保 handler 注册完成），避免用户名/密码输入期间 rpassword 的 raise(SIGINT) 触发 SIG_DFL
+    杀死进程导致终端 ISIG 残留关闭 (之后 Ctrl-C 只产生字节不产生信号)；用户名/密码读取用 spawn_blocking
     让出 runtime 保证 handler 尽快注册。收到信号后 watchdog 打印关闭日志并 trigger。
     `run_data_plane` 另保留 `wait_for_interrupt` 兜底 ctrl_c 分支（watchdog 注册失败时仍可响应）。
   - 客户端收到服务端 Disconnect: 心跳 task 打印原因后立即退出 (不等 30s 心跳超时)，
@@ -186,7 +186,7 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 `vpn client --config client.toml` 的运行流程（与服务端对称，客户端是主动方）：
 
 ```
- 1. 交互式读取密码（rpassword，不回显）
+ 1. 交互式读取用户名（rpassword，不回显），空用户名直接退出；再交互式读取密码（rpassword，不回显）
  2. build_quinn_client_config(ca_cert, server_name)
     → 从 CA PEM 建立信任根，按 server_name 做 SNI 与证书校验
  3. Endpoint::client + connect_with 连接 server
@@ -232,11 +232,10 @@ password_hash = "$argon2..."   # argon2 哈希
 server = "vpn.example.com:443"
 server_name = "vpn.example.com"   # 用于 SNI 与证书 SAN 匹配
 ca_cert = "ca.crt"                # 信任的 CA 证书，用于校验服务端
-username = "alice"
-# 注意：密码不写入配置，运行时交互式输入（rpassword 读取，不回显）
+# 注意：用户名与密码均不写入配置，运行时交互式输入（rpassword 读取，不回显）
 ```
 
-客户端解析语义：`server` 为 `SocketAddr`（V1 仅支持 `IP:port`，域名 DNS 解析列 V2）；`server_name` 非空、`ca_cert` 非空（文件存在性由 TLS 构造阶段校验）；`ClientConfig` 不含密码字段。
+客户端解析语义：`server` 为 `SocketAddr`（V1 仅支持 `IP:port`，域名 DNS 解析列 V2）；`server_name` 非空、`ca_cert` 非空（文件存在性由 TLS 构造阶段校验）；`ClientConfig` 不含 `username` 字段、不含密码字段，用户名与密码均由运行时交互式输入。
 
 服务端用户管理工具 `cargo xtask add-user`（workspace 内独立 `xtask` crate，`.cargo/config.toml` 定义 alias）：交互式输入两次密码（rpassword 不回显），生成 argon2id PHC 哈希后写回 `server.toml` 的 `[[users]]`，同名用户只更新 `password_hash`，toml_edit 原地编辑保留注释与格式，无 `[[users]]` 段时自动创建。
 
@@ -307,7 +306,7 @@ vpn server --config server.toml   # 以服务端模式运行
 vpn client --config client.toml   # 以客户端模式运行
 ```
 
-`vpn client --config <PATH>` 启动流程：加载 `ClientConfig` → 交互式提示输入密码（不回显）→ 连接、认证、建 TUN、转发。任一步骤失败以非零退出码退出并打印错误；认证失败会打印 `AuthDenied` 的可读原因（认证失败 / 服务端繁忙）。
+`vpn client --config <PATH>` 启动流程：加载 `ClientConfig` → 交互式提示输入用户名（不回显，空用户名直接退出）→ 交互式提示输入密码（不回显）→ 连接、认证、建 TUN、转发。任一步骤失败以非零退出码退出并打印错误；认证失败会打印 `AuthDenied` 的可读原因（认证失败 / 服务端繁忙）。
 
 协议定义、加密、配置解析、数据泵等共享代码置于 `vpn` crate 的 library（`vpn/src/lib.rs`），两个子命令复用。
 

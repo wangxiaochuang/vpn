@@ -123,7 +123,6 @@ pub struct ClientConfig {
     pub server: SocketAddr,
     pub server_name: String,
     pub ca_cert: PathBuf,
-    pub username: String,
 }
 
 impl ClientConfig {
@@ -144,7 +143,6 @@ impl ClientConfig {
             server: raw.client.server,
             server_name: raw.client.server_name,
             ca_cert: raw.client.ca_cert,
-            username: raw.client.username,
         })
     }
 }
@@ -204,7 +202,6 @@ struct RawClient {
     server: SocketAddr,
     server_name: String,
     ca_cert: PathBuf,
-    username: String,
 }
 
 #[cfg(test)]
@@ -512,7 +509,6 @@ password_hash = "{hash}"
 server = "127.0.0.1:4433"
 server_name = "vpn.example.com"
 ca_cert = "ca.crt"
-username = "alice"
 "#
         .to_string()
     }
@@ -525,7 +521,17 @@ username = "alice"
         assert_eq!(cfg.server, "127.0.0.1:4433".parse().unwrap());
         assert_eq!(cfg.server_name, "vpn.example.com");
         assert_eq!(cfg.ca_cert, PathBuf::from("ca.crt"));
-        assert_eq!(cfg.username, "alice");
+    }
+
+    #[test]
+    fn test_client_load_when_legacy_username_present_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("{}username = \"alice\"\n", minimal_client_config_body());
+        let path = write_config(&dir, "client_legacy.toml", &body);
+        let cfg = ClientConfig::load(&path).expect("legacy username row must be ignored");
+        assert_eq!(cfg.server, "127.0.0.1:4433".parse().unwrap());
+        assert_eq!(cfg.server_name, "vpn.example.com");
+        assert_eq!(cfg.ca_cert, PathBuf::from("ca.crt"));
     }
 
     #[test]

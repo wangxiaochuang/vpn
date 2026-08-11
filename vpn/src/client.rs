@@ -123,22 +123,45 @@ pub async fn run(config: ClientConfig) -> anyhow::Result<()> {
     let sd = Shutdown::new(Duration::from_secs(5));
     let ready = shutdown::spawn_signal_watchdog(sd.clone());
     let _ = ready.await;
-    let password = tokio::task::spawn_blocking(move || rpassword::prompt_password("请输入密码："))
+    let username = read_username().await?;
+    let password = read_password().await?;
+    run_with_credentials(config, username, password, sd).await
+}
+
+async fn read_username() -> anyhow::Result<String> {
+    let raw = tokio::task::spawn_blocking(|| rpassword::prompt_password("请输入用户名："))
         .await
-        .context("password prompt task panicked")??;
-    run_with_credentials(config, password, sd).await
+        .context("username prompt task panicked")??;
+    validate_username(&raw)
+}
+
+fn validate_username(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("用户名不能为空");
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn read_password() -> anyhow::Result<String> {
+    tokio::task::spawn_blocking(move || rpassword::prompt_password("请输入密码："))
+        .await
+        .context("password prompt task panicked")?
+        .map_err(Into::into)
 }
 
 pub async fn run_with_credentials(
     config: ClientConfig,
+    username: String,
     password: String,
     sd: Shutdown,
 ) -> anyhow::Result<()> {
-    let (client, session, channel, params) = establish_connection(&config, password).await?;
+    let (client, session, channel, params) =
+        establish_connection(&config, &username, password).await?;
     let tun = setup_tun(&params)?;
     tracing::info!(
         "authenticated as {}, assigned_ip={}, subnet={}, mtu={}",
-        config.username,
+        username,
         params.assigned_ip,
         params.subnet,
         params.mtu
@@ -148,6 +171,7 @@ pub async fn run_with_credentials(
 
 async fn establish_connection(
     config: &ClientConfig,
+    username: &str,
     password: String,
 ) -> anyhow::Result<(
     quic_link::Client,
@@ -163,7 +187,7 @@ async fn establish_connection(
     let session = client.connect(config.server).await?;
     tracing::info!("connected to {}", config.server);
     let mut channel = open_control_stream(&session).await?;
-    let params = authenticate(&mut channel, &config.username, password).await?;
+    let params = authenticate(&mut channel, username, password).await?;
     Ok((client, session, channel, params))
 }
 
@@ -535,5 +559,19 @@ mod tests {
         assert!(deny_reason_text(crate::vpn::DenyReason::AuthFailed as i32).contains("认证失败"));
         assert!(deny_reason_text(crate::vpn::DenyReason::ServerBusy as i32).contains("服务端繁忙"));
         assert!(deny_reason_text(999).contains("未知"));
+    }
+
+    #[test]
+    fn test_validate_username_when_empty_returns_err() {
+        for raw in ["", "   ", "\t"] {
+            let err = validate_username(raw).expect_err("empty input must error");
+            assert!(err.to_string().contains("用户名不能为空"), "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_username_when_non_empty_returns_trimmed() {
+        let got = validate_username("  alice  ").expect("non-empty must succeed");
+        assert_eq!(got, "alice");
     }
 }
