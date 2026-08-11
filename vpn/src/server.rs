@@ -2,36 +2,36 @@ use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 
 use crate::auth::UserStore;
 use crate::config::ServerConfig;
 use crate::ctrl::{self, deny_reason_from};
-use crate::data::{DownlinkDispatcher, QuinnDatagram, Tun, downlink_pump, dst_ipv4_addr, forward};
+use crate::data::{DownlinkDispatcher, Tun, downlink_pump, dst_ipv4_addr};
 use crate::ipam::IpPool;
 use crate::route::SessionRegistry;
 use crate::tun_setup::gateway_addr;
 use crate::vpn::control_message::Msg;
 use crate::vpn::{AuthDenied, AuthOk, ControlMessage, Disconnect, Heartbeat};
+use bytes::Bytes;
+use msgx::Channel;
 use msgx::channel::{Receiver, Sender};
-use msgx::{Channel, KEEPALIVE_INTERVAL, KeepaliveTracker};
+use quic_link::{
+    KeepaliveConfig, LoopControl, PacketSink, Server, Session, forward, keepalive_loop,
+};
 use shutdown::Shutdown;
 use shutdown::ShutdownHandle;
 
 #[derive(Debug)]
 pub struct ConnectionHandle {
     id: usize,
-    pub conn: quinn::Connection,
+    pub session: Session,
     pub ip: Ipv4Addr,
 }
 
 impl ConnectionHandle {
-    pub fn new(conn: quinn::Connection, ip: Ipv4Addr) -> Self {
-        Self {
-            id: conn.stable_id(),
-            conn,
-            ip,
-        }
+    pub fn new(session: Session, ip: Ipv4Addr) -> Self {
+        let id = session.id();
+        Self { id, session, ip }
     }
 
     pub fn id(&self) -> usize {
@@ -43,7 +43,7 @@ impl Clone for ConnectionHandle {
     fn clone(&self) -> Self {
         Self {
             id: self.id,
-            conn: self.conn.clone(),
+            session: self.session.clone(),
             ip: self.ip,
         }
     }
@@ -78,7 +78,7 @@ pub struct RegistryDispatcher {
 }
 
 impl DownlinkDispatcher for RegistryDispatcher {
-    fn dispatch(&self, pkt: bytes::Bytes) -> impl std::future::Future<Output = ()> + Send {
+    fn dispatch(&self, pkt: Bytes) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let Some(dst) = dst_ipv4_addr(&pkt) else {
                 return;
@@ -90,7 +90,8 @@ impl DownlinkDispatcher for RegistryDispatcher {
                 reg.lookup(dst).cloned()
             };
             if let Some(h) = handle {
-                let _ = h.conn.send_datagram(pkt);
+                let mut tx = h.session.datagram_tx();
+                let _ = tx.send(pkt).await;
             }
         }
     }
@@ -99,21 +100,21 @@ impl DownlinkDispatcher for RegistryDispatcher {
 const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn handle_conn(
-    conn: quinn::Connection,
+    session: Session,
     state: SharedState,
     shutdown: ShutdownHandle,
 ) -> anyhow::Result<()> {
-    let Some((channel, ip)) = setup_session(&conn, &state).await? else {
+    let Some((channel, ip)) = setup_session(&session, &state).await? else {
         return Ok(());
     };
     let (sender, receiver) = channel.split();
-    let conn_for_hb = conn.clone();
+    let session_for_hb = session.clone();
     let shutdown_for_hb = shutdown.clone();
     let ctrl_task = tokio::spawn(async move {
-        run_ctrl_loop(conn_for_hb, sender, receiver, shutdown_for_hb).await;
+        run_ctrl_loop(session_for_hb, sender, receiver, shutdown_for_hb).await;
     });
 
-    let uplink_task = spawn_uplink(&state, &conn, shutdown);
+    let uplink_task = spawn_uplink(&state, &session, shutdown);
     let _ = ctrl_task.await;
     if let Some(t) = uplink_task {
         let _ = t.await;
@@ -123,23 +124,35 @@ pub async fn handle_conn(
 }
 
 async fn setup_session(
-    conn: &quinn::Connection,
+    session: &Session,
     state: &SharedState,
 ) -> anyhow::Result<Option<(Channel<ControlMessage>, Ipv4Addr)>> {
-    let mut channel = crate::quinn_stream::accept_bi::<ControlMessage>(conn)
+    let mut channel = session
+        .accept_stream::<ControlMessage>()
         .await
         .map_err(|e| anyhow::anyhow!("failed to accept control stream: {e}"))?;
-    let Some(req) = recv_auth_request(&mut channel, conn).await? else {
+    let Some(req) = recv_auth_request(&mut channel, session).await? else {
         return Ok(None);
     };
-    let ip = match resolve_auth(state, &req) {
+    match resolve_auth(state, &req) {
         AuthResolution::Denied(reason) => {
-            finish_denied(channel, conn, reason).await;
-            return Ok(None);
+            finish_denied(channel, session, reason).await;
+            Ok(None)
         }
-        AuthResolution::Ok(ip) => ip,
-    };
-    if !register_and_evict(state, &req.username, ip, conn) {
+        AuthResolution::Ok(ip) => {
+            finalize_session(state, &req.username, ip, session, channel).await
+        }
+    }
+}
+
+async fn finalize_session(
+    state: &SharedState,
+    username: &str,
+    ip: Ipv4Addr,
+    session: &Session,
+    mut channel: Channel<ControlMessage>,
+) -> anyhow::Result<Option<(Channel<ControlMessage>, Ipv4Addr)>> {
+    if !register_and_evict(state, username, ip, session) {
         return Ok(None);
     }
     send_auth_ok(&mut channel, state, ip).await?;
@@ -148,7 +161,7 @@ async fn setup_session(
 
 async fn recv_auth_request(
     channel: &mut Channel<ControlMessage>,
-    conn: &quinn::Connection,
+    session: &Session,
 ) -> anyhow::Result<Option<crate::vpn::AuthRequest>> {
     let first = channel
         .recv_timeout(FIRST_MSG_TIMEOUT)
@@ -157,7 +170,7 @@ async fn recv_auth_request(
     if let Some(Msg::AuthRequest(req)) = first.msg {
         Ok(Some(req))
     } else {
-        conn.close(0u32.into(), b"protocol-error");
+        session.close(0, b"protocol-error");
         Ok(None)
     }
 }
@@ -183,7 +196,7 @@ fn resolve_auth(state: &SharedState, req: &crate::vpn::AuthRequest) -> AuthResol
 
 async fn finish_denied(
     mut channel: Channel<ControlMessage>,
-    conn: &quinn::Connection,
+    session: &Session,
     reason: crate::vpn::DenyReason,
 ) {
     let deny = ControlMessage {
@@ -193,16 +206,16 @@ async fn finish_denied(
     };
     let _ = channel.send(deny).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    conn.close(0u32.into(), b"auth-denied");
+    session.close(0, b"auth-denied");
 }
 
 fn register_and_evict(
     state: &SharedState,
     username: &str,
     ip: Ipv4Addr,
-    conn: &quinn::Connection,
+    session: &Session,
 ) -> bool {
-    let handle = ConnectionHandle::new(conn.clone(), ip);
+    let handle = ConnectionHandle::new(session.clone(), ip);
     let evicted = {
         let mut reg = state
             .registry
@@ -213,12 +226,12 @@ fn register_and_evict(
     match evicted {
         Ok(Some(evicted)) => {
             free_ip(state, evicted.ip);
-            evicted.handle.conn.close(0u32.into(), b"superseded");
+            evicted.handle.session.close(0, b"superseded");
             true
         }
         Ok(None) => true,
         Err(_) => {
-            conn.close(0u32.into(), b"internal-error");
+            session.close(0, b"internal-error");
             false
         }
     }
@@ -263,68 +276,49 @@ fn build_auth_ok(state: &SharedState, ip: Ipv4Addr) -> ControlMessage {
 
 fn spawn_uplink(
     state: &SharedState,
-    conn: &quinn::Connection,
+    session: &Session,
     shutdown: ShutdownHandle,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let tun = state.tun.clone()?;
-    let conn_for_uplink = conn.clone();
+    let session_for_uplink = session.clone();
     Some(tokio::spawn(async move {
-        let mut source = QuinnDatagram::new(conn_for_uplink.clone());
+        let mut source = session_for_uplink.datagram_rx();
         let mut sink = Tun(tun);
         let _ = forward(&mut source, &mut sink, &shutdown).await;
-        conn_for_uplink.close(0x101u32.into(), b"uplink-ended");
+        session_for_uplink.close(0x101, b"uplink-ended");
     }))
 }
 
-#[allow(clippy::too_many_lines)]
 async fn run_ctrl_loop(
-    conn: quinn::Connection,
+    session: Session,
     mut writer: Sender<ControlMessage>,
     mut reader: Receiver<ControlMessage>,
     shutdown: ShutdownHandle,
 ) {
-    let mut tracker = KeepaliveTracker::new(now());
-    let mut send_tick = tokio::time::interval(KEEPALIVE_INTERVAL);
-    let mut timeout_tick = tokio::time::interval(Duration::from_secs(1));
-    loop {
-        tokio::select! {
-            biased;
-            () = shutdown.cancelled() => {
-                let _ = writer
-                    .send(ControlMessage {
-                        msg: Some(Msg::Disconnect(Disconnect {
-                            reason: "server-shutdown".to_string(),
-                        })),
-                    })
-                    .await;
-                break;
-            }
-            _ = timeout_tick.tick() => {
-                if tracker.is_dead(now()) {
-                    conn.close(0x100u32.into(), b"timeout");
-                    break;
-                }
-            }
-            _ = send_tick.tick() => {
-                let hb = ControlMessage {
-                    msg: Some(Msg::Heartbeat(Heartbeat {})),
-                };
-                if writer.send(hb).await.is_err() {
-                    break;
-                }
-            }
-            msg = reader.recv() => {
-                match msg {
-                    Ok(Some(_)) => tracker.observe(now()),
-                    _ => break,
-                }
-            }
-        }
+    let hb = || ControlMessage {
+        msg: Some(Msg::Heartbeat(Heartbeat {})),
+    };
+    keepalive_loop(
+        &session,
+        &mut writer,
+        &mut reader,
+        &shutdown,
+        KeepaliveConfig::default(),
+        hb,
+        |_| LoopControl::Continue,
+    )
+    .await;
+    if shutdown.is_cancelled() {
+        let _ = writer.send(server_disconnect_msg()).await;
     }
 }
 
-fn now() -> Instant {
-    tokio::time::Instant::now().into_std()
+fn server_disconnect_msg() -> ControlMessage {
+    ControlMessage {
+        msg: Some(Msg::Disconnect(Disconnect {
+            reason: "server-shutdown".to_string(),
+        })),
+    }
 }
 
 fn cleanup_session(state: &SharedState, ip: Ipv4Addr) {
@@ -337,7 +331,7 @@ fn cleanup_session(state: &SharedState, ip: Ipv4Addr) {
 }
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
-    let endpoint = build_server_endpoint(&config)?;
+    let server = build_server(&config)?;
     let tun = Arc::new(crate::tun_setup::create_tun(config.tun_subnet, config.mtu)?);
     let state = build_server_state(config, tun.clone())?;
     let sd = Shutdown::new(Duration::from_secs(5));
@@ -345,20 +339,21 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let _ = ready.await;
     spawn_downlink(tun, state.clone(), sd.handle());
     let mut conn_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    accept_connections(&endpoint, state, &sd, &mut conn_set).await;
-    endpoint.close(0u32.into(), b"shutdown");
+    accept_connections(&server, state, &sd, &mut conn_set).await;
+    server.close();
     sd.drain(&mut conn_set, "server").await;
     Ok(())
 }
 
-fn build_server_endpoint(config: &ServerConfig) -> anyhow::Result<quinn::Endpoint> {
-    let quinn_cfg = crate::tls::build_quinn_server_config(&config.cert, &config.key)?;
-    let endpoint = quinn::Endpoint::server(quinn_cfg, config.listen)?;
+fn build_server(config: &ServerConfig) -> anyhow::Result<Server> {
+    let server = quic_link::Server::builder()
+        .tls_from_files(config.cert.clone(), config.key.clone())
+        .build(config.listen)?;
     tracing::info!(
         "listening on {}",
-        endpoint.local_addr().unwrap_or(config.listen)
+        server.local_addr().unwrap_or(config.listen)
     );
-    Ok(endpoint)
+    Ok(server)
 }
 
 fn build_server_state(
@@ -392,33 +387,32 @@ fn spawn_downlink(tun: Arc<tun_rs::AsyncDevice>, state: SharedState, shutdown: S
 }
 
 async fn accept_connections(
-    endpoint: &quinn::Endpoint,
+    server: &Server,
     state: SharedState,
     sd: &Shutdown,
     conn_set: &mut tokio::task::JoinSet<()>,
 ) {
-    let accept_endpoint = endpoint.clone();
     let handle = sd.handle();
-    run_accept_loop(&accept_endpoint, &state, &handle, conn_set).await;
+    run_accept_loop(server, &state, &handle, conn_set).await;
     tracing::info!("initiating graceful shutdown");
     sd.trigger();
 }
 
 async fn run_accept_loop(
-    endpoint: &quinn::Endpoint,
+    server: &Server,
     state: &SharedState,
     shutdown: &ShutdownHandle,
     conn_set: &mut tokio::task::JoinSet<()>,
 ) {
     loop {
-        if !accept_one(endpoint, state, shutdown, conn_set).await {
+        if !accept_one(server, state, shutdown, conn_set).await {
             break;
         }
     }
 }
 
 async fn accept_one(
-    endpoint: &quinn::Endpoint,
+    server: &Server,
     state: &SharedState,
     shutdown: &ShutdownHandle,
     conn_set: &mut tokio::task::JoinSet<()>,
@@ -426,12 +420,10 @@ async fn accept_one(
     tokio::select! {
         biased;
         () = shutdown.cancelled() => false,
-        incoming = endpoint.accept() => {
-            match incoming {
-                Some(incoming) => match incoming.await {
-                    Ok(conn) => spawn_handle_conn(conn, state, shutdown, conn_set),
-                    Err(e) => tracing::warn!("connection accept error: {e}"),
-                },
+        accepted = server.accept() => {
+            match accepted {
+                Some(Ok(session)) => spawn_handle_conn(session, state, shutdown, conn_set),
+                Some(Err(e)) => tracing::warn!("connection accept error: {e}"),
                 None => return false,
             }
             true
@@ -440,7 +432,7 @@ async fn accept_one(
 }
 
 fn spawn_handle_conn(
-    conn: quinn::Connection,
+    session: Session,
     state: &SharedState,
     shutdown: &ShutdownHandle,
     conn_set: &mut tokio::task::JoinSet<()>,
@@ -448,7 +440,7 @@ fn spawn_handle_conn(
     let st = state.clone();
     let ct = shutdown.clone();
     conn_set.spawn(async move {
-        let _ = handle_conn(conn, st, ct).await;
+        let _ = handle_conn(session, st, ct).await;
     });
 }
 
@@ -510,27 +502,28 @@ mod tests {
             .join(p)
     }
 
-    async fn make_client_conns(n: usize) -> Vec<quinn::Connection> {
+    async fn make_client_sessions(n: usize) -> Vec<Session> {
         let server = build_test_server();
         let client_cfg = build_no_verify_client_config();
         let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = server.local_addr().unwrap();
-        let mut conns = Vec::new();
+        let mut sessions = Vec::new();
         for _ in 0..n {
             let conn = client
                 .connect_with(client_cfg.clone(), addr, "localhost")
                 .expect("dial")
                 .await
                 .expect("connect");
-            conns.push(conn);
+            sessions.push(Session::new(conn));
         }
-        conns
+        std::mem::forget(client);
+        sessions
     }
 
     fn build_test_server() -> quinn::Endpoint {
         let cert = repo("cert.pem");
         let key = repo("key.pem");
-        let server_cfg = crate::tls::build_quinn_server_config(&cert, &key).expect("server cfg");
+        let server_cfg = quic_link::build_quinn_server_config(&cert, &key).expect("server cfg");
         let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
             .expect("server endpoint");
         let server_for_accept = server.clone();
@@ -562,29 +555,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_handle_eq_by_id_across_clones() {
-        let mut conns = make_client_conns(1).await;
-        let conn = conns.remove(0);
-        let dup = conn.clone();
-        let h1 = ConnectionHandle::new(conn, Ipv4Addr::new(10, 0, 0, 2));
+        let mut sessions = make_client_sessions(1).await;
+        let session = sessions.remove(0);
+        let dup = session.clone();
+        let h1 = ConnectionHandle::new(session, Ipv4Addr::new(10, 0, 0, 2));
         let h2 = ConnectionHandle::new(dup, Ipv4Addr::new(10, 0, 0, 9));
         assert_eq!(h1, h2);
     }
 
     #[tokio::test]
     async fn test_connection_handle_neq_different_id() {
-        let mut conns = make_client_conns(2).await;
-        let h1 = ConnectionHandle::new(conns.remove(0), Ipv4Addr::new(10, 0, 0, 2));
-        let h2 = ConnectionHandle::new(conns.remove(0), Ipv4Addr::new(10, 0, 0, 3));
+        let mut sessions = make_client_sessions(2).await;
+        let h1 = ConnectionHandle::new(sessions.remove(0), Ipv4Addr::new(10, 0, 0, 2));
+        let h2 = ConnectionHandle::new(sessions.remove(0), Ipv4Addr::new(10, 0, 0, 3));
         assert_ne!(h1.id(), h2.id());
         assert_ne!(h1, h2);
     }
 
     #[tokio::test]
     async fn test_connection_handle_hash_by_id() {
-        let mut conns = make_client_conns(1).await;
-        let conn = conns.remove(0);
-        let h1 = ConnectionHandle::new(conn.clone(), Ipv4Addr::new(10, 0, 0, 2));
-        let h2 = ConnectionHandle::new(conn, Ipv4Addr::new(10, 0, 0, 9));
+        let mut sessions = make_client_sessions(1).await;
+        let session = sessions.remove(0);
+        let h1 = ConnectionHandle::new(session.clone(), Ipv4Addr::new(10, 0, 0, 2));
+        let h2 = ConnectionHandle::new(session, Ipv4Addr::new(10, 0, 0, 9));
         let mut s1 = DefaultHasher::new();
         let mut s2 = DefaultHasher::new();
         h1.hash(&mut s1);
@@ -594,10 +587,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_handle_dedups_in_hashset() {
-        let mut conns = make_client_conns(1).await;
-        let conn = conns.remove(0);
-        let h1 = ConnectionHandle::new(conn.clone(), Ipv4Addr::new(10, 0, 0, 2));
-        let h2 = ConnectionHandle::new(conn, Ipv4Addr::new(10, 0, 0, 3));
+        let mut sessions = make_client_sessions(1).await;
+        let session = sessions.remove(0);
+        let h1 = ConnectionHandle::new(session.clone(), Ipv4Addr::new(10, 0, 0, 2));
+        let h2 = ConnectionHandle::new(session, Ipv4Addr::new(10, 0, 0, 3));
         let mut set = HashSet::new();
         set.insert(h1);
         assert!(set.contains(&h2));

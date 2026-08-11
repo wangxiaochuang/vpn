@@ -77,7 +77,7 @@ mod tests {
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .expect("vpn crate nested under repo root")
+            .expect("quic-link crate nested under repo root")
             .to_path_buf()
     }
 
@@ -101,6 +101,21 @@ mod tests {
     }
 
     #[test]
+    fn test_build_quinn_server_config_missing_key_returns_err() {
+        let cert = repo_root().join("cert.pem");
+        let key = repo_root().join("nonexistent-key.pem");
+        assert!(build_quinn_server_config(&cert, &key).is_err());
+    }
+
+    #[test]
+    fn test_build_quinn_server_config_empty_cert_list_returns_err() {
+        let empty = tempfile::NamedTempFile::new().expect("temp file");
+        let cert = empty.path();
+        let key = repo_root().join("key.pem");
+        assert!(build_quinn_server_config(cert, &key).is_err());
+    }
+
+    #[test]
     fn test_build_quinn_client_config_ca_exists_returns_ok() {
         let ca = repo_root().join("cert.pem");
         let cfg = build_quinn_client_config(&ca, "localhost");
@@ -115,5 +130,11 @@ mod tests {
     fn test_build_quinn_client_config_missing_ca_returns_err() {
         let ca = repo_root().join("nonexistent-ca.pem");
         assert!(build_quinn_client_config(&ca, "localhost").is_err());
+    }
+
+    #[test]
+    fn test_build_quinn_client_config_invalid_server_name_returns_err() {
+        let ca = repo_root().join("cert.pem");
+        assert!(build_quinn_client_config(&ca, "").is_err());
     }
 }

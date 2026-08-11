@@ -46,8 +46,10 @@ async fn assert_no_datagram(conn: &quinn::Connection) {
 async fn test_dispatcher_delivers_packet_to_registered_conn() {
     let state = common::make_test_state().await;
     let pair = common::make_connected_pair().await;
-    let handle =
-        vpn::server::ConnectionHandle::new(pair.server.clone(), Ipv4Addr::new(10, 0, 0, 2));
+    let handle = vpn::server::ConnectionHandle::new(
+        quic_link::Session::new(pair.server.clone()),
+        Ipv4Addr::new(10, 0, 0, 2),
+    );
 
     {
         let mut reg = state.registry.lock().unwrap();
@@ -69,8 +71,10 @@ async fn test_dispatcher_delivers_packet_to_registered_conn() {
 async fn test_dispatcher_miss_silently_drops_no_datagram() {
     let state = common::make_test_state().await;
     let pair = common::make_connected_pair().await;
-    let handle =
-        vpn::server::ConnectionHandle::new(pair.server.clone(), Ipv4Addr::new(10, 0, 0, 2));
+    let handle = vpn::server::ConnectionHandle::new(
+        quic_link::Session::new(pair.server.clone()),
+        Ipv4Addr::new(10, 0, 0, 2),
+    );
 
     {
         let mut reg = state.registry.lock().unwrap();
@@ -90,8 +94,10 @@ async fn test_dispatcher_miss_silently_drops_no_datagram() {
 async fn test_dispatcher_malformed_short_packet_silently_dropped() {
     let state = common::make_test_state().await;
     let pair = common::make_connected_pair().await;
-    let handle =
-        vpn::server::ConnectionHandle::new(pair.server.clone(), Ipv4Addr::new(10, 0, 0, 2));
+    let handle = vpn::server::ConnectionHandle::new(
+        quic_link::Session::new(pair.server.clone()),
+        Ipv4Addr::new(10, 0, 0, 2),
+    );
 
     {
         let mut reg = state.registry.lock().unwrap();
@@ -111,8 +117,10 @@ async fn test_dispatcher_malformed_short_packet_silently_dropped() {
 async fn test_dispatcher_non_ipv4_packet_silently_dropped() {
     let state = common::make_test_state().await;
     let pair = common::make_connected_pair().await;
-    let handle =
-        vpn::server::ConnectionHandle::new(pair.server.clone(), Ipv4Addr::new(10, 0, 0, 2));
+    let handle = vpn::server::ConnectionHandle::new(
+        quic_link::Session::new(pair.server.clone()),
+        Ipv4Addr::new(10, 0, 0, 2),
+    );
 
     {
         let mut reg = state.registry.lock().unwrap();
@@ -134,8 +142,10 @@ async fn test_dispatcher_non_ipv4_packet_silently_dropped() {
 async fn test_downlink_pump_relays_multiple_packets_in_order_and_exits_on_tun_close() {
     let state = common::make_test_state().await;
     let pair = common::make_connected_pair().await;
-    let handle =
-        vpn::server::ConnectionHandle::new(pair.server.clone(), Ipv4Addr::new(10, 0, 0, 2));
+    let handle = vpn::server::ConnectionHandle::new(
+        quic_link::Session::new(pair.server.clone()),
+        Ipv4Addr::new(10, 0, 0, 2),
+    );
 
     {
         let mut reg = state.registry.lock().unwrap();
@@ -172,8 +182,10 @@ async fn test_downlink_pump_relays_multiple_packets_in_order_and_exits_on_tun_cl
 async fn test_downlink_pump_continues_after_miss() {
     let state = common::make_test_state().await;
     let pair = common::make_connected_pair().await;
-    let handle =
-        vpn::server::ConnectionHandle::new(pair.server.clone(), Ipv4Addr::new(10, 0, 0, 2));
+    let handle = vpn::server::ConnectionHandle::new(
+        quic_link::Session::new(pair.server.clone()),
+        Ipv4Addr::new(10, 0, 0, 2),
+    );
 
     {
         let mut reg = state.registry.lock().unwrap();

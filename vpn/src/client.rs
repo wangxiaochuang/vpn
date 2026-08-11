@@ -7,13 +7,13 @@ use thiserror::Error;
 
 use crate::config::ClientConfig;
 use crate::config::MIN_MTU;
-use crate::ctrl::KeepaliveTracker;
-use crate::data::{QuinnDatagram, Tun, forward};
+use crate::data::{Tun, forward};
 use crate::vpn::AuthOk;
 use crate::vpn::ControlMessage;
 use crate::vpn::control_message::Msg;
+use msgx::Channel;
 use msgx::channel::{Receiver, Sender};
-use msgx::{Channel, KEEPALIVE_INTERVAL};
+use quic_link::{KeepaliveConfig, LoopControl, Session, keepalive_loop};
 use shutdown::Shutdown;
 use shutdown::ShutdownHandle;
 
@@ -134,7 +134,7 @@ pub async fn run_with_credentials(
     password: String,
     sd: Shutdown,
 ) -> anyhow::Result<()> {
-    let (endpoint, conn, channel, params) = establish_connection(&config, password).await?;
+    let (client, session, channel, params) = establish_connection(&config, password).await?;
     let tun = setup_tun(&params)?;
     tracing::info!(
         "authenticated as {}, assigned_ip={}, subnet={}, mtu={}",
@@ -143,41 +143,33 @@ pub async fn run_with_credentials(
         params.subnet,
         params.mtu
     );
-    run_data_plane(&conn, tun, channel, endpoint, sd).await
+    run_data_plane(&session, tun, channel, client, sd).await
 }
 
 async fn establish_connection(
     config: &ClientConfig,
     password: String,
 ) -> anyhow::Result<(
-    quinn::Endpoint,
-    quinn::Connection,
+    quic_link::Client,
+    Session,
     Channel<ControlMessage>,
     ClientTunParams,
 )> {
-    let endpoint = connect_quic()?;
-    let conn = endpoint
-        .connect_with(
-            crate::tls::build_quinn_client_config(&config.ca_cert, &config.server_name)
-                .context("failed to build client TLS config")?,
-            config.server,
-            &config.server_name,
-        )
-        .context("failed to initiate QUIC connection")?
-        .await
-        .context("failed to connect to server")?;
+    let client = quic_link::Client::builder()
+        .trust_ca(config.ca_cert.clone())
+        .server_name(config.server_name.clone())
+        .build()
+        .context("failed to build client")?;
+    let session = client.connect(config.server).await?;
     tracing::info!("connected to {}", config.server);
-    let mut channel = open_control_stream(&conn).await?;
+    let mut channel = open_control_stream(&session).await?;
     let params = authenticate(&mut channel, &config.username, password).await?;
-    Ok((endpoint, conn, channel, params))
+    Ok((client, session, channel, params))
 }
 
-fn connect_quic() -> anyhow::Result<quinn::Endpoint> {
-    quinn::Endpoint::client("0.0.0.0:0".parse()?).context("failed to bind client endpoint")
-}
-
-async fn open_control_stream(conn: &quinn::Connection) -> anyhow::Result<Channel<ControlMessage>> {
-    crate::quinn_stream::open_bi(conn)
+async fn open_control_stream(session: &Session) -> anyhow::Result<Channel<ControlMessage>> {
+    session
+        .open_stream::<ControlMessage>()
         .await
         .context("failed to open control stream")
 }
@@ -237,130 +229,98 @@ fn setup_tun(params: &ClientTunParams) -> anyhow::Result<std::sync::Arc<tun_rs::
 }
 
 pub async fn heartbeat_loop(
-    conn: quinn::Connection,
+    session: Session,
     mut reader: Receiver<ControlMessage>,
     mut writer: Sender<ControlMessage>,
     shutdown: ShutdownHandle,
 ) {
-    let mut tracker = KeepaliveTracker::new(now());
-    let mut send_tick = tokio::time::interval(KEEPALIVE_INTERVAL);
-    let mut timeout_tick = tokio::time::interval(Duration::from_secs(1));
-    loop {
-        let should_break = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => true,
-            _ = timeout_tick.tick() => close_if_dead(&conn, &tracker),
-            _ = send_tick.tick() => send_heartbeat(&mut writer).await.is_err(),
-            msg = reader.recv() => !handle_control_msg(msg, &mut tracker),
-        };
-        if should_break {
-            break;
-        }
-    }
-}
-
-fn now() -> std::time::Instant {
-    tokio::time::Instant::now().into_std()
-}
-
-fn close_if_dead(conn: &quinn::Connection, tracker: &KeepaliveTracker) -> bool {
-    if tracker.is_dead(now()) {
-        conn.close(0x100u32.into(), b"timeout");
-        true
-    } else {
-        false
-    }
-}
-
-async fn send_heartbeat(writer: &mut Sender<ControlMessage>) -> Result<(), ()> {
-    let hb = ControlMessage {
+    let hb = || ControlMessage {
         msg: Some(Msg::Heartbeat(crate::vpn::Heartbeat {})),
     };
-    writer.send(hb).await.map_err(|_| ())
+    keepalive_loop(
+        &session,
+        &mut writer,
+        &mut reader,
+        &shutdown,
+        KeepaliveConfig::default(),
+        hb,
+        handle_ctrl_msg,
+    )
+    .await;
 }
 
-fn handle_control_msg(
-    msg: Result<Option<ControlMessage>, msgx::RecvError>,
-    tracker: &mut KeepaliveTracker,
-) -> bool {
-    match msg {
-        Ok(Some(ControlMessage {
-            msg: Some(Msg::Disconnect(d)),
-        })) => {
-            tracing::info!("server disconnected: {}", d.reason);
-            false
-        }
-        Ok(Some(_)) => {
-            tracker.observe(now());
-            true
-        }
-        _ => false,
+fn handle_ctrl_msg(m: &ControlMessage) -> LoopControl {
+    if matches!(m.msg, Some(Msg::Disconnect(_))) {
+        tracing::info!("server disconnected");
+        LoopControl::Break
+    } else {
+        LoopControl::Continue
     }
 }
 
 async fn run_data_plane(
-    conn: &quinn::Connection,
+    session: &Session,
     tun: std::sync::Arc<tun_rs::AsyncDevice>,
     channel: Channel<ControlMessage>,
-    endpoint: quinn::Endpoint,
+    client: quic_link::Client,
     sd: Shutdown,
 ) -> anyhow::Result<()> {
     let (writer, reader) = channel.split();
-    let mut tasks = spawn_data_tasks(conn, tun, reader, writer, &sd);
+    let mut tasks = spawn_data_tasks(session, tun, reader, writer, &sd);
     shutdown::wait_for_interrupt(&sd).await;
-    conn.close(0u32.into(), b"client-shutdown");
+    session.close(0, b"client-shutdown");
     sd.drain(&mut tasks, "client").await;
-    endpoint.close(0u32.into(), b"client-shutdown");
+    std::mem::forget(client);
     Ok(())
 }
 
 fn spawn_data_tasks(
-    conn: &quinn::Connection,
+    session: &Session,
     tun: std::sync::Arc<tun_rs::AsyncDevice>,
     reader: Receiver<ControlMessage>,
     writer: Sender<ControlMessage>,
     sd: &Shutdown,
 ) -> tokio::task::JoinSet<()> {
     let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    let conn_for_hb = conn.clone();
+    let session_for_hb = session.clone();
     let hb_handle = sd.handle();
     tasks.spawn(async move {
-        heartbeat_loop(conn_for_hb, reader, writer, hb_handle.clone()).await;
+        heartbeat_loop(session_for_hb, reader, writer, hb_handle.clone()).await;
         hb_handle.cancel();
     });
-    spawn_uplink(conn, tun.clone(), sd.handle(), &mut tasks);
-    spawn_downlink(conn, tun, sd.handle(), &mut tasks);
+    spawn_uplink(session, tun.clone(), sd.handle(), &mut tasks);
+    spawn_downlink(session, tun, sd.handle(), &mut tasks);
     tasks
 }
 
 fn spawn_uplink(
-    conn: &quinn::Connection,
+    session: &Session,
     tun: std::sync::Arc<tun_rs::AsyncDevice>,
     shutdown: ShutdownHandle,
     tasks: &mut tokio::task::JoinSet<()>,
 ) {
-    let uplink_conn = conn.clone();
+    let session_for_uplink = session.clone();
     tasks.spawn(async move {
         let mut source = Tun(tun);
-        let mut sink = QuinnDatagram::new(uplink_conn.clone());
+        let mut sink = session_for_uplink.datagram_tx();
         let _ = forward(&mut source, &mut sink, &shutdown).await;
-        uplink_conn.close(0x101u32.into(), b"uplink-ended");
+        session_for_uplink.close(0x101, b"uplink-ended");
         shutdown.cancel();
     });
 }
 
 fn spawn_downlink(
-    conn: &quinn::Connection,
+    session: &Session,
     tun: std::sync::Arc<tun_rs::AsyncDevice>,
     shutdown: ShutdownHandle,
     tasks: &mut tokio::task::JoinSet<()>,
 ) {
-    let downlink_conn = conn.clone();
+    let session_for_downlink = session.clone();
     tasks.spawn(async move {
-        let mut source = QuinnDatagram::new(downlink_conn.clone());
+        let mut source = session_for_downlink.datagram_rx();
         let mut sink = Tun(tun);
         let _ = forward(&mut source, &mut sink, &shutdown).await;
-        downlink_conn.close(0x102u32.into(), b"downlink-ended");
+        session_for_downlink.close(0x102, b"downlink-ended");
         shutdown.cancel();
     });
 }

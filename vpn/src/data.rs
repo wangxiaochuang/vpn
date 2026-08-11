@@ -4,6 +4,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+pub use quic_link::{PacketSink, PacketSource, forward};
 use shutdown::ShutdownHandle;
 
 pub fn dst_ipv4_addr(pkt: &[u8]) -> Option<Ipv4Addr> {
@@ -15,31 +16,8 @@ pub fn dst_ipv4_addr(pkt: &[u8]) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(octets))
 }
 
-pub trait PacketSource {
-    fn recv(&mut self) -> impl Future<Output = io::Result<Bytes>> + Send;
-}
-
-pub trait PacketSink {
-    fn send(&mut self, pkt: Bytes) -> impl Future<Output = io::Result<()>> + Send;
-}
-
 pub trait DownlinkDispatcher {
     fn dispatch(&self, pkt: Bytes) -> impl Future<Output = ()> + Send;
-}
-
-pub async fn forward<S: PacketSource + Unpin, K: PacketSink + Unpin>(
-    source: &mut S,
-    sink: &mut K,
-    cancel: &ShutdownHandle,
-) -> io::Result<()> {
-    loop {
-        let pkt = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Ok(()),
-            pkt = source.recv() => pkt?,
-        };
-        sink.send(pkt).await?;
-    }
 }
 
 pub async fn downlink_pump<S: PacketSource + Unpin, D: DownlinkDispatcher>(
@@ -88,41 +66,9 @@ impl PacketSink for Tun {
     }
 }
 
-pub struct QuinnDatagram {
-    conn: quinn::Connection,
-}
-
-impl QuinnDatagram {
-    pub fn new(conn: quinn::Connection) -> Self {
-        Self { conn }
-    }
-}
-
-impl PacketSource for QuinnDatagram {
-    fn recv(&mut self) -> impl Future<Output = io::Result<Bytes>> + Send {
-        async move {
-            self.conn
-                .read_datagram()
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()))
-        }
-    }
-}
-
-impl PacketSink for QuinnDatagram {
-    fn send(&mut self, pkt: Bytes) -> impl Future<Output = io::Result<()>> + Send {
-        async move {
-            self.conn
-                .send_datagram(pkt)
-                .map_err(|e| io::Error::other(e.to_string()))
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use std::future::Future;
     use std::time::Duration;
 
     use tokio::sync::mpsc;
@@ -147,21 +93,6 @@ mod tests {
                         "source closed",
                     )),
                 }
-            }
-        }
-    }
-
-    struct ChannelSink {
-        tx: mpsc::Sender<Bytes>,
-    }
-
-    impl PacketSink for ChannelSink {
-        fn send(&mut self, pkt: Bytes) -> impl Future<Output = io::Result<()>> + Send {
-            async move {
-                self.tx
-                    .send(pkt)
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "sink closed"))
             }
         }
     }
@@ -217,81 +148,6 @@ mod tests {
     #[test]
     fn test_dst_ipv4_addr_empty_packet_returns_none() {
         assert_eq!(dst_ipv4_addr(&[]), None);
-    }
-
-    #[tokio::test]
-    async fn test_forward_cancel_when_source_hanging_returns_ok() {
-        let cancel = sd_handle();
-        let (src_tx, src_rx) = mpsc::channel::<Bytes>(8);
-        let (sink_tx, mut sink_rx) = mpsc::channel::<Bytes>(8);
-        let mut source = ChannelSource { rx: src_rx };
-        let mut sink = ChannelSink { tx: sink_tx };
-
-        let cancel_for_task = cancel.clone();
-        let task =
-            tokio::spawn(async move { forward(&mut source, &mut sink, &cancel_for_task).await });
-
-        tokio::task::yield_now().await;
-        cancel.cancel();
-
-        let result = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("forward should return promptly after cancel")
-            .expect("task should not panic");
-        assert!(result.is_ok(), "forward returns Ok(()) on cancel");
-        assert!(
-            sink_rx.recv().await.is_none(),
-            "no packet should be sent after cancel"
-        );
-        drop(src_tx);
-    }
-
-    #[tokio::test]
-    async fn test_forward_cancel_biased_priority_over_ready_recv() {
-        let cancel = sd_handle();
-        let (src_tx, src_rx) = mpsc::channel::<Bytes>(8);
-        let (sink_tx, mut sink_rx) = mpsc::channel::<Bytes>(8);
-
-        src_tx.send(Bytes::from_static(b"P")).await.unwrap();
-        cancel.cancel();
-
-        let result = {
-            let mut source = ChannelSource { rx: src_rx };
-            let mut sink = ChannelSink { tx: sink_tx };
-            forward(&mut source, &mut sink, &cancel).await
-        };
-
-        assert!(
-            result.is_ok(),
-            "biased cancel should win over a ready packet"
-        );
-        assert!(
-            sink_rx.recv().await.is_none(),
-            "the ready packet P should be dropped, not forwarded"
-        );
-        drop(src_tx);
-    }
-
-    #[tokio::test]
-    async fn test_forward_uncancelled_relays_packets_until_source_error() {
-        let cancel = sd_handle();
-        let (src_tx, src_rx) = mpsc::channel::<Bytes>(8);
-        let (sink_tx, mut sink_rx) = mpsc::channel::<Bytes>(8);
-
-        src_tx.send(Bytes::from_static(b"p1")).await.unwrap();
-        src_tx.send(Bytes::from_static(b"p2")).await.unwrap();
-        drop(src_tx);
-
-        let result = {
-            let mut source = ChannelSource { rx: src_rx };
-            let mut sink = ChannelSink { tx: sink_tx };
-            forward(&mut source, &mut sink, &cancel).await
-        };
-        assert!(result.is_err());
-
-        assert_eq!(sink_rx.recv().await.unwrap(), Bytes::from_static(b"p1"));
-        assert_eq!(sink_rx.recv().await.unwrap(), Bytes::from_static(b"p2"));
-        assert!(sink_rx.recv().await.is_none());
     }
 
     fn spawn_downlink_pump(
@@ -358,7 +214,7 @@ mod tests {
         assert!(TUN_RECV_BUF_SIZE >= usize::from(MIN_MTU));
     }
 
-    /// Spec scenario: `TUN_RECV_BUF_SIZE 覆盖最大 IPv4 包长度` —
+    /// Spec scenario: `TUN_RECV_BUF_SIZE 覆盖最大 IPv4 包长度` ——
     /// 该常量 SHALL 等于 65535（`u16::MAX`），覆盖 IPv4 total length 字段最大值。
     #[test]
     fn test_tun_recv_buf_size_equals_u16_max() {

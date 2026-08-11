@@ -95,7 +95,7 @@ async fn test_pool_exhausted_receives_server_busy() {
 #[test]
 fn test_missing_ca_returns_error_from_tls_builder() {
     let ca = common::repo("nonexistent-ca.pem");
-    let result = vpn::tls::build_quinn_client_config(&ca, "localhost");
+    let result = quic_link::build_quinn_client_config(&ca, "localhost");
     assert!(result.is_err(), "missing CA should fail TLS config build");
 }
 

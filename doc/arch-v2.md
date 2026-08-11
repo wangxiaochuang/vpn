@@ -290,3 +290,4 @@ v1 技术栈全部保留。v2 倾向**最小新增依赖**：能复用 v1 既有
 | 客户端定位为交互式 CLI 用户 | 挑战机制硬依赖人工输入，无人值守场景不在 v2 范围 |
 | 不做 v1 客户端兼容（无版本协商） | 开发阶段整体升级，避免协议版本协商复杂度 |
 | 优雅关闭协调逻辑抽为独立 `shutdown` crate | "信号 → token → 带超时 drain"模式对任何 tokio 长驻服务通用，预期被其他服务复用；仿 `msgx` 以 workspace member + path 依赖形式共享，暂不发布 crates.io 待 API 打磨稳定 |
+| QUIC 连接管道抽为独立 `quic-link` crate | TLS 配置构建、Endpoint 建立、bidi stream→Channel 适配、datagram 收发、保活循环在 VPN 及后续 QUIC 项目中重复；提取为 `quic-link` 后调用方只写"握手+业务"，连接管道全复用。依赖方向：`quic-link → msgx`，`vpn → quic-link`。`Session` 私有封装 `quinn::Connection`，对外类型签名不含 `quinn::` 类型；`inner()` 逃生口标注为 `#[doc(hidden)]` |

@@ -7,8 +7,8 @@ use std::io;
 use std::time::Duration;
 
 use bytes::Bytes;
+use quic_link::{DatagramRx, PacketSink, forward};
 use tokio::sync::mpsc;
-use vpn::data::{PacketSink, QuinnDatagram, forward};
 
 fn sd_handle() -> shutdown::ShutdownHandle {
     shutdown::Shutdown::new(Duration::from_secs(5)).handle()
@@ -42,7 +42,7 @@ async fn test_client_uplink_packet_reaches_server_side() {
 
     let (tx, mut rx) = mpsc::channel::<Bytes>(8);
     let mut sink = ChannelSink { tx };
-    let mut source = QuinnDatagram::new(pair.server.clone());
+    let mut source = DatagramRx::new(pair.server.clone());
 
     let forward_task = tokio::spawn(async move {
         let _ = forward(&mut source, &mut sink, &sd_handle()).await;
@@ -72,7 +72,7 @@ async fn test_client_downlink_packet_reaches_client_side() {
 
     let (tx, mut rx) = mpsc::channel::<Bytes>(8);
     let mut sink = ChannelSink { tx };
-    let mut source = QuinnDatagram::new(pair.client.clone());
+    let mut source = DatagramRx::new(pair.client.clone());
 
     let forward_task = tokio::spawn(async move {
         let _ = forward(&mut source, &mut sink, &sd_handle()).await;
@@ -102,7 +102,7 @@ async fn test_client_downlink_exits_when_connection_closed() {
 
     let (tx, _rx) = mpsc::channel::<Bytes>(8);
     let mut sink = ChannelSink { tx };
-    let mut source = QuinnDatagram::new(pair.client.clone());
+    let mut source = DatagramRx::new(pair.client.clone());
 
     let forward_task =
         tokio::spawn(async move { forward(&mut source, &mut sink, &sd_handle()).await });
