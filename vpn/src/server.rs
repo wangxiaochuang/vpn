@@ -9,6 +9,8 @@ use crate::ctrl::{self, deny_reason_from};
 use crate::data::{DownlinkDispatcher, Tun, downlink_pump, dst_ipv4_addr};
 use crate::ipam::IpPool;
 use crate::route::SessionRegistry;
+use crate::telemetry::TelemetryTxSlot;
+use crate::telemetry::make_telemetry_tx_slot;
 use crate::tun_setup::gateway_addr;
 use crate::vpn::control_message::Msg;
 use crate::vpn::{AuthDenied, AuthOk, ControlMessage, Disconnect, Heartbeat};
@@ -20,22 +22,49 @@ use quic_link::{
 };
 use shutdown::Shutdown;
 use shutdown::ShutdownHandle;
+use sysprobe::proto::TelemetryMessage;
+use sysprobe::sink::ConsoleSink;
+use sysprobe::sink::SinkSource;
+use sysprobe::sink::TelemetrySink;
 
-#[derive(Debug)]
+const TELEMETRY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct ConnectionHandle {
     id: usize,
     pub session: Session,
     pub ip: Ipv4Addr,
+    pub telemetry_tx: TelemetryTxSlot,
+}
+
+impl std::fmt::Debug for ConnectionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionHandle")
+            .field("id", &self.id)
+            .field("ip", &self.ip)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConnectionHandle {
     pub fn new(session: Session, ip: Ipv4Addr) -> Self {
         let id = session.id();
-        Self { id, session, ip }
+        Self {
+            id,
+            session,
+            ip,
+            telemetry_tx: make_telemetry_tx_slot(),
+        }
     }
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    pub async fn request_collect(
+        &self,
+        kinds: Vec<sysprobe::proto::InfoKind>,
+    ) -> Result<(), crate::telemetry::TelemetryError> {
+        crate::telemetry::request_collect(&self.telemetry_tx, kinds).await
     }
 }
 
@@ -45,6 +74,7 @@ impl Clone for ConnectionHandle {
             id: self.id,
             session: self.session.clone(),
             ip: self.ip,
+            telemetry_tx: self.telemetry_tx.clone(),
         }
     }
 }
@@ -69,6 +99,7 @@ pub struct ServerState {
     pub registry: std::sync::Mutex<SessionRegistry<ConnectionHandle>>,
     pub tun: Option<Arc<tun_rs::AsyncDevice>>,
     pub config: Arc<ServerConfig>,
+    pub telemetry_sink: Arc<dyn TelemetrySink>,
 }
 
 pub type SharedState = Arc<ServerState>;
@@ -104,16 +135,12 @@ pub async fn handle_conn(
     state: SharedState,
     shutdown: ShutdownHandle,
 ) -> anyhow::Result<()> {
-    let Some((channel, ip)) = setup_session(&session, &state).await? else {
+    let Some((channel, ip, username, telemetry_tx)) = setup_session(&session, &state).await? else {
         return Ok(());
     };
     let (sender, receiver) = channel.split();
-    let session_for_hb = session.clone();
-    let shutdown_for_hb = shutdown.clone();
-    let ctrl_task = tokio::spawn(async move {
-        run_ctrl_loop(session_for_hb, sender, receiver, shutdown_for_hb).await;
-    });
-
+    let ctrl_task = spawn_ctrl_task(&session, sender, receiver, shutdown.clone());
+    spawn_telemetry_accept(&session, &state, &username, telemetry_tx, shutdown.clone());
     let uplink_task = spawn_uplink(&state, &session, shutdown);
     let _ = ctrl_task.await;
     if let Some(t) = uplink_task {
@@ -123,10 +150,22 @@ pub async fn handle_conn(
     Ok(())
 }
 
+fn spawn_ctrl_task(
+    session: &Session,
+    sender: Sender<ControlMessage>,
+    receiver: Receiver<ControlMessage>,
+    shutdown: ShutdownHandle,
+) -> tokio::task::JoinHandle<()> {
+    let session_for_hb = session.clone();
+    tokio::spawn(async move {
+        run_ctrl_loop(session_for_hb, sender, receiver, shutdown).await;
+    })
+}
+
 async fn setup_session(
     session: &Session,
     state: &SharedState,
-) -> anyhow::Result<Option<(Channel<ControlMessage>, Ipv4Addr)>> {
+) -> anyhow::Result<Option<(Channel<ControlMessage>, Ipv4Addr, String, TelemetryTxSlot)>> {
     let mut channel = session
         .accept_stream::<ControlMessage>()
         .await
@@ -151,12 +190,13 @@ async fn finalize_session(
     ip: Ipv4Addr,
     session: &Session,
     mut channel: Channel<ControlMessage>,
-) -> anyhow::Result<Option<(Channel<ControlMessage>, Ipv4Addr)>> {
-    if !register_and_evict(state, username, ip, session) {
+) -> anyhow::Result<Option<(Channel<ControlMessage>, Ipv4Addr, String, TelemetryTxSlot)>> {
+    let telemetry_tx = register_and_evict(state, username, ip, session);
+    let Some(telemetry_tx) = telemetry_tx else {
         return Ok(None);
-    }
+    };
     send_auth_ok(&mut channel, state, ip).await?;
-    Ok(Some((channel, ip)))
+    Ok(Some((channel, ip, username.to_string(), telemetry_tx)))
 }
 
 async fn recv_auth_request(
@@ -214,27 +254,35 @@ fn register_and_evict(
     username: &str,
     ip: Ipv4Addr,
     session: &Session,
-) -> bool {
+) -> Option<TelemetryTxSlot> {
     let handle = ConnectionHandle::new(session.clone(), ip);
-    let evicted = {
-        let mut reg = state
-            .registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reg.insert(username, ip, handle)
-    };
+    let telemetry_tx = handle.telemetry_tx.clone();
+    let evicted = lock_registry_insert(state, username, ip, handle);
     match evicted {
         Ok(Some(evicted)) => {
             free_ip(state, evicted.ip);
             evicted.handle.session.close(0, b"superseded");
-            true
+            Some(telemetry_tx)
         }
-        Ok(None) => true,
+        Ok(None) => Some(telemetry_tx),
         Err(_) => {
             session.close(0, b"internal-error");
-            false
+            None
         }
     }
+}
+
+fn lock_registry_insert(
+    state: &SharedState,
+    username: &str,
+    ip: Ipv4Addr,
+    handle: ConnectionHandle,
+) -> Result<Option<crate::route::Evicted<ConnectionHandle>>, crate::route::RouteError> {
+    let mut reg = state
+        .registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reg.insert(username, ip, handle)
 }
 
 fn free_ip(state: &SharedState, ip: Ipv4Addr) {
@@ -287,6 +335,58 @@ fn spawn_uplink(
         let _ = forward(&mut source, &mut sink, &shutdown).await;
         session_for_uplink.close(0x101, b"uplink-ended");
     }))
+}
+
+async fn accept_telemetry_stream(
+    session: &Session,
+    state: &SharedState,
+    username: &str,
+    telemetry_tx: TelemetryTxSlot,
+    shutdown: ShutdownHandle,
+) {
+    let accept = tokio::time::timeout(
+        TELEMETRY_ACCEPT_TIMEOUT,
+        session.accept_stream::<TelemetryMessage>(),
+    )
+    .await;
+    let Ok(Ok(channel)) = accept else {
+        tracing::debug!("telemetry stream not opened within timeout, skipping");
+        return;
+    };
+    let (writer, reader) = channel.split();
+    set_telemetry_sender(&telemetry_tx, writer).await;
+    let source = build_sink_source(session, username);
+    let sink = state.telemetry_sink.clone();
+    tokio::spawn(async move {
+        crate::telemetry::server_telemetry_loop(reader, sink, source, shutdown).await;
+    });
+}
+
+fn build_sink_source(session: &Session, username: &str) -> SinkSource {
+    SinkSource {
+        session_id: session.id() as u64,
+        username: username.to_string(),
+        virtual_ip: None,
+    }
+}
+
+fn spawn_telemetry_accept(
+    session: &Session,
+    state: &SharedState,
+    username: &str,
+    telemetry_tx: TelemetryTxSlot,
+    shutdown: ShutdownHandle,
+) {
+    let session = session.clone();
+    let state = state.clone();
+    let username = username.to_string();
+    tokio::spawn(async move {
+        accept_telemetry_stream(&session, &state, &username, telemetry_tx, shutdown).await;
+    });
+}
+
+async fn set_telemetry_sender(slot: &TelemetryTxSlot, sender: crate::telemetry::TelemetrySender) {
+    *slot.lock().await = Some(sender);
 }
 
 async fn run_ctrl_loop(
@@ -374,6 +474,7 @@ fn build_server_state(
         registry: std::sync::Mutex::new(registry),
         tun: Some(tun),
         config: Arc::new(config),
+        telemetry_sink: Arc::new(ConsoleSink),
     }))
 }
 

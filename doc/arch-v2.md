@@ -183,6 +183,8 @@ v2 采用**离散等级**而非连续分数。每级对应清晰的用户体验�
 
 设备健康是 v2 的核心信号之一，也是工作量最大的部分：跨平台采集（Linux / macOS / Windows）涉及完全不同的系统 API。本架构文档**不规定具体采集方式**，由后续实现澄清。但 v2 的客户端必须具备设备健康采集能力并周期上报，服务端必须把设备健康状态作为 TrustEngine 的关键输入。
 
+**遥测底座已就位（v1 后期增量）**：通用客户端信息采集框架 `sysprobe` crate（workspace member）已落地，提供 proto 数据模型、`Collector` trait + `CollectorRegistry`（cadence 调度 / pull 响应）、内置跨平台 collectors（进程 / 端口 / 网卡 / 磁盘）、`TelemetrySink` trait + `ConsoleSink`。该 crate 与传输完全解耦（不依赖 `quinn` / `msgx` / VPN 类型），承载于一条独立 QUIC bidi stream（非控制 stream）。v2 的 `DeviceAttestation` 将作为 `SecurityCollector` 实现 `Collector` trait 接入 sysprobe，复用既有 push（cadence）/ pull（`CollectRequest`）调度与遥测通道——无需新建第二条 stream，无需在控制 stream oneof 中加新消息类型。
+
 ## 6. 控制面协议演进
 
 继承 v1 的单条双向 stream + length-prefixed framing（见 v1 §3）。新增消息类型：
@@ -208,6 +210,8 @@ v2 采用**离散等级**而非连续分数。每级对应清晰的用户体验�
 ```
 
 具体字段、编解码、状态机由后续实现澄清。
+
+**`DeviceAttestation` 的承载通道调整**：原计划把 `DeviceAttestation` 塞进控制 stream 的 oneof，但 v1 后期已建立独立遥测通道（见 §5.1）承载 `sysprobe` 的 `TelemetryReport`。v2 的 `DeviceAttestation` 将作为 `SecurityCollector` 走遥测 stream 上报，控制 stream 保持 v1 纯净（仅 Auth / Heartbeat / Disconnect + v2 的 Reauth / TrustUpdate 等控制语义消息）。这避免了控制 stream 的 keepalive 逻辑与大 payload 采集耦合。
 
 ## 7. 数据面 PEP（L4 检查点）
 
@@ -291,3 +295,6 @@ v1 技术栈全部保留。v2 倾向**最小新增依赖**：能复用 v1 既有
 | 不做 v1 客户端兼容（无版本协商） | 开发阶段整体升级，避免协议版本协商复杂度 |
 | 优雅关闭协调逻辑抽为独立 `shutdown` crate | "信号 → token → 带超时 drain"模式对任何 tokio 长驻服务通用，预期被其他服务复用；仿 `msgx` 以 workspace member + path 依赖形式共享，暂不发布 crates.io 待 API 打磨稳定 |
 | QUIC 连接管道抽为独立 `quic-link` crate | TLS 配置构建、Endpoint 建立、bidi stream→Channel 适配、datagram 收发、保活循环在 VPN 及后续 QUIC 项目中重复；提取为 `quic-link` 后调用方只写"握手+业务"，连接管道全复用。依赖方向：`quic-link → msgx`，`vpn → quic-link`。`Session` 私有封装 `quinn::Connection`，对外类型签名不含 `quinn::` 类型；`inner()` 逃生口标注为 `#[doc(hidden)]` |
+| 通用客户端信息采集抽为独立 `sysprobe` crate（遥测底座） | 采集数据模型（进程 / 端口 / 网卡 / 磁盘）、`Collector` trait + `CollectorRegistry`（cadence 调度 / pull 响应）、`TelemetrySink` trait 与传输完全解耦，可被 VPN 之外系统复用；依赖方向 `sysprobe` 无下游 VPN/QUIC 依赖，`vpn → sysprobe` |
+| 遥测承载于独立 QUIC bidi stream（不复用控制 stream） | 控制 stream 的 keepalive 逻辑与大 payload 采集耦合会拖累心跳；独立 stream 实现流控隔离、task 隔离、故障隔离——遥测 stream 阻塞 / 解码失败 / 采集 panic 均 SHALL NOT 影响控制流与数据面 |
+| `DeviceAttestation` 作为 `SecurityCollector` 接入 sysprobe（不塞进控制 stream oneof） | 复用 v1 后期建立的遥测底座（`sysprobe` crate + 独立遥测 stream），无需新建协议消息；控制 stream 保持纯控制语义，避免大 payload 与 keepalive 耦合 |

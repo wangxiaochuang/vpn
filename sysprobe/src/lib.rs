@@ -15,19 +15,15 @@
     clippy::manual_async_fn
 )]
 
-pub mod auth;
-pub mod client;
-pub mod config;
-pub mod ctrl;
-pub mod data;
-pub mod framing;
-pub mod ipam;
-pub mod route;
-pub mod server;
-pub mod telemetry;
-pub mod tun_setup;
+pub mod collector;
+pub mod collectors;
 
-pub mod vpn {
+pub mod proto {
     #![allow(clippy::doc_markdown)]
-    include!(concat!(env!("OUT_DIR"), "/vpn.rs"));
+    include!(concat!(env!("OUT_DIR"), "/sysprobe.rs"));
 }
+
+pub mod sink;
+
+#[cfg(test)]
+mod proto_roundtrip_tests;

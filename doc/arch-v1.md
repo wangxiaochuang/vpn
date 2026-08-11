@@ -317,5 +317,7 @@ Cargo workspace 成员：
 |-------|------|
 | `vpn` | 主库与主二进制：QUIC 控制面/数据面、TUN、路由、配置、认证 |
 | `msgx` | 控制面 framing + length-prefixed codec + 心跳 tracker（QUIC stream 适配） |
+| `quic-link` | QUIC 连接管道：TLS 配置、Endpoint、bidi stream → Channel 适配、datagram 收发、保活循环（`Session` 封装 `quinn::Connection`，对外不含 `quinn::` 类型） |
 | `shutdown` | 通用的 tokio 长驻服务优雅关闭协调（`Shutdown`：信号 → token → drain，含超时/abort 兜底） |
+| `sysprobe` | 通用客户端信息采集框架：proto 数据模型、`Collector` trait + `CollectorRegistry`（cadence 调度 / pull 响应）、内置跨平台 collectors（进程/端口/网卡/磁盘）、`TelemetrySink` trait + `ConsoleSink`；与传输完全解耦，不依赖 `quinn` / `msgx` / VPN 类型 |
 | `xtask` | 开发/运维工具（如 `cargo xtask users ...` 哈希用户密码） |

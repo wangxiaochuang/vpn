@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package sysprobe;
+
+message TelemetryMessage {
+  oneof msg {
+    TelemetryReport report = 1;
+    CollectRequest collect_req = 2;
+  }
+}
+
+message TelemetryReport {
+  uint64 ts_ms = 1;
+  repeated InfoSnapshot items = 2;
+}
+
+message CollectRequest {
+  repeated InfoKind kinds = 1;
+}
+
+message InfoSnapshot {
+  InfoKind kind = 1;
+  oneof payload {
+    ProcessSummary process_summary = 10;
+    ProcessList processes = 11;
+    PortList ports = 12;
+    NetifList interfaces = 13;
+    DiskInfo disks = 14;
+  }
+}
+
+enum InfoKind {
+  PROCESS_SUMMARY = 0;
+  PROCESS_LIST = 1;
+  PORT_LIST = 2;
+  NETIF_LIST = 3;
+  DISK_INFO = 4;
+}
+
+message ProcessSummary {
+  uint32 count = 1;
+  repeated ProcessEntry top_by_cpu = 2;
+}
+
+message ProcessList {
+  repeated ProcessEntry processes = 1;
+}
+
+message ProcessEntry {
+  uint32 pid = 1;
+  string name = 2;
+  float cpu_percent = 3;
+  uint64 mem_kb = 4;
+}
+
+message PortList {
+  repeated PortEntry ports = 1;
+}
+
+message PortEntry {
+  string proto = 1;
+  string local_addr = 2;
+  uint32 local_port = 3;
+  string state = 4;
+  uint32 pid = 5;
+}
+
+message NetifList {
+  repeated NetifEntry interfaces = 1;
+}
+
+message NetifEntry {
+  string name = 1;
+  string mac = 2;
+  repeated string ipv4_addrs = 3;
+  repeated string ipv6_addrs = 4;
+  bool is_up = 5;
+  uint32 mtu = 6;
+}
+
+message DiskInfo {
+  repeated DiskEntry disks = 1;
+}
+
+message DiskEntry {
+  string mount_point = 1;
+  string fs_type = 2;
+  uint64 total_bytes = 3;
+  uint64 used_bytes = 4;
+  uint64 free_bytes = 5;
+}

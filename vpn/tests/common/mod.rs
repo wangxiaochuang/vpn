@@ -55,6 +55,33 @@ pub fn test_state_with_subnet(subnet: Ipv4Net, users: Vec<(String, String)>) -> 
     test_state_with_subnet_and_routes(subnet, users, vec![])
 }
 
+pub fn test_state_with_sink(
+    subnet: Ipv4Net,
+    users: Vec<(String, String)>,
+    sink: Arc<dyn sysprobe::sink::TelemetrySink>,
+) -> SharedState {
+    let user_pairs: Vec<(String, String)> = users;
+    let store = UserStore::from_users(user_pairs).unwrap();
+    let pool = IpPool::new(subnet).unwrap();
+    let config = ServerConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tun_subnet: subnet,
+        mtu: 1280,
+        cert: repo("cert.pem"),
+        key: repo("key.pem"),
+        routes: vec![],
+        users: vec![],
+    };
+    Arc::new(ServerState {
+        users: store,
+        pool: std::sync::Mutex::new(pool),
+        registry: std::sync::Mutex::new(SessionRegistry::new()),
+        tun: None,
+        config: Arc::new(config),
+        telemetry_sink: sink,
+    })
+}
+
 pub fn test_state_with_subnet_and_routes(
     subnet: Ipv4Net,
     users: Vec<(String, String)>,
@@ -78,6 +105,7 @@ pub fn test_state_with_subnet_and_routes(
         registry: std::sync::Mutex::new(SessionRegistry::new()),
         tun: None,
         config: Arc::new(config),
+        telemetry_sink: std::sync::Arc::new(sysprobe::sink::ConsoleSink),
     })
 }
 
@@ -226,6 +254,32 @@ pub async fn start_test_server_with_routes(
     });
 
     (endpoint, state, handle)
+}
+
+pub async fn start_test_server_with_state(
+    state: SharedState,
+) -> (quinn::Endpoint, shutdown::Shutdown) {
+    let server_cfg = quic_link::build_quinn_server_config(&repo("cert.pem"), &repo("key.pem"))
+        .expect("server cfg");
+    let endpoint = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
+        .expect("server endpoint");
+    let sd = shutdown::Shutdown::new(std::time::Duration::from_secs(10));
+    let accept_endpoint = endpoint.clone();
+    let state_clone = state.clone();
+    let handle = sd.handle();
+    tokio::spawn(async move {
+        while let Some(incoming) = accept_endpoint.accept().await {
+            if let Ok(conn) = incoming.await {
+                let state = state_clone.clone();
+                let ct = handle.clone();
+                tokio::spawn(async move {
+                    let _ =
+                        vpn::server::handle_conn(quic_link::Session::new(conn), state, ct).await;
+                });
+            }
+        }
+    });
+    (endpoint, sd)
 }
 
 pub async fn start_test_server_with_shutdown(

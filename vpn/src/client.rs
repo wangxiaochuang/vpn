@@ -290,7 +290,19 @@ fn spawn_data_tasks(
     });
     spawn_uplink(session, tun.clone(), sd.handle(), &mut tasks);
     spawn_downlink(session, tun, sd.handle(), &mut tasks);
+    spawn_telemetry(session, sd.handle(), &mut tasks);
     tasks
+}
+
+fn spawn_telemetry(
+    session: &Session,
+    shutdown: ShutdownHandle,
+    tasks: &mut tokio::task::JoinSet<()>,
+) {
+    let session_for_telemetry = session.clone();
+    tasks.spawn(async move {
+        crate::telemetry::run_client_telemetry(session_for_telemetry, shutdown).await;
+    });
 }
 
 fn spawn_uplink(
