@@ -22,6 +22,7 @@ pub mod ctrl;
 pub mod data;
 pub mod framing;
 pub mod ipam;
+pub mod ledger;
 pub mod route;
 pub mod server;
 pub mod telemetry;

@@ -4,7 +4,7 @@ mod common;
 
 use std::time::Duration;
 
-use vpn::client::heartbeat_loop;
+use vpn::client::{ExitCause, heartbeat_loop};
 use vpn::ctrl::control_message::Msg;
 use vpn::ctrl::{ControlMessage, Disconnect, Heartbeat};
 
@@ -91,6 +91,11 @@ async fn test_client_closes_connection_after_heartbeat_timeout() {
 
     let result = tokio::time::timeout(Duration::from_secs(3), hb_task).await;
     assert!(result.is_ok(), "heartbeat loop should exit after timeout");
+    assert_eq!(
+        result.unwrap().unwrap(),
+        ExitCause::HeartbeatEnded,
+        "timeout should produce HeartbeatEnded"
+    );
     assert!(
         pair.client.close_reason().is_some(),
         "client should close the connection after 30s without heartbeats"
@@ -100,7 +105,7 @@ async fn test_client_closes_connection_after_heartbeat_timeout() {
 }
 
 #[tokio::test]
-async fn test_client_exits_when_connection_closed_by_server() {
+async fn test_client_exits_with_server_disconnect_cause_on_disconnect_message() {
     let pair = common::make_connected_pair().await;
     let (client_sender, client_reader, mut server_writer, _server_reader) =
         open_control_halves(&pair).await;
@@ -119,11 +124,15 @@ async fn test_client_exits_when_connection_closed_by_server() {
             })),
         })
         .await;
-    pair.server.close(0u32.into(), b"bye");
 
     let result = tokio::time::timeout(Duration::from_secs(3), hb_task).await;
     assert!(
         result.is_ok(),
-        "heartbeat loop should exit when server closes the connection"
+        "heartbeat loop should exit when server sends Disconnect"
+    );
+    assert_eq!(
+        result.unwrap().unwrap(),
+        ExitCause::ServerDisconnect,
+        "Disconnect message should produce ServerDisconnect"
     );
 }

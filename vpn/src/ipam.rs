@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use ipnet::Ipv4Net;
@@ -13,6 +14,8 @@ pub enum IpPoolError {
     OutOfPool(Ipv4Addr),
     #[error("address {0} is not allocated")]
     NotAllocated(Ipv4Addr),
+    #[error("address {0} is not reserved")]
+    NotReserved(Ipv4Addr),
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +23,7 @@ pub struct IpPool {
     network: u32,
     total: u32,
     bits: Vec<u64>,
+    reserved: HashSet<Ipv4Addr>,
 }
 
 fn build_reserved_bits(total: u32) -> Vec<u64> {
@@ -58,6 +62,7 @@ impl IpPool {
             network,
             total,
             bits,
+            reserved: HashSet::new(),
         })
     }
 
@@ -82,6 +87,9 @@ impl IpPool {
         let Some(offset) = self.pool_offset(addr) else {
             return Err(IpPoolError::OutOfPool(addr));
         };
+        if self.reserved.contains(&addr) {
+            return Err(IpPoolError::NotAllocated(addr));
+        }
         let word_idx = (offset / u64::BITS) as usize;
         let mask = 1u64 << (offset % u64::BITS);
         #[allow(clippy::indexing_slicing)]
@@ -91,6 +99,45 @@ impl IpPool {
         }
         *word &= !mask;
         Ok(())
+    }
+
+    pub fn reserve(&mut self, addr: Ipv4Addr) -> Result<(), IpPoolError> {
+        if self.pool_offset(addr).is_none() {
+            return Err(IpPoolError::OutOfPool(addr));
+        }
+        if !self.is_bit_set(addr) || self.reserved.contains(&addr) {
+            return Err(IpPoolError::NotAllocated(addr));
+        }
+        self.reserved.insert(addr);
+        Ok(())
+    }
+
+    pub fn release(&mut self, addr: Ipv4Addr) -> Result<(), IpPoolError> {
+        if !self.reserved.remove(&addr) {
+            return Err(IpPoolError::NotReserved(addr));
+        }
+        self.clear_bit(addr);
+        Ok(())
+    }
+
+    #[allow(clippy::indexing_slicing)]
+    fn is_bit_set(&self, addr: Ipv4Addr) -> bool {
+        let Some(offset) = self.pool_offset(addr) else {
+            return false;
+        };
+        let word_idx = (offset / u64::BITS) as usize;
+        let mask = 1u64 << (offset % u64::BITS);
+        (self.bits[word_idx] & mask) != 0
+    }
+
+    #[allow(clippy::indexing_slicing)]
+    fn clear_bit(&mut self, addr: Ipv4Addr) {
+        let Some(offset) = self.pool_offset(addr) else {
+            return;
+        };
+        let word_idx = (offset / u64::BITS) as usize;
+        let mask = 1u64 << (offset % u64::BITS);
+        self.bits[word_idx] &= !mask;
     }
 
     fn pool_offset(&self, addr: Ipv4Addr) -> Option<u32> {
@@ -207,5 +254,96 @@ mod tests {
             pool.free(Ipv4Addr::new(10, 0, 0, 255)),
             Err(IpPoolError::OutOfPool(Ipv4Addr::new(10, 0, 0, 255)))
         );
+    }
+
+    #[test]
+    fn test_ip_pool_reserve_then_alloc_skips_reserved_address() {
+        let mut pool = IpPool::new(net(10, 0, 0, 0, 29)).expect("valid /29");
+        let a = pool.alloc().expect("alloc .2");
+        assert_eq!(a, Ipv4Addr::new(10, 0, 0, 2));
+        pool.reserve(a).expect("reserve .2");
+        let mut got = Vec::new();
+        while let Ok(ip) = pool.alloc() {
+            got.push(ip);
+        }
+        assert!(!got.contains(&Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(
+            got,
+            vec![
+                Ipv4Addr::new(10, 0, 0, 3),
+                Ipv4Addr::new(10, 0, 0, 4),
+                Ipv4Addr::new(10, 0, 0, 5),
+                Ipv4Addr::new(10, 0, 0, 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ip_pool_release_then_alloc_returns_released_address() {
+        let mut pool = IpPool::new(net(10, 0, 0, 0, 29)).expect("valid /29");
+        let a = pool.alloc().expect("alloc");
+        pool.reserve(a).expect("reserve");
+        pool.release(a).expect("release");
+        assert_eq!(pool.alloc(), Ok(Ipv4Addr::new(10, 0, 0, 2)));
+    }
+
+    #[test]
+    fn test_ip_pool_available_count_excludes_reserved() {
+        let mut pool = IpPool::new(net(10, 0, 0, 0, 29)).expect("valid /29");
+        let a = pool.alloc().expect("alloc .2");
+        let _b = pool.alloc().expect("alloc .3");
+        pool.reserve(a).expect("reserve .2");
+        assert_eq!(pool.available_count(), 3);
+    }
+
+    #[test]
+    fn test_ip_pool_reserve_when_free_returns_not_allocated() {
+        let mut pool = IpPool::new(net(10, 0, 0, 0, 29)).expect("valid /29");
+        assert_eq!(
+            pool.reserve(Ipv4Addr::new(10, 0, 0, 5)),
+            Err(IpPoolError::NotAllocated(Ipv4Addr::new(10, 0, 0, 5)))
+        );
+    }
+
+    #[test]
+    fn test_ip_pool_reserve_when_already_reserved_returns_not_allocated() {
+        let mut pool = IpPool::new(net(10, 0, 0, 0, 29)).expect("valid /29");
+        let a = pool.alloc().expect("alloc");
+        pool.reserve(a).expect("first reserve");
+        assert_eq!(pool.reserve(a), Err(IpPoolError::NotAllocated(a)));
+    }
+
+    #[test]
+    fn test_ip_pool_reserve_out_of_pool_returns_out_of_pool() {
+        let mut pool = IpPool::new(net(10, 0, 0, 0, 29)).expect("valid /29");
+        assert_eq!(
+            pool.reserve(Ipv4Addr::new(10, 0, 0, 1)),
+            Err(IpPoolError::OutOfPool(Ipv4Addr::new(10, 0, 0, 1)))
+        );
+    }
+
+    #[test]
+    fn test_ip_pool_release_when_allocated_returns_not_reserved() {
+        let mut pool = IpPool::new(net(10, 0, 0, 0, 29)).expect("valid /29");
+        let a = pool.alloc().expect("alloc");
+        assert_eq!(pool.release(a), Err(IpPoolError::NotReserved(a)));
+    }
+
+    #[test]
+    fn test_ip_pool_release_when_free_returns_not_reserved() {
+        let mut pool = IpPool::new(net(10, 0, 0, 0, 29)).expect("valid /29");
+        assert_eq!(
+            pool.release(Ipv4Addr::new(10, 0, 0, 5)),
+            Err(IpPoolError::NotReserved(Ipv4Addr::new(10, 0, 0, 5)))
+        );
+    }
+
+    #[test]
+    fn test_ip_pool_free_when_reserved_returns_not_allocated() {
+        let mut pool = IpPool::new(net(10, 0, 0, 0, 29)).expect("valid /29");
+        let a = pool.alloc().expect("alloc");
+        pool.reserve(a).expect("reserve");
+        assert_eq!(pool.free(a), Err(IpPoolError::NotAllocated(a)));
+        assert_eq!(pool.available_count(), 4);
     }
 }

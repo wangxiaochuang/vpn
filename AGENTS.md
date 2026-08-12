@@ -76,6 +76,7 @@ cargo fmt --check           # 格式检查
 - **cancel-safety 标注**：涉及 `tokio::select!` 的代码，review 时必须确认每个分支的 cancel-safety。
 - **测试先行**：Q1/Q2 任务在实现前先写测试（或至少写测试骨架），定义契约后再实现。
 - **类型优先于测试**：能用 Rust 类型系统（typestate、newtype、`#[non_exhaustive]`）在编译期杜绝的非法状态，优先用类型而非运行时测试。
+- **模块高内聚低耦合**: 每个模块负责一个功能，不依赖其他模块的实现实现。
 
 ### AI 协作 prompt 模板
 

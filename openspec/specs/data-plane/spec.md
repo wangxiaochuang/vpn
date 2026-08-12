@@ -75,6 +75,8 @@
 
 系统 SHALL 提供 `DownlinkDispatcher` trait（方法 `dispatch(&self, pkt: Bytes) -> impl Future<Output = ()> + Send`）与 `downlink_pump<S: PacketSource + Unpin, D: DownlinkDispatcher>(&mut tun, &dispatcher, cancel: CancellationToken) -> io::Result<()>`。下行泵循环执行 `tun.recv().await` 后将包交 `dispatcher.dispatch().await`，逐包处理不加工。退出条件有二：(1) `tun.recv()` 返回 `Err` 时退出并返回该错误；(2) `cancel` 被取消时干净退出并返回 `Ok(())`。`dispatch` 返回 `()`（best-effort），单个包的路由 miss 或发送失败 SHALL NOT 终止下行泵。
 
+`server::run` SHALL 在 `downlink_pump` 调用处直接传入局部的 `Tun(Arc<AsyncDevice>)` 作为 `PacketSource`（原 `ServerState.tun: Option<Arc<...>>` 字段已删除）；`downlink_pump` SHALL NOT 从任何全局 state 读取 tun。生产 `RegistryDispatcher` SHALL 持有 `Arc<ConnectionLedger>`，dispatch 时调 `ledger.lookup_by_ip(ip)` 取 clone 后的 `ConnectionHandle`，向其 `session.datagram_tx()` 发包。
+
 #### Scenario: TUN 收到的包原样到达 dispatcher
 
 - **WHEN** mock TUN 预设包 P 后关闭，以未取消的 CancellationToken 调用 `downlink_pump(&mut tun, &mock_dispatcher, &cancel)`
@@ -89,6 +91,11 @@
 
 - **WHEN** mock TUN 持续有包但 `recv().await` 挂起，在 `downlink_pump` 运行期间触发 `cancel.cancel()`
 - **THEN** `downlink_pump` 返回 `Ok(())`，不再处理后续包
+
+#### Scenario: downlink_pump 接受任意 PacketSource 实现（含测试 mock）
+
+- **WHEN** 测试中以 `tokio::sync::mpsc` 实现的 mock `PacketSource` 调用 `downlink_pump`，且不构造 `Tun` 或 `ServerState`
+- **THEN** 编译通过且 pump 行为与生产 `Tun` 一致（验证 tun 抽象已脱离 ServerState）
 
 ### Requirement: tun_rs AsyncDevice 与 quinn datagram 的 trait 桥接
 

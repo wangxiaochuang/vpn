@@ -130,7 +130,8 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
   QUIC 握手 (TLS, CA 校验)
     → 客户端开控制 stream → 发 {username, password}
     → 服务端校验密码
-    → 若存在同名旧连接: 踢掉旧的 (取消其数据泵, 释放其 IP)
+    → 若存在同名旧连接: 顶替 (同一锁内把旧 IP 标记 Reserved, 关闭旧连接;
+       IP 直到老 supervisor 显式 retire 才回到 Free, 见下方顶替规则说明)
     → 从空闲池分配 IP, 写入路由表与 username→连接表
     → 下发 {assigned_ip, subnet, server_ip(gateway), mtu}
     → 客户端按下发参数创建/配置 TUN (含 MTU=1280)
@@ -138,18 +139,36 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 
 断线:
   连接断开 (主动关闭 / 心跳超时 / 被同名新连接顶替)
-    → IP 立即归还池 → 路由表与 username→连接表清除 → 数据泵停止
+  → 每连接 supervisor 统一收尾 (session.close → drain tasks → retire)
+  → retire: 按 handle 移除路由表与 username→连接表, 并经 ReservedIp guard 归还 IP →
+    数据泵停止
 
 主动关闭 (V1):
   - "信号 → 取消令牌 → JoinSet 带超时 drain"的协调逻辑抽为独立 workspace crate
     `shutdown`（`Shutdown` 持有 `CancellationToken` + drain 超时；`spawn_signal_watchdog`
     注册 SIGINT/SIGTERM → `trigger`；`wait_for_interrupt` 内联 select 兜底 ctrl_c）。
     调用方负责 conn/endpoint 的 close 顺序编排，crate 不持有传输资源。
+  - 服务端采用两级 supervisor 结构：
+    全局 supervisor（`server::run`）：accept loop + `conn_set: JoinSet<ConnExitCause>` +
+      `daemon_set: JoinSet<()>`（全局下行泵纳入追踪，非 fire-and-forget）。
+    每连接 supervisor（`ConnectionSupervisor`）：spawn ctrl/uplink/telemetry 三个 task
+      进 `JoinSet<ConnExitCause>`，`run` 以 `select!`(biased) 决定退出原因。
+  - `ConnExitCause` 关闭协议（纯枚举"遗言"契约）：
+      ServerShutdown(全局 sd 触发) / CtrlEnded / UplinkEnded / TelemetryEnded(被忽略) /
+      TaskPanicked → 各自映射 close code/reason。
+      ServerShutdown 时先 drain 后 close（让 ctrl task 发送 Disconnect 通知再关连接），
+      其他 cause 先 close 后 drain（session.close 打断卡住的 recv）。
+    每 task 返回 ConnExitCause；task panic 经 JoinSet::join_next Err 可见（error! 日志，
+      不再静默）。
+    不引入 per-conn cancel token、绝不 trigger 全局 sd——session.close 自然打断所有 task。
   - 服务端 Ctrl-C/SIGTERM: `spawn_signal_watchdog` 捕获信号 → `Shutdown::trigger()` 广播
-    取消 → 停止 accept → 各 handle_conn 清理 (释放 IP、移除 registry)；心跳 task 在 cancel 分支
-    向客户端 best-effort 发送 Disconnect { reason: "server-shutdown" }；
-    endpoint.close → `sd.drain(conn_set)` 等所有连接清理 (带 5s 超时保护) → 超时 abort_all 兜底退出。
-    用 JoinSet 追踪所有 handle_conn task，使关闭时可 await 全部完成。
+    取消 → 停止 accept → 每连接 supervisor 收 ServerShutdown → ctrl task best-effort 发送
+      Disconnect { reason: "server-shutdown" } → drain → close → retire (释放 IP、移除 registry)；
+    endpoint.close → `sd.drain(conn_set)` 等所有连接清理 → `sd.drain(daemon_set)` 等下行泵
+      (各带 5s 超时保护) → 超时 abort_all 兜底退出。
+  - 认证失败下发 AuthDenied: `channel.send(deny)` → `drop(channel)` 触发 stream FIN
+    （AuthDenied 必然按序送达）→ `timeout(AUTH_DENY_CONFIRM=1s, session.closed())` 等对端确认
+    → `session.close(0, b"auth-denied")` 兜底。确定性 FIN 握手替代 sleep(100ms) 时间 hack。
   - 客户端 Ctrl-C 或任一 task 结束: 广播 cancel → conn.close → 等三个 task
     (心跳/上行/下行) 清理 (`sd.drain`，带 5s 超时保护) → 超时 abort 兜底 → endpoint.close
     (endpoint 生命周期由 establish_connection 返回，延长到数据面结束)。
@@ -177,7 +196,7 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
     → 连接与虚拟 IP 保持 → 应用 TCP 会话不断
 ```
 
-顶替规则说明：新连接认证通过后，服务端先处理同名旧连接的清理，再给新连接分配 IP。这避免了"谁是当前合法连接"的竞态——**后到的同名连接即合法**。
+顶替规则说明：新连接认证通过后，服务端先处理同名旧连接的清理，再给新连接分配 IP。这避免了"谁是当前合法连接"的竞态——**后到的同名连接即合法**。旧 IP 在 evict 时被标记为 **Reserved**，直到老 supervisor 显式 `retire`（携带 `ReservedIp` guard）才回到 Free，因此 drain 期间旧 IP 不会被新客户端抢到；`retire` 按 handle 而非 IP 移除 registry，杜绝误删新主人。
 
 （前瞻）V2 引入主动 migration 后，"合法迁移"与"顶替"的判据将由 connection ID 区分：同一 CID 换路径 = 合法迁移（保留），新 CID + 同 username = 顶替（杀旧的）。
 
@@ -187,22 +206,33 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 
 ```
  1. 交互式读取用户名（rpassword，不回显），空用户名直接退出；再交互式读取密码（rpassword，不回显）
- 2. build_quinn_client_config(ca_cert, server_name)
-    → 从 CA PEM 建立信任根，按 server_name 做 SNI 与证书校验
- 3. Endpoint::client + connect_with 连接 server
- 4. 打开控制 stream，发送 AuthRequest{ username, password }
- 5. 匹配首条响应:
-    - AuthOk{ assigned_ip, subnet, gateway, mtu }
-        → parse_auth_ok 校验（IPv4 / Ipv4Net / mtu≥1280 / gateway 在 subnet 内）
-        → create_client_tun(assigned_ip, subnet, mtu)
-            TUN 地址 = 服务端分配的虚拟 IP（区别于服务端的网关地址）
-            macOS 显式 associate_route(true)
-        → ensure_subnet_route(dev, subnet)
-        → 拆分控制 stream 为 reader/writer
-        → 心跳 task（每 10s 发心跳，30s 判死）+ 上行/下行 forward task
-    - AuthDenied{ reason } → 打印可读信息退出（不建 TUN）
- 6. 任一 task 结束（连接关闭 / 心跳超时 / 被顶替 / Ctrl+C）
-    → conn.close → 进程退出（V1 不自动重连）
+ 2. connect_and_auth(config, username, password)
+    → Client::builder + connect 建立 QUIC 连接（quic-link 封装，TLS 校验由 trust_ca/server_name 配置）
+    → 打开控制 stream，发送 AuthRequest{ username, password }
+    → 匹配首条响应:
+       - AuthOk{ assigned_ip, subnet, gateway, mtu }
+           → parse_auth_ok 校验（IPv4 / Ipv4Net / mtu≥1280 / gateway 在 subnet 内）
+           → 返回 EstablishedClient（session / channel / params / endpoint，endpoint 字段声明在最后
+             → 析构顺序保证 endpoint 活得比所有使用 session 的 task 更久，无需 std::mem::forget）
+       - AuthDenied{ reason } → 打印可读信息退出（不建 TUN）
+ 3. setup_tun(&est.params)
+    → create_client_tun(assigned_ip, subnet, mtu)
+        TUN 地址 = 服务端分配的虚拟 IP（区别于服务端的网关地址）
+        macOS 显式 associate_route(true)
+    → ensure_subnet_route(dev, subnet) + add_routes(dev, &params.routes)
+ 4. DataPlane::spawn(est.session.clone(), Tun(tun), est.channel, &sd)
+    → 4 个数据面 task 一批 spawn 进 JoinSet<ExitCause>：
+      心跳（keepalive_loop：每 10s 发心跳，30s 判死；收到 Disconnect → LoopControl::Break）
+      上行 forward(Tun, datagram_tx, cancel)、下行 forward(datagram_rx, Tun, cancel)、遥测
+    → 每个 task 返回 ExitCause（"遗言"契约：Interrupted/ServerDisconnect/HeartbeatEnded/
+      UplinkEnded/DownlinkEnded/TelemetryEnded/TaskPanicked）
+ 5. plane.run(sd).await（DataPlane supervisor）
+    → tokio::select!(biased) 监听 sd.triggered()（Ctrl+C/SIGTERM → Interrupted）
+      与 JoinSet::join_next()（首个 task 遗言；JoinError → error! + TaskPanicked）
+    → TelemetryEnded 被忽略并 continue（遥测退出 SHALL NOT 触发整体关闭）
+    → 其余 ExitCause → session.close(cause.code(), cause.reason()) 通知对端
+    → sd.trigger() 广播取消 → sd.drain(&mut tasks) 等待清理（5s 超时 abort）
+ 6. run 返回后 EstablishedClient 按字段顺序析构（session 先、endpoint 最后），进程退出（V1 不自动重连）
 ```
 
 **方案 A 路由说明（split tunneling）**：客户端把 `subnet` 内的流量导入 TUN（Linux 上执行 `ip route add <subnet> dev <dev>`，幂等；macOS/BSD 依赖 tun-rs `associate_route` 自动加/删路由）。此外服务端可通过配置 `routes` 字段声明需通过 VPN 访问的额外子网（如服务端背后的办公内网 `192.168.100.0/24`），认证成功后随 `AuthOk` 下发给客户端；客户端用 `route_manager` crate 程序化将这些路由绑定到 TUN 接口（跨平台：Linux netlink / macOS-BSD PF_ROUTE / Windows IP Helper），不 shell out 调用系统命令。`0.0.0.0/0`（默认路由）被配置阶段拒绝。V1 **不做全流量代理**（方案 B：默认路由 + server `/32` 例外），因此外网流量不经由服务端转发。macOS 上若 `associate_route` 被环境关闭则无路由，客户端在 TUN 构造时显式开启，不依赖默认值。

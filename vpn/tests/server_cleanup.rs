@@ -81,12 +81,7 @@ async fn test_superseded_old_conn_cleanup_does_not_affect_new_conn() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let has_new = state
-        .registry
-        .lock()
-        .unwrap()
-        .lookup_by_username("alice")
-        .is_some();
+    let has_new = state.ledger.lookup_by_username("alice").is_some();
     assert!(
         has_new,
         "new alice session should still be in registry after old cleanup"

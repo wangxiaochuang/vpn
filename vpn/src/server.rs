@@ -7,8 +7,8 @@ use crate::auth::UserStore;
 use crate::config::ServerConfig;
 use crate::ctrl::{self, deny_reason_from};
 use crate::data::{DownlinkDispatcher, Tun, downlink_pump, dst_ipv4_addr};
-use crate::ipam::IpPool;
-use crate::route::SessionRegistry;
+use crate::ledger::{ConnectionLedger, Evicted, ReservedIp};
+use crate::telemetry::TelemetryPlane;
 use crate::telemetry::TelemetryTxSlot;
 use crate::telemetry::make_telemetry_tx_slot;
 use crate::tun_setup::gateway_addr;
@@ -29,11 +29,65 @@ use sysprobe::sink::TelemetrySink;
 
 const TELEMETRY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 每连接 supervisor 的退出原因（"遗言"契约）。纯枚举，不携带错误信息。
+///
+/// 与客户端 `ExitCause` 的差异：服务端没有 `Downlink`（下行是全局泵，非 per-conn）、
+/// 没有 `HeartbeatEnded`/`ServerDisconnect`（用 `keepalive_loop` 的归并 `CtrlEnded` 表达）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnExitCause {
+    ServerShutdown,
+    CtrlEnded,
+    UplinkEnded,
+    TelemetryEnded,
+    TaskPanicked,
+}
+
+impl ConnExitCause {
+    pub const ALL: [Self; 5] = [
+        Self::ServerShutdown,
+        Self::CtrlEnded,
+        Self::UplinkEnded,
+        Self::TelemetryEnded,
+        Self::TaskPanicked,
+    ];
+
+    pub fn code(self) -> u64 {
+        match self {
+            Self::UplinkEnded | Self::CtrlEnded => 0x1,
+            Self::TaskPanicked => 0x2,
+            Self::ServerShutdown | Self::TelemetryEnded => 0,
+        }
+    }
+
+    pub fn reason(self) -> &'static [u8] {
+        match self {
+            Self::ServerShutdown => b"server-shutdown",
+            Self::CtrlEnded => b"ctrl-ended",
+            Self::UplinkEnded => b"uplink-ended",
+            Self::TelemetryEnded => b"telemetry-ended",
+            Self::TaskPanicked => b"conn-panic",
+        }
+    }
+}
+
+impl std::fmt::Display for ConnExitCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ServerShutdown => write!(f, "server-shutdown"),
+            Self::CtrlEnded => write!(f, "ctrl-ended"),
+            Self::UplinkEnded => write!(f, "uplink-ended"),
+            Self::TelemetryEnded => write!(f, "telemetry-ended"),
+            Self::TaskPanicked => write!(f, "conn-panic"),
+        }
+    }
+}
+
 pub struct ConnectionHandle {
     id: usize,
     pub session: Session,
     pub ip: Ipv4Addr,
     pub telemetry_tx: TelemetryTxSlot,
+    pub(crate) retire_slot: Arc<std::sync::Mutex<Option<ReservedIp>>>,
 }
 
 impl std::fmt::Debug for ConnectionHandle {
@@ -53,6 +107,7 @@ impl ConnectionHandle {
             session,
             ip,
             telemetry_tx: make_telemetry_tx_slot(),
+            retire_slot: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -75,6 +130,7 @@ impl Clone for ConnectionHandle {
             session: self.session.clone(),
             ip: self.ip,
             telemetry_tx: self.telemetry_tx.clone(),
+            retire_slot: self.retire_slot.clone(),
         }
     }
 }
@@ -93,19 +149,25 @@ impl Hash for ConnectionHandle {
     }
 }
 
-pub struct ServerState {
-    pub users: UserStore,
-    pub pool: std::sync::Mutex<IpPool>,
-    pub registry: std::sync::Mutex<SessionRegistry<ConnectionHandle>>,
-    pub tun: Option<Arc<tun_rs::AsyncDevice>>,
+/// 启动参数（只读快照）。按需 clone 给每个连接。
+pub struct BootParams {
     pub config: Arc<ServerConfig>,
-    pub telemetry_sink: Arc<dyn TelemetrySink>,
 }
 
-pub type SharedState = Arc<ServerState>;
+/// 认证存储（只读共享）。
+pub struct AuthStore {
+    pub users: UserStore,
+}
+
+pub struct ServerRuntime {
+    pub ledger: Arc<ConnectionLedger<ConnectionHandle>>,
+    pub auth: Arc<AuthStore>,
+    pub boot: Arc<BootParams>,
+    pub telemetry: Arc<TelemetryPlane>,
+}
 
 pub struct RegistryDispatcher {
-    pub state: SharedState,
+    pub ledger: Arc<ConnectionLedger<ConnectionHandle>>,
 }
 
 impl DownlinkDispatcher for RegistryDispatcher {
@@ -114,58 +176,237 @@ impl DownlinkDispatcher for RegistryDispatcher {
             let Some(dst) = dst_ipv4_addr(&pkt) else {
                 return;
             };
-            let handle = {
-                let Ok(reg) = self.state.registry.lock() else {
-                    return;
-                };
-                reg.lookup(dst).cloned()
+            let Some(handle) = self.ledger.lookup_by_ip(dst) else {
+                return;
             };
-            if let Some(h) = handle {
-                let mut tx = h.session.datagram_tx();
-                let _ = tx.send(pkt).await;
-            }
+            let mut tx = handle.session.datagram_tx();
+            let _ = tx.send(pkt).await;
         }
     }
 }
 
 const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub async fn handle_conn(
+pub async fn handle_conn<S: PacketSink + Unpin + Send + 'static>(
     session: Session,
-    state: SharedState,
+    runtime: Arc<ServerRuntime>,
+    uplink_sink: S,
     shutdown: ShutdownHandle,
-) -> anyhow::Result<()> {
-    let Some((channel, ip, username, telemetry_tx)) = setup_session(&session, &state).await? else {
-        return Ok(());
+) -> anyhow::Result<ConnExitCause> {
+    let Some((channel, handle, username)) = setup_session(&session, &runtime).await? else {
+        return Ok(ConnExitCause::CtrlEnded);
     };
-    let (sender, receiver) = channel.split();
-    let ctrl_task = spawn_ctrl_task(&session, sender, receiver, shutdown.clone());
-    spawn_telemetry_accept(&session, &state, &username, telemetry_tx, shutdown.clone());
-    let uplink_task = spawn_uplink(&state, &session, shutdown);
-    let _ = ctrl_task.await;
-    if let Some(t) = uplink_task {
-        let _ = t.await;
+    let supervisor = ConnectionSupervisor::spawn(
+        handle,
+        runtime.ledger.clone(),
+        runtime.telemetry.clone(),
+        uplink_sink,
+        channel,
+        username,
+        &shutdown,
+    );
+    let cause = supervisor.run(&shutdown).await;
+    tracing::info!("connection exited: {cause}");
+    Ok(cause)
+}
+
+/// 每连接 supervisor：集中 spawn ctrl/uplink/telemetry 三个 task，
+/// 统一"等待结束信号 → 决定退出原因 → close → drain → cleanup"。
+pub struct ConnectionSupervisor {
+    session: Session,
+    handle: ConnectionHandle,
+    ledger: Arc<ConnectionLedger<ConnectionHandle>>,
+    tasks: tokio::task::JoinSet<ConnExitCause>,
+    drain_sd: Shutdown,
+}
+
+impl ConnectionSupervisor {
+    pub fn spawn<S: PacketSink + Unpin + Send + 'static>(
+        handle: ConnectionHandle,
+        ledger: Arc<ConnectionLedger<ConnectionHandle>>,
+        telemetry: Arc<TelemetryPlane>,
+        uplink_sink: S,
+        channel: Channel<ControlMessage>,
+        username: String,
+        sd: &ShutdownHandle,
+    ) -> Self {
+        let mut tasks: tokio::task::JoinSet<ConnExitCause> = tokio::task::JoinSet::new();
+        let (sender, receiver) = channel.split();
+        let session = handle.session.clone();
+        let telemetry_tx = handle.telemetry_tx.clone();
+        spawn_ctrl_task(&mut tasks, session.clone(), sender, receiver, sd);
+        spawn_uplink_task(&mut tasks, uplink_sink, session.clone(), sd);
+        spawn_telemetry_task(&mut tasks, session, telemetry, username, telemetry_tx, sd);
+        Self {
+            session: handle.session.clone(),
+            handle,
+            ledger,
+            tasks,
+            drain_sd: Shutdown::new(Duration::from_secs(5)),
+        }
     }
-    cleanup_session(&state, ip);
-    Ok(())
+
+    pub async fn run(mut self, global_sd: &ShutdownHandle) -> ConnExitCause {
+        let cause = self.await_cause(global_sd).await;
+        let close_after_drain = cause == ConnExitCause::ServerShutdown;
+        if !close_after_drain {
+            self.session.close(cause.code(), cause.reason());
+        }
+        self.drain_sd.drain(&mut self.tasks, "conn").await;
+        if close_after_drain {
+            self.session.close(cause.code(), cause.reason());
+        }
+        let reserved = self
+            .handle
+            .retire_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.ledger.retire(&self.handle, reserved);
+        cause
+    }
+
+    async fn await_cause(&mut self, global_sd: &ShutdownHandle) -> ConnExitCause {
+        loop {
+            // cancel-safety: global_sd.cancelled() 和 tasks.join_next() 均 cancel-safe（tokio 文档）。
+            let cause = tokio::select! {
+                biased;
+                () = global_sd.cancelled() => ConnExitCause::ServerShutdown,
+                Some(r) = self.tasks.join_next() => match r {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("conn task panicked: {e}");
+                        ConnExitCause::TaskPanicked
+                    }
+                },
+            };
+            if cause != ConnExitCause::TelemetryEnded {
+                return cause;
+            }
+        }
+    }
 }
 
 fn spawn_ctrl_task(
-    session: &Session,
+    tasks: &mut tokio::task::JoinSet<ConnExitCause>,
+    session: Session,
     sender: Sender<ControlMessage>,
     receiver: Receiver<ControlMessage>,
+    sd: &ShutdownHandle,
+) {
+    let sd = sd.clone();
+    tasks.spawn(async move { ctrl_task(session, sender, receiver, sd).await });
+}
+
+pub fn spawn_uplink_task<S: PacketSink + Unpin + Send + 'static>(
+    tasks: &mut tokio::task::JoinSet<ConnExitCause>,
+    sink: S,
+    session: Session,
+    sd: &ShutdownHandle,
+) {
+    let sd = sd.clone();
+    tasks.spawn(async move { uplink_task(sink, session, sd).await });
+}
+
+fn spawn_telemetry_task(
+    tasks: &mut tokio::task::JoinSet<ConnExitCause>,
+    session: Session,
+    telemetry: Arc<TelemetryPlane>,
+    username: String,
+    telemetry_tx: TelemetryTxSlot,
+    sd: &ShutdownHandle,
+) {
+    let sd = sd.clone();
+    tasks
+        .spawn(async move { telemetry_task(session, telemetry, username, telemetry_tx, sd).await });
+}
+
+async fn ctrl_task(
+    session: Session,
+    mut writer: Sender<ControlMessage>,
+    mut reader: Receiver<ControlMessage>,
     shutdown: ShutdownHandle,
-) -> tokio::task::JoinHandle<()> {
-    let session_for_hb = session.clone();
-    tokio::spawn(async move {
-        run_ctrl_loop(session_for_hb, sender, receiver, shutdown).await;
-    })
+) -> ConnExitCause {
+    let hb = || ControlMessage {
+        msg: Some(Msg::Heartbeat(Heartbeat {})),
+    };
+    keepalive_loop(
+        &session,
+        &mut writer,
+        &mut reader,
+        &shutdown,
+        KeepaliveConfig::default(),
+        hb,
+        |_| LoopControl::Continue,
+    )
+    .await;
+    send_disconnect_on_shutdown(&shutdown, &mut writer).await;
+    ConnExitCause::CtrlEnded
+}
+
+async fn send_disconnect_on_shutdown(
+    shutdown: &ShutdownHandle,
+    writer: &mut Sender<ControlMessage>,
+) {
+    if shutdown.is_cancelled() {
+        let _ = writer.send(server_disconnect_msg()).await;
+    }
+}
+
+async fn uplink_task<S: PacketSink + Unpin + Send>(
+    mut sink: S,
+    session: Session,
+    shutdown: ShutdownHandle,
+) -> ConnExitCause {
+    let mut source = session.datagram_rx();
+    match forward(&mut source, &mut sink, &shutdown).await {
+        Ok(()) => {}
+        Err(e) => tracing::warn!("uplink ended with error: {e}"),
+    }
+    ConnExitCause::UplinkEnded
+}
+
+async fn telemetry_task(
+    session: Session,
+    telemetry: Arc<TelemetryPlane>,
+    username: String,
+    telemetry_tx: TelemetryTxSlot,
+    shutdown: ShutdownHandle,
+) -> ConnExitCause {
+    let Some(channel) = accept_telemetry_channel(&session, &shutdown).await else {
+        return ConnExitCause::TelemetryEnded;
+    };
+    let (writer, reader) = channel.split();
+    set_telemetry_sender(&telemetry_tx, writer).await;
+    let source = build_sink_source(&session, &username);
+    crate::telemetry::server_telemetry_loop(reader, telemetry, source, shutdown).await;
+    ConnExitCause::TelemetryEnded
+}
+
+async fn accept_telemetry_channel(
+    session: &Session,
+    shutdown: &ShutdownHandle,
+) -> Option<Channel<TelemetryMessage>> {
+    // cancel-safety: shutdown.cancelled() 与 timeout+accept_stream 均 cancel-safe。
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => None,
+        result = tokio::time::timeout(
+            TELEMETRY_ACCEPT_TIMEOUT,
+            session.accept_stream::<TelemetryMessage>(),
+        ) => if let Ok(Ok(ch)) = result {
+            Some(ch)
+        } else {
+            tracing::debug!("telemetry stream not opened within timeout, skipping");
+            None
+        },
+    }
 }
 
 async fn setup_session(
     session: &Session,
-    state: &SharedState,
-) -> anyhow::Result<Option<(Channel<ControlMessage>, Ipv4Addr, String, TelemetryTxSlot)>> {
+    runtime: &ServerRuntime,
+) -> anyhow::Result<Option<(Channel<ControlMessage>, ConnectionHandle, String)>> {
     let mut channel = session
         .accept_stream::<ControlMessage>()
         .await
@@ -173,30 +414,61 @@ async fn setup_session(
     let Some(req) = recv_auth_request(&mut channel, session).await? else {
         return Ok(None);
     };
-    match resolve_auth(state, &req) {
+    match resolve_auth(runtime, &req) {
         AuthResolution::Denied(reason) => {
             finish_denied(channel, session, reason).await;
             Ok(None)
         }
         AuthResolution::Ok(ip) => {
-            finalize_session(state, &req.username, ip, session, channel).await
+            finalize_session(runtime, &req.username, ip, session, channel).await
         }
     }
 }
 
 async fn finalize_session(
-    state: &SharedState,
+    runtime: &ServerRuntime,
     username: &str,
     ip: Ipv4Addr,
     session: &Session,
     mut channel: Channel<ControlMessage>,
-) -> anyhow::Result<Option<(Channel<ControlMessage>, Ipv4Addr, String, TelemetryTxSlot)>> {
-    let telemetry_tx = register_and_evict(state, username, ip, session);
-    let Some(telemetry_tx) = telemetry_tx else {
+) -> anyhow::Result<Option<(Channel<ControlMessage>, ConnectionHandle, String)>> {
+    let Some(handle) = register_session(runtime, username, ip, session) else {
         return Ok(None);
     };
-    send_auth_ok(&mut channel, state, ip).await?;
-    Ok(Some((channel, ip, username.to_string(), telemetry_tx)))
+    send_auth_ok(&mut channel, &runtime.boot, ip).await?;
+    Ok(Some((channel, handle, username.to_string())))
+}
+
+fn register_session(
+    runtime: &ServerRuntime,
+    username: &str,
+    ip: Ipv4Addr,
+    session: &Session,
+) -> Option<ConnectionHandle> {
+    let handle = ConnectionHandle::new(session.clone(), ip);
+    match runtime.ledger.register(username, ip, handle.clone()) {
+        Ok(None) => Some(handle),
+        Ok(Some(evicted)) => {
+            deliver_reserved_and_close(evicted);
+            Some(handle)
+        }
+        Err(_) => {
+            session.close(0, b"internal-error");
+            None
+        }
+    }
+}
+
+fn deliver_reserved_and_close(evicted: Evicted<ConnectionHandle>) {
+    install_retire_guard(&evicted.handle, evicted.reserved);
+    evicted.handle.session.close(0, b"superseded");
+}
+
+fn install_retire_guard(handle: &ConnectionHandle, reserved: ReservedIp) {
+    *handle
+        .retire_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reserved);
 }
 
 async fn recv_auth_request(
@@ -220,19 +492,15 @@ enum AuthResolution {
     Denied(crate::vpn::DenyReason),
 }
 
-fn resolve_auth(state: &SharedState, req: &crate::vpn::AuthRequest) -> AuthResolution {
-    let result = {
-        let mut pool = state
-            .pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ctrl::authenticate(&state.users, &mut pool, req)
-    };
+fn resolve_auth(runtime: &ServerRuntime, req: &crate::vpn::AuthRequest) -> AuthResolution {
+    let result = ctrl::authenticate(&runtime.auth.users, req, || runtime.ledger.alloc());
     match result {
         Ok(ip) => AuthResolution::Ok(ip),
         Err(e) => AuthResolution::Denied(deny_reason_from(&e)),
     }
 }
+
+const AUTH_DENY_CONFIRM: Duration = Duration::from_secs(1);
 
 async fn finish_denied(
     mut channel: Channel<ControlMessage>,
@@ -245,121 +513,38 @@ async fn finish_denied(
         })),
     };
     let _ = channel.send(deny).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(channel);
+    let _ = tokio::time::timeout(AUTH_DENY_CONFIRM, session.closed()).await;
     session.close(0, b"auth-denied");
-}
-
-fn register_and_evict(
-    state: &SharedState,
-    username: &str,
-    ip: Ipv4Addr,
-    session: &Session,
-) -> Option<TelemetryTxSlot> {
-    let handle = ConnectionHandle::new(session.clone(), ip);
-    let telemetry_tx = handle.telemetry_tx.clone();
-    let evicted = lock_registry_insert(state, username, ip, handle);
-    match evicted {
-        Ok(Some(evicted)) => {
-            free_ip(state, evicted.ip);
-            evicted.handle.session.close(0, b"superseded");
-            Some(telemetry_tx)
-        }
-        Ok(None) => Some(telemetry_tx),
-        Err(_) => {
-            session.close(0, b"internal-error");
-            None
-        }
-    }
-}
-
-fn lock_registry_insert(
-    state: &SharedState,
-    username: &str,
-    ip: Ipv4Addr,
-    handle: ConnectionHandle,
-) -> Result<Option<crate::route::Evicted<ConnectionHandle>>, crate::route::RouteError> {
-    let mut reg = state
-        .registry
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.insert(username, ip, handle)
-}
-
-fn free_ip(state: &SharedState, ip: Ipv4Addr) {
-    let mut pool = state
-        .pool
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = pool.free(ip);
 }
 
 async fn send_auth_ok(
     channel: &mut Channel<ControlMessage>,
-    state: &SharedState,
+    boot: &BootParams,
     ip: Ipv4Addr,
 ) -> anyhow::Result<()> {
     channel
-        .send(build_auth_ok(state, ip))
+        .send(build_auth_ok(boot, ip))
         .await
         .map_err(|e| anyhow::anyhow!("failed to send AuthOk: {e}"))
 }
 
-fn build_auth_ok(state: &SharedState, ip: Ipv4Addr) -> ControlMessage {
-    let gateway = gateway_addr(state.config.tun_subnet);
+fn build_auth_ok(boot: &BootParams, ip: Ipv4Addr) -> ControlMessage {
+    let config = &boot.config;
+    let gateway = gateway_addr(config.tun_subnet);
     ControlMessage {
         msg: Some(Msg::AuthOk(AuthOk {
             assigned_ip: ip.to_string(),
-            subnet: state.config.tun_subnet.to_string(),
+            subnet: config.tun_subnet.to_string(),
             gateway: gateway.to_string(),
-            mtu: u32::from(state.config.mtu),
-            routes: state
-                .config
+            mtu: u32::from(config.mtu),
+            routes: config
                 .routes
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect(),
         })),
     }
-}
-
-fn spawn_uplink(
-    state: &SharedState,
-    session: &Session,
-    shutdown: ShutdownHandle,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let tun = state.tun.clone()?;
-    let session_for_uplink = session.clone();
-    Some(tokio::spawn(async move {
-        let mut source = session_for_uplink.datagram_rx();
-        let mut sink = Tun(tun);
-        let _ = forward(&mut source, &mut sink, &shutdown).await;
-        session_for_uplink.close(0x101, b"uplink-ended");
-    }))
-}
-
-async fn accept_telemetry_stream(
-    session: &Session,
-    state: &SharedState,
-    username: &str,
-    telemetry_tx: TelemetryTxSlot,
-    shutdown: ShutdownHandle,
-) {
-    let accept = tokio::time::timeout(
-        TELEMETRY_ACCEPT_TIMEOUT,
-        session.accept_stream::<TelemetryMessage>(),
-    )
-    .await;
-    let Ok(Ok(channel)) = accept else {
-        tracing::debug!("telemetry stream not opened within timeout, skipping");
-        return;
-    };
-    let (writer, reader) = channel.split();
-    set_telemetry_sender(&telemetry_tx, writer).await;
-    let source = build_sink_source(session, username);
-    let sink = state.telemetry_sink.clone();
-    tokio::spawn(async move {
-        crate::telemetry::server_telemetry_loop(reader, sink, source, shutdown).await;
-    });
 }
 
 fn build_sink_source(session: &Session, username: &str) -> SinkSource {
@@ -370,47 +555,8 @@ fn build_sink_source(session: &Session, username: &str) -> SinkSource {
     }
 }
 
-fn spawn_telemetry_accept(
-    session: &Session,
-    state: &SharedState,
-    username: &str,
-    telemetry_tx: TelemetryTxSlot,
-    shutdown: ShutdownHandle,
-) {
-    let session = session.clone();
-    let state = state.clone();
-    let username = username.to_string();
-    tokio::spawn(async move {
-        accept_telemetry_stream(&session, &state, &username, telemetry_tx, shutdown).await;
-    });
-}
-
 async fn set_telemetry_sender(slot: &TelemetryTxSlot, sender: crate::telemetry::TelemetrySender) {
     *slot.lock().await = Some(sender);
-}
-
-async fn run_ctrl_loop(
-    session: Session,
-    mut writer: Sender<ControlMessage>,
-    mut reader: Receiver<ControlMessage>,
-    shutdown: ShutdownHandle,
-) {
-    let hb = || ControlMessage {
-        msg: Some(Msg::Heartbeat(Heartbeat {})),
-    };
-    keepalive_loop(
-        &session,
-        &mut writer,
-        &mut reader,
-        &shutdown,
-        KeepaliveConfig::default(),
-        hb,
-        |_| LoopControl::Continue,
-    )
-    .await;
-    if shutdown.is_cancelled() {
-        let _ = writer.send(server_disconnect_msg()).await;
-    }
 }
 
 fn server_disconnect_msg() -> ControlMessage {
@@ -421,28 +567,43 @@ fn server_disconnect_msg() -> ControlMessage {
     }
 }
 
-fn cleanup_session(state: &SharedState, ip: Ipv4Addr) {
-    let _ = state
-        .registry
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove_by_ip(ip);
-    free_ip(state, ip);
-}
-
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let server = build_server(&config)?;
-    let tun = Arc::new(crate::tun_setup::create_tun(config.tun_subnet, config.mtu)?);
-    let state = build_server_state(config, tun.clone())?;
+    let (runtime, tun) = build_runtime(config)?;
     let sd = Shutdown::new(Duration::from_secs(5));
     let ready = shutdown::spawn_signal_watchdog(sd.clone());
     let _ = ready.await;
-    spawn_downlink(tun, state.clone(), sd.handle());
-    let mut conn_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    accept_connections(&server, state, &sd, &mut conn_set).await;
+    let mut daemon_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    spawn_downlink(
+        tun.clone(),
+        runtime.ledger.clone(),
+        sd.handle(),
+        &mut daemon_set,
+    );
+    let mut conn_set: tokio::task::JoinSet<ConnExitCause> = tokio::task::JoinSet::new();
+    accept_connections(&server, runtime, tun, &sd, &mut conn_set).await;
     server.close();
     sd.drain(&mut conn_set, "server").await;
+    sd.drain(&mut daemon_set, "daemon").await;
     Ok(())
+}
+
+fn build_runtime(config: ServerConfig) -> anyhow::Result<(Arc<ServerRuntime>, Tun)> {
+    let ledger = build_ledger(config.tun_subnet)?;
+    let auth = build_auth_store(&config)?;
+    let boot = build_boot_params(config);
+    let telemetry = build_telemetry_plane();
+    let runtime = Arc::new(ServerRuntime {
+        ledger,
+        auth,
+        boot,
+        telemetry,
+    });
+    let tun = Tun(Arc::new(crate::tun_setup::create_tun(
+        runtime.boot.config.tun_subnet,
+        runtime.boot.config.mtu,
+    )?));
+    Ok((runtime, tun))
 }
 
 fn build_server(config: &ServerConfig) -> anyhow::Result<Server> {
@@ -456,57 +617,66 @@ fn build_server(config: &ServerConfig) -> anyhow::Result<Server> {
     Ok(server)
 }
 
-fn build_server_state(
-    config: ServerConfig,
-    tun: Arc<tun_rs::AsyncDevice>,
-) -> anyhow::Result<SharedState> {
+fn build_boot_params(config: ServerConfig) -> Arc<BootParams> {
+    Arc::new(BootParams {
+        config: Arc::new(config),
+    })
+}
+
+fn build_auth_store(config: &ServerConfig) -> anyhow::Result<Arc<AuthStore>> {
     let user_pairs: Vec<(String, String)> = config
         .users
         .iter()
         .map(|u| (u.username.clone(), u.password_hash.clone()))
         .collect();
     let users = UserStore::from_users(user_pairs)?;
-    let pool = IpPool::new(config.tun_subnet)?;
-    let registry = SessionRegistry::new();
-    Ok(Arc::new(ServerState {
-        users,
-        pool: std::sync::Mutex::new(pool),
-        registry: std::sync::Mutex::new(registry),
-        tun: Some(tun),
-        config: Arc::new(config),
-        telemetry_sink: Arc::new(ConsoleSink),
-    }))
+    Ok(Arc::new(AuthStore { users }))
 }
 
-fn spawn_downlink(tun: Arc<tun_rs::AsyncDevice>, state: SharedState, shutdown: ShutdownHandle) {
-    let downlink_tun = Tun(tun);
-    let dispatcher = RegistryDispatcher { state };
-    tokio::spawn(async move {
-        let mut src = downlink_tun;
-        let _ = downlink_pump(&mut src, &dispatcher, &shutdown).await;
+fn build_ledger(subnet: ipnet::Ipv4Net) -> anyhow::Result<Arc<ConnectionLedger<ConnectionHandle>>> {
+    Ok(Arc::new(ConnectionLedger::new(subnet)?))
+}
+
+fn build_telemetry_plane() -> Arc<TelemetryPlane> {
+    Arc::new(TelemetryPlane::new(vec![
+        Arc::new(ConsoleSink) as Arc<dyn TelemetrySink>
+    ]))
+}
+
+fn spawn_downlink(
+    mut tun: Tun,
+    ledger: Arc<ConnectionLedger<ConnectionHandle>>,
+    shutdown: ShutdownHandle,
+    daemon_set: &mut tokio::task::JoinSet<()>,
+) {
+    let dispatcher = RegistryDispatcher { ledger };
+    daemon_set.spawn(async move {
+        let _ = downlink_pump(&mut tun, &dispatcher, &shutdown).await;
     });
 }
 
 async fn accept_connections(
     server: &Server,
-    state: SharedState,
+    runtime: Arc<ServerRuntime>,
+    tun: Tun,
     sd: &Shutdown,
-    conn_set: &mut tokio::task::JoinSet<()>,
+    conn_set: &mut tokio::task::JoinSet<ConnExitCause>,
 ) {
     let handle = sd.handle();
-    run_accept_loop(server, &state, &handle, conn_set).await;
+    run_accept_loop(server, runtime, tun, &handle, conn_set).await;
     tracing::info!("initiating graceful shutdown");
     sd.trigger();
 }
 
 async fn run_accept_loop(
     server: &Server,
-    state: &SharedState,
+    runtime: Arc<ServerRuntime>,
+    tun: Tun,
     shutdown: &ShutdownHandle,
-    conn_set: &mut tokio::task::JoinSet<()>,
+    conn_set: &mut tokio::task::JoinSet<ConnExitCause>,
 ) {
     loop {
-        if !accept_one(server, state, shutdown, conn_set).await {
+        if !accept_one(server, runtime.clone(), tun.clone(), shutdown, conn_set).await {
             break;
         }
     }
@@ -514,16 +684,17 @@ async fn run_accept_loop(
 
 async fn accept_one(
     server: &Server,
-    state: &SharedState,
+    runtime: Arc<ServerRuntime>,
+    tun: Tun,
     shutdown: &ShutdownHandle,
-    conn_set: &mut tokio::task::JoinSet<()>,
+    conn_set: &mut tokio::task::JoinSet<ConnExitCause>,
 ) -> bool {
     tokio::select! {
         biased;
         () = shutdown.cancelled() => false,
         accepted = server.accept() => {
             match accepted {
-                Some(Ok(session)) => spawn_handle_conn(session, state, shutdown, conn_set),
+                Some(Ok(session)) => spawn_handle_conn(session, runtime, tun, shutdown, conn_set),
                 Some(Err(e)) => tracing::warn!("connection accept error: {e}"),
                 None => return false,
             }
@@ -534,19 +705,30 @@ async fn accept_one(
 
 fn spawn_handle_conn(
     session: Session,
-    state: &SharedState,
+    runtime: Arc<ServerRuntime>,
+    tun: Tun,
     shutdown: &ShutdownHandle,
-    conn_set: &mut tokio::task::JoinSet<()>,
+    conn_set: &mut tokio::task::JoinSet<ConnExitCause>,
 ) {
-    let st = state.clone();
     let ct = shutdown.clone();
     conn_set.spawn(async move {
-        let _ = handle_conn(session, st, ct).await;
+        match handle_conn(session, runtime, tun, ct).await {
+            Ok(cause) => cause,
+            Err(e) => {
+                tracing::error!("connection error: {e}");
+                ConnExitCause::CtrlEnded
+            }
+        }
     });
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::mutable_key_type)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::mutable_key_type,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -697,5 +879,37 @@ mod tests {
         assert!(set.contains(&h2));
         set.insert(h2);
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_conn_exit_cause_code_reason_mapping() {
+        let cases = [
+            (ConnExitCause::ServerShutdown, 0, "server-shutdown"),
+            (ConnExitCause::CtrlEnded, 0x1, "ctrl-ended"),
+            (ConnExitCause::UplinkEnded, 0x1, "uplink-ended"),
+            (ConnExitCause::TelemetryEnded, 0, "telemetry-ended"),
+            (ConnExitCause::TaskPanicked, 0x2, "conn-panic"),
+        ];
+        for (cause, code, reason) in cases {
+            assert_eq!(cause.code(), code, "{cause:?}");
+            assert_eq!(cause.reason(), reason.as_bytes(), "{cause:?}");
+        }
+    }
+
+    #[test]
+    fn test_conn_exit_cause_displays_are_distinct() {
+        let all: Vec<String> = ConnExitCause::ALL.iter().map(ToString::to_string).collect();
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "duplicate at {i},{j}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_conn_exit_cause_is_copy_and_eq() {
+        let a = ConnExitCause::CtrlEnded;
+        let b = a;
+        assert_eq!(a, b);
     }
 }

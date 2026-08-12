@@ -85,6 +85,7 @@ echo "nat on en0 from 10.0.0.0/24 to any -> (en0)" | sudo pfctl -ef -
 - [ ] 同一 username 两次连接，旧连接被顶替，新连接拿到 IP
 - [ ] 被顶替的旧连接数据泵停止，无残留流量
 - [ ] 断线重连后分配到空闲 IP（不要求同 IP）
+- [ ] 真实重连场景下，旧 IP 在 drain 期间不被新客户端拿到：alice 用两个客户端交替重连（旧连接被顶替后仍处于 drain 窗口），此时 bob 连接，其分配到的 IP 不应等于 alice 的旧 IP；待旧 alice supervisor 退出（服务端日志出现 retire 记录）后，alice 旧 IP 才重新进入可用池（Q3：验证 reserved 中间态在真实并发下的行为）
 
 ## 数据面
 

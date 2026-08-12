@@ -51,14 +51,13 @@ async fn test_dispatcher_delivers_packet_to_registered_conn() {
         Ipv4Addr::new(10, 0, 0, 2),
     );
 
-    {
-        let mut reg = state.registry.lock().unwrap();
-        reg.insert("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
-            .unwrap();
-    }
+    state
+        .ledger
+        .register("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
+        .unwrap();
 
     let dispatcher = RegistryDispatcher {
-        state: state.clone(),
+        ledger: state.ledger.clone(),
     };
     let pkt = ipv4_packet([10, 0, 0, 2]);
     dispatcher.dispatch(pkt.clone()).await;
@@ -76,14 +75,13 @@ async fn test_dispatcher_miss_silently_drops_no_datagram() {
         Ipv4Addr::new(10, 0, 0, 2),
     );
 
-    {
-        let mut reg = state.registry.lock().unwrap();
-        reg.insert("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
-            .unwrap();
-    }
+    state
+        .ledger
+        .register("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
+        .unwrap();
 
     let dispatcher = RegistryDispatcher {
-        state: state.clone(),
+        ledger: state.ledger.clone(),
     };
     dispatcher.dispatch(ipv4_packet([10, 0, 0, 9])).await;
 
@@ -99,14 +97,13 @@ async fn test_dispatcher_malformed_short_packet_silently_dropped() {
         Ipv4Addr::new(10, 0, 0, 2),
     );
 
-    {
-        let mut reg = state.registry.lock().unwrap();
-        reg.insert("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
-            .unwrap();
-    }
+    state
+        .ledger
+        .register("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
+        .unwrap();
 
     let dispatcher = RegistryDispatcher {
-        state: state.clone(),
+        ledger: state.ledger.clone(),
     };
     dispatcher.dispatch(Bytes::from_static(b"abc")).await;
 
@@ -122,14 +119,13 @@ async fn test_dispatcher_non_ipv4_packet_silently_dropped() {
         Ipv4Addr::new(10, 0, 0, 2),
     );
 
-    {
-        let mut reg = state.registry.lock().unwrap();
-        reg.insert("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
-            .unwrap();
-    }
+    state
+        .ledger
+        .register("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
+        .unwrap();
 
     let dispatcher = RegistryDispatcher {
-        state: state.clone(),
+        ledger: state.ledger.clone(),
     };
     let mut pkt = vec![0u8; 40];
     pkt[0] = 0x60;
@@ -147,11 +143,10 @@ async fn test_downlink_pump_relays_multiple_packets_in_order_and_exits_on_tun_cl
         Ipv4Addr::new(10, 0, 0, 2),
     );
 
-    {
-        let mut reg = state.registry.lock().unwrap();
-        reg.insert("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
-            .unwrap();
-    }
+    state
+        .ledger
+        .register("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
+        .unwrap();
 
     let p1 = ipv4_packet([10, 0, 0, 2]);
     let p2 = ipv4_packet([10, 0, 0, 2]);
@@ -164,7 +159,7 @@ async fn test_downlink_pump_relays_multiple_packets_in_order_and_exits_on_tun_cl
     drop(src_tx);
 
     let dispatcher = RegistryDispatcher {
-        state: state.clone(),
+        ledger: state.ledger.clone(),
     };
     let pump_result = {
         let mut tun = ChannelSource { rx: src_rx };
@@ -187,11 +182,10 @@ async fn test_downlink_pump_continues_after_miss() {
         Ipv4Addr::new(10, 0, 0, 2),
     );
 
-    {
-        let mut reg = state.registry.lock().unwrap();
-        reg.insert("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
-            .unwrap();
-    }
+    state
+        .ledger
+        .register("alice", Ipv4Addr::new(10, 0, 0, 2), handle)
+        .unwrap();
 
     let miss_pkt = ipv4_packet([10, 0, 0, 9]);
     let hit_pkt = ipv4_packet([10, 0, 0, 2]);
@@ -203,7 +197,7 @@ async fn test_downlink_pump_continues_after_miss() {
     drop(src_tx);
 
     let dispatcher = RegistryDispatcher {
-        state: state.clone(),
+        ledger: state.ledger.clone(),
     };
     let _ = {
         let mut tun = ChannelSource { rx: src_rx };

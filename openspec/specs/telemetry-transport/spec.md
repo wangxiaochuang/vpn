@@ -105,19 +105,21 @@
 - **WHEN** 已认证客户端未开启遥测 stream（如旧版本客户端），服务端 `accept_stream` 等待 5 秒
 - **THEN** 服务端按超时处理，不报错，继续心跳与数据面 task（不 spawn 遥测处理 task）
 
-### Requirement: 服务端遥测处理 task 解码并投递到 TelemetrySink
+### Requirement: 服务端遥测处理 task 解码并投递到 TelemetryPlane
 
-系统 SHALL 在遥测处理 task 内循环读取遥测 stream：收到 `TelemetryMessage{ msg: report(report) }` 时，调用 `TelemetrySink::store(&source, &report)`；`store` 返回 `Err` SHALL 记录日志并继续 loop（不退出 task）。收到 `TelemetryMessage{ msg: collect_req(_) }` 时 SHALL 记录警告并忽略（服务端不应从客户端收到 pull 请求）。stream 读返回 EOF / 错误 SHALL 退出 task。task 退出 SHALL NOT 触发连接 cleanup（与上行 task 不同，遥测 task 不被纳入"全部 task 退出才 cleanup"判定；或若纳入， SHALL 与上行 task 解耦）。
+系统 SHALL 在遥测处理 task 内循环读取遥测 stream：收到 `TelemetryMessage{ msg: report(report) }` 时，调用 `TelemetryPlane::store(&source, &report)`（`TelemetryPlane` 自身实现 `TelemetrySink`，内部 fan-out 到所有装配的 sink）；`store` 返回 `Err` SHALL 记录日志并继续 loop（不退出 task）。收到 `TelemetryMessage{ msg: collect_req(_) }` 时 SHALL 记录警告并忽略（服务端不应从客户端收到 pull 请求）。stream 读返回 EOF / 错误 SHALL 退出 task。task 退出 SHALL NOT 触发连接 cleanup（与上行 task 不同，遥测 task 不被纳入"全部 task 退出才 cleanup"判定；或若纳入， SHALL 与上行 task 解耦）。
 
-#### Scenario: 收到 report 投递到 sink
+`handle_conn` 在 spawn 遥测处理 task 时 SHALL 注入 `Arc<TelemetryPlane>`（替代原 `state.telemetry_sink.clone()`），与原 `Arc<dyn TelemetrySink>` 在调用接口上等价（`TelemetryPlane` impl `TelemetrySink`）。
 
-- **WHEN** 服务端遥测处理 task 收到一条含 `PROCESS_SUMMARY` 快照的 `TelemetryReport`
-- **THEN** `TelemetrySink::store` 被调用，参数 `source` 含正确的 `session_id` 与 `username`，`report` 为收到的内容
+#### Scenario: 收到 report 投递到 plane 并 fan-out 到所有 sink
+
+- **WHEN** 服务端遥测处理 task 收到一条含 `PROCESS_SUMMARY` 快照的 `TelemetryReport`，`TelemetryPlane` 含 `[ConsoleSink, AnotherSink]` 两个 sink
+- **THEN** 两个 sink 的 `store` 均被调用，参数 `source` 含正确的 `session_id` 与 `username`，`report` 为收到的内容
 
 #### Scenario: sink 失败不退出处理 task
 
-- **WHEN** `TelemetrySink::store` 返回 `Err`，遥测处理 task 继续运行
-- **THEN** task 记录日志后继续读下一条消息，不退出
+- **WHEN** `TelemetryPlane::store` 内某 sink 返回 `Err`，遥测处理 task 继续运行
+- **THEN** task 记录日志后继续读下一条消息，不退出；plane 内其它 sink 仍被调用
 
 #### Scenario: 遥测 stream EOF 后 task 退出
 
@@ -156,3 +158,27 @@
 
 - **WHEN** 遥测 stream 因大 payload 或对端不读而写阻塞（QUIC 流控）
 - **THEN** 数据面 datagram 的上下行转发不受影响（QUIC stream 与 datagram 是独立资源）
+
+### Requirement: TelemetryPlane fan-out 多 sink
+
+系统 SHALL 提供 `TelemetryPlane { sinks: Vec<Arc<dyn TelemetrySink>> }`（位于 `vpn/src/telemetry.rs`）作为遥测 sink 的统一聚合，自身实现 `TelemetrySink` trait。`server::run` 在启动时 SHALL 装配 `TelemetryPlane { sinks: vec![Arc::new(ConsoleSink)] }`（V1 默认单 sink，向后兼容）。`TelemetryPlane::store(source, report)` SHALL 遍历 `sinks` 依次调用每个 sink 的 `store`，单个 sink 失败（返回 `Err`）SHALL NOT 阻断其它 sink，SHALL 记录 warn 日志后继续；单个 sink 的 store 调用 SHALL 设有 per-sink 超时（默认 1 秒），超时 SHALL 跳过该 sink 这一帧并记录 warn。`TelemetryPlane` SHALL 通过 `Arc<TelemetryPlane>` 共享给每个 `ConnectionSupervisor`。原 `ServerState.telemetry_sink: Arc<dyn TelemetrySink>` 字段 SHALL 被删除。
+
+#### Scenario: server::run 装配默认 ConsoleSink 单元素 TelemetryPlane
+
+- **WHEN** `server::run` 用合法 `ServerConfig` 启动
+- **THEN** 运行时持有 `Arc<TelemetryPlane>`，其 `sinks` 长度为 1，唯一元素是 `Arc<ConsoleSink>` 指向的实例
+
+#### Scenario: 多个连接共享同一 TelemetryPlane 实例
+
+- **WHEN** 两个客户端并发认证成功，各自的遥测处理 task 调用 `telemetry_plane.store(...)`
+- **THEN** 两次调用命中同一 `Arc` 指向的 `TelemetryPlane` 实例（`Arc::ptr_eq` 为真）
+
+#### Scenario: 单 sink 失败不阻断其它 sink
+
+- **WHEN** `TelemetryPlane` 含两个 sink `[A, B]`，A 的 `store` 返回 `Err`，B 正常
+- **THEN** B 的 `store` 仍被调用并收到与原 report 一致的参数；A 失败被记录 warn 日志；`TelemetryPlane::store` 自身返回 `Ok(())`（fan-out 不向上传递单 sink 错误）
+
+#### Scenario: 单 sink 超时不阻塞其它 sink
+
+- **WHEN** `TelemetryPlane` 含两个 sink `[A, B]`，A 的 `store` 阻塞超过 1 秒（per-sink 超时阈值）
+- **THEN** 超时触发后跳过 A 这一帧（记录 warn），B 的 `store` 正常调用且总耗时不超过 ~1 秒 + B 自身耗时

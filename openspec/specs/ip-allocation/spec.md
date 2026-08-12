@@ -84,3 +84,37 @@
 
 - **WHEN** 新 /24 池 `alloc` 一次后查询 `available_count`
 - **THEN** 返回 `252`；随后 `free` 该地址后查询恢复为 `253`
+
+### Requirement: 地址池支持 reserved 中间态隔离 evict 与释放
+
+系统 SHALL 在 `IpPool` 中为每个地址维护三态：`Free`（可分配）/ `Allocated`（已分配且活跃）/ `Reserved`（已 evict 但老 session 尚未 retire）。`alloc` SHALL 仅返回 `Free` 地址；`available_count` SHALL 仅返回 `Free` 计数（不含 `Allocated` 与 `Reserved`）。系统 SHALL 提供 `reserve(addr)` 将 `Allocated` 转为 `Reserved`（若非 `Allocated` 返回错误）；SHALL 提供 `release(addr)` 将 `Reserved` 转为 `Free`（若非 `Reserved` 返回错误）。reserved 地址 SHALL NOT 被 `alloc` 返回，SHALL NOT 被 `free` 接受（`free` 仅作用于 `Allocated`）。
+
+#### Scenario: reserve 后地址不被 alloc 返回
+
+- **WHEN** 池为 `10.0.0.0/29`，`alloc` 得 `10.0.0.2`，调用 `reserve(10.0.0.2)`，随后连续 `alloc` 至池耗尽
+- **THEN** `10.0.0.2` 永不出现于 alloc 返回值；其它 `Free` 地址（如 `10.0.0.3`..`10.0.0.6`）按升序返回
+
+#### Scenario: release 后地址重新可被 alloc
+
+- **WHEN** 池中 `10.0.0.2` 处于 `Reserved`，调用 `release(10.0.0.2)` 后 `alloc`
+- **THEN** `alloc` 返回 `10.0.0.2`（重新成为最小 Free 地址）
+
+#### Scenario: available_count 不含 reserved
+
+- **WHEN** 池为 `10.0.0.0/29`（Free 共 5 个：`.2`..`.6`），`alloc` 得 `.2`，`alloc` 得 `.3`，对 `.2` 调用 `reserve`
+- **THEN** `available_count` 返回 `3`（即 `.4`、`.5`、`.6`），`.2`（Reserved）与 `.3`（Allocated）均不计入
+
+#### Scenario: reserve 非 Allocated 地址返回错误
+
+- **WHEN** 池为 `10.0.0.0/29`，调用 `reserve(10.0.0.5)`（该地址处于 `Free`）
+- **THEN** 返回错误（如 `NotAllocated(10.0.0.5)`），池状态不变
+
+#### Scenario: release 非 Reserved 地址返回错误
+
+- **WHEN** 池为 `10.0.0.0/29`，`alloc` 得 `.2`（`Allocated`），调用 `release(10.0.0.2)`
+- **THEN** 返回错误（如 `NotReserved(10.0.0.2)`），池状态仍为 `Allocated`
+
+#### Scenario: free 对 Reserved 地址返回错误
+
+- **WHEN** 池为 `10.0.0.0/29`，`alloc` 得 `.2`，`reserve(.2)` 后调用 `free(10.0.0.2)`
+- **THEN** 返回错误（如 `NotAllocated(10.0.0.2)`），池状态不变（仍为 Reserved）

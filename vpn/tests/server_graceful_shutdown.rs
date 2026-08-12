@@ -34,14 +34,9 @@ async fn test_shutdown_cancel_frees_ip_and_clears_registry() {
 
     let (_conn, _framed, _ip) = auth_alice(addr).await;
 
-    let available_before = state.pool.lock().unwrap().available_count();
+    let available_before = state.ledger.available_count();
     assert!(
-        state
-            .registry
-            .lock()
-            .unwrap()
-            .lookup_by_username("alice")
-            .is_some(),
+        state.ledger.lookup_by_username("alice").is_some(),
         "alice should be in registry while connected"
     );
 
@@ -49,13 +44,8 @@ async fn test_shutdown_cancel_frees_ip_and_clears_registry() {
 
     let cleaned = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let in_registry = state
-                .registry
-                .lock()
-                .unwrap()
-                .lookup_by_username("alice")
-                .is_some();
-            let available = state.pool.lock().unwrap().available_count();
+            let in_registry = state.ledger.lookup_by_username("alice").is_some();
+            let available = state.ledger.available_count();
             if !in_registry && available > available_before {
                 return;
             }

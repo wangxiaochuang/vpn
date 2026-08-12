@@ -108,3 +108,30 @@ async fn test_first_message_not_auth_request_closes_connection() {
         "stream should be closed without AuthOk/AuthDenied"
     );
 }
+
+#[tokio::test]
+async fn test_auth_denied_connection_closes_within_bounded_time_without_sleep() {
+    let (endpoint, _state) = common::start_test_server(
+        common::alice_users(),
+        Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap(),
+    )
+    .await;
+    let addr = endpoint.local_addr().unwrap();
+
+    let client_conn = common::test_client_connect(addr).await;
+    let mut framed = common::open_control(&client_conn).await;
+    common::send_auth_request(&mut framed, "alice", "wrong").await;
+
+    let msg = common::recv_control(&mut framed).await.expect("response");
+    assert!(matches!(msg.msg, Some(Msg::AuthDenied(_))));
+
+    let close_result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        futures::StreamExt::next(&mut framed),
+    )
+    .await;
+    assert!(
+        close_result.is_ok(),
+        "connection must close within bounded time after AuthDenied (FIN handshake, no sleep)"
+    );
+}

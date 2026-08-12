@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::config::ClientConfig;
 use crate::config::MIN_MTU;
-use crate::data::{Tun, forward};
+use crate::data::{PacketSink, PacketSource, Tun, forward};
 use crate::vpn::AuthOk;
 use crate::vpn::ControlMessage;
 use crate::vpn::control_message::Msg;
@@ -24,6 +24,79 @@ pub struct ClientTunParams {
     pub gateway: Ipv4Addr,
     pub mtu: u16,
     pub routes: Vec<Ipv4Net>,
+}
+
+/// 数据面 task 的结束原因（"遗言"契约）。纯枚举，不携带错误信息。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitCause {
+    Interrupted,
+    ServerDisconnect,
+    HeartbeatEnded,
+    UplinkEnded,
+    DownlinkEnded,
+    TelemetryEnded,
+    TaskPanicked,
+}
+
+impl ExitCause {
+    pub const ALL: [Self; 7] = [
+        Self::Interrupted,
+        Self::ServerDisconnect,
+        Self::HeartbeatEnded,
+        Self::UplinkEnded,
+        Self::DownlinkEnded,
+        Self::TelemetryEnded,
+        Self::TaskPanicked,
+    ];
+
+    pub fn code(self) -> u64 {
+        match self {
+            Self::UplinkEnded | Self::DownlinkEnded => 0x1,
+            Self::TaskPanicked => 0x2,
+            Self::Interrupted
+            | Self::ServerDisconnect
+            | Self::HeartbeatEnded
+            | Self::TelemetryEnded => 0,
+        }
+    }
+
+    pub fn reason(self) -> &'static [u8] {
+        match self {
+            Self::Interrupted => b"client-shutdown",
+            Self::ServerDisconnect => b"server-disconnect",
+            Self::HeartbeatEnded => b"heartbeat-timeout",
+            Self::UplinkEnded => b"uplink-ended",
+            Self::DownlinkEnded => b"downlink-ended",
+            Self::TelemetryEnded => b"telemetry-ended",
+            Self::TaskPanicked => b"data-plane-panic",
+        }
+    }
+}
+
+impl std::fmt::Display for ExitCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interrupted => write!(f, "interrupted"),
+            Self::ServerDisconnect => write!(f, "server-disconnect"),
+            Self::HeartbeatEnded => write!(f, "heartbeat-ended"),
+            Self::UplinkEnded => write!(f, "uplink-ended"),
+            Self::DownlinkEnded => write!(f, "downlink-ended"),
+            Self::TelemetryEnded => write!(f, "telemetry-ended"),
+            Self::TaskPanicked => write!(f, "task-panicked"),
+        }
+    }
+}
+
+/// 已认证客户端，持有连接生命周期。
+///
+/// 字段按声明顺序析构：`session` 先、`endpoint` 最后，保证 Endpoint 活得比
+/// 所有使用 Session 的 task 更久。
+pub struct EstablishedClient {
+    session: Session,
+    channel: Channel<ControlMessage>,
+    params: ClientTunParams,
+    #[allow(dead_code)]
+    endpoint: quic_link::Client,
 }
 
 #[derive(Debug, Error)]
@@ -156,29 +229,26 @@ pub async fn run_with_credentials(
     password: String,
     sd: Shutdown,
 ) -> anyhow::Result<()> {
-    let (client, session, channel, params) =
-        establish_connection(&config, &username, password).await?;
-    let tun = setup_tun(&params)?;
+    let est = connect_and_auth(&config, &username, password).await?;
+    let tun = setup_tun(&est.params)?;
     tracing::info!(
         "authenticated as {}, assigned_ip={}, subnet={}, mtu={}",
         username,
-        params.assigned_ip,
-        params.subnet,
-        params.mtu
+        est.params.assigned_ip,
+        est.params.subnet,
+        est.params.mtu
     );
-    run_data_plane(&session, tun, channel, client, sd).await
+    let plane = DataPlane::spawn(est.session.clone(), Tun(tun), est.channel, &sd);
+    let cause = plane.run(sd).await;
+    tracing::info!("client exited: {cause}");
+    Ok(())
 }
 
-async fn establish_connection(
+async fn connect_and_auth(
     config: &ClientConfig,
     username: &str,
     password: String,
-) -> anyhow::Result<(
-    quic_link::Client,
-    Session,
-    Channel<ControlMessage>,
-    ClientTunParams,
-)> {
+) -> anyhow::Result<EstablishedClient> {
     let client = quic_link::Client::builder()
         .trust_ca(config.ca_cert.clone())
         .server_name(config.server_name.clone())
@@ -188,7 +258,12 @@ async fn establish_connection(
     tracing::info!("connected to {}", config.server);
     let mut channel = open_control_stream(&session).await?;
     let params = authenticate(&mut channel, username, password).await?;
-    Ok((client, session, channel, params))
+    Ok(EstablishedClient {
+        session,
+        channel,
+        params,
+        endpoint: client,
+    })
 }
 
 async fn open_control_stream(session: &Session) -> anyhow::Result<Channel<ControlMessage>> {
@@ -257,108 +332,195 @@ pub async fn heartbeat_loop(
     mut reader: Receiver<ControlMessage>,
     mut writer: Sender<ControlMessage>,
     shutdown: ShutdownHandle,
+) -> ExitCause {
+    let mut saw_disconnect = false;
+    run_keepalive(
+        &session,
+        &mut reader,
+        &mut writer,
+        &shutdown,
+        &mut saw_disconnect,
+    )
+    .await;
+    resolve_cause(saw_disconnect, &shutdown)
+}
+
+async fn run_keepalive(
+    session: &Session,
+    reader: &mut Receiver<ControlMessage>,
+    writer: &mut Sender<ControlMessage>,
+    shutdown: &ShutdownHandle,
+    saw_disconnect: &mut bool,
 ) {
     let hb = || ControlMessage {
         msg: Some(Msg::Heartbeat(crate::vpn::Heartbeat {})),
     };
     keepalive_loop(
-        &session,
-        &mut writer,
-        &mut reader,
-        &shutdown,
+        session,
+        writer,
+        reader,
+        shutdown,
         KeepaliveConfig::default(),
         hb,
-        handle_ctrl_msg,
+        disconnect_handler(saw_disconnect),
     )
     .await;
 }
 
-fn handle_ctrl_msg(m: &ControlMessage) -> LoopControl {
-    if matches!(m.msg, Some(Msg::Disconnect(_))) {
-        tracing::info!("server disconnected");
-        LoopControl::Break
-    } else {
-        LoopControl::Continue
+fn disconnect_handler(
+    saw_disconnect: &mut bool,
+) -> impl FnMut(&ControlMessage) -> LoopControl + '_ {
+    move |m| {
+        if matches!(m.msg, Some(Msg::Disconnect(_))) {
+            tracing::info!("server disconnected");
+            *saw_disconnect = true;
+            LoopControl::Break
+        } else {
+            LoopControl::Continue
+        }
     }
 }
 
-async fn run_data_plane(
-    session: &Session,
-    tun: std::sync::Arc<tun_rs::AsyncDevice>,
-    channel: Channel<ControlMessage>,
-    client: quic_link::Client,
-    sd: Shutdown,
-) -> anyhow::Result<()> {
-    let (writer, reader) = channel.split();
-    let mut tasks = spawn_data_tasks(session, tun, reader, writer, &sd);
-    shutdown::wait_for_interrupt(&sd).await;
-    session.close(0, b"client-shutdown");
-    sd.drain(&mut tasks, "client").await;
-    std::mem::forget(client);
-    Ok(())
+fn resolve_cause(saw_disconnect: bool, shutdown: &ShutdownHandle) -> ExitCause {
+    if saw_disconnect {
+        ExitCause::ServerDisconnect
+    } else if shutdown.is_cancelled() {
+        ExitCause::Interrupted
+    } else {
+        ExitCause::HeartbeatEnded
+    }
 }
 
-fn spawn_data_tasks(
-    session: &Session,
-    tun: std::sync::Arc<tun_rs::AsyncDevice>,
+/// 数据面 supervisor：集中 spawn 心跳/上行/下行/遥测 task，并统一关闭协调。
+pub struct DataPlane<S> {
+    session: Session,
+    tasks: tokio::task::JoinSet<ExitCause>,
+    _tun: std::marker::PhantomData<S>,
+}
+
+impl<S> DataPlane<S>
+where
+    S: PacketSource + PacketSink + Clone + Unpin + Send + Sync + 'static,
+{
+    pub fn spawn(
+        session: Session,
+        tun: S,
+        channel: Channel<ControlMessage>,
+        sd: &Shutdown,
+    ) -> Self {
+        let (writer, reader) = channel.split();
+        let mut tasks: tokio::task::JoinSet<ExitCause> = tokio::task::JoinSet::new();
+        spawn_heartbeat(&mut tasks, session.clone(), reader, writer, sd);
+        spawn_uplink_task(&mut tasks, session.clone(), tun.clone(), sd);
+        spawn_downlink_task(&mut tasks, session.clone(), tun, sd);
+        spawn_telemetry_task(&mut tasks, session.clone(), sd);
+        Self {
+            session,
+            tasks,
+            _tun: std::marker::PhantomData,
+        }
+    }
+
+    pub async fn run(mut self, sd: Shutdown) -> ExitCause {
+        let cause = self.await_cause(&sd).await;
+        self.session.close(cause.code(), cause.reason());
+        sd.trigger();
+        sd.drain(&mut self.tasks, "client").await;
+        cause
+    }
+
+    async fn await_cause(&mut self, sd: &Shutdown) -> ExitCause {
+        loop {
+            let cause = tokio::select! {
+                biased;
+                () = sd.triggered() => ExitCause::Interrupted,
+                Some(r) = self.tasks.join_next() => match r {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("data plane task panicked: {e}");
+                        ExitCause::TaskPanicked
+                    }
+                },
+            };
+            if cause != ExitCause::TelemetryEnded {
+                return cause;
+            }
+        }
+    }
+}
+
+async fn uplink<S>(session: Session, tun: S, cancel: ShutdownHandle) -> ExitCause
+where
+    S: PacketSource + Unpin,
+{
+    let mut source = tun;
+    let mut sink = session.datagram_tx();
+    match forward(&mut source, &mut sink, &cancel).await {
+        Ok(()) => ExitCause::UplinkEnded,
+        Err(e) => {
+            tracing::warn!("uplink ended with error: {e}");
+            ExitCause::UplinkEnded
+        }
+    }
+}
+
+fn spawn_heartbeat(
+    tasks: &mut tokio::task::JoinSet<ExitCause>,
+    session: Session,
     reader: Receiver<ControlMessage>,
     writer: Sender<ControlMessage>,
     sd: &Shutdown,
-) -> tokio::task::JoinSet<()> {
-    let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    let session_for_hb = session.clone();
-    let hb_handle = sd.handle();
-    tasks.spawn(async move {
-        heartbeat_loop(session_for_hb, reader, writer, hb_handle.clone()).await;
-        hb_handle.cancel();
-    });
-    spawn_uplink(session, tun.clone(), sd.handle(), &mut tasks);
-    spawn_downlink(session, tun, sd.handle(), &mut tasks);
-    spawn_telemetry(session, sd.handle(), &mut tasks);
-    tasks
+) {
+    let handle = sd.handle();
+    tasks.spawn(async move { heartbeat_loop(session, reader, writer, handle).await });
 }
 
-fn spawn_telemetry(
-    session: &Session,
-    shutdown: ShutdownHandle,
-    tasks: &mut tokio::task::JoinSet<()>,
-) {
-    let session_for_telemetry = session.clone();
-    tasks.spawn(async move {
-        crate::telemetry::run_client_telemetry(session_for_telemetry, shutdown).await;
-    });
+fn spawn_uplink_task<S>(
+    tasks: &mut tokio::task::JoinSet<ExitCause>,
+    session: Session,
+    tun: S,
+    sd: &Shutdown,
+) where
+    S: PacketSource + PacketSink + Clone + Unpin + Send + Sync + 'static,
+{
+    let handle = sd.handle();
+    tasks.spawn(async move { uplink(session, tun, handle).await });
 }
 
-fn spawn_uplink(
-    session: &Session,
-    tun: std::sync::Arc<tun_rs::AsyncDevice>,
-    shutdown: ShutdownHandle,
-    tasks: &mut tokio::task::JoinSet<()>,
-) {
-    let session_for_uplink = session.clone();
-    tasks.spawn(async move {
-        let mut source = Tun(tun);
-        let mut sink = session_for_uplink.datagram_tx();
-        let _ = forward(&mut source, &mut sink, &shutdown).await;
-        session_for_uplink.close(0x101, b"uplink-ended");
-        shutdown.cancel();
-    });
+fn spawn_downlink_task<S>(
+    tasks: &mut tokio::task::JoinSet<ExitCause>,
+    session: Session,
+    tun: S,
+    sd: &Shutdown,
+) where
+    S: PacketSource + PacketSink + Clone + Unpin + Send + Sync + 'static,
+{
+    let handle = sd.handle();
+    tasks.spawn(async move { downlink(session, tun, handle).await });
 }
 
-fn spawn_downlink(
-    session: &Session,
-    tun: std::sync::Arc<tun_rs::AsyncDevice>,
-    shutdown: ShutdownHandle,
-    tasks: &mut tokio::task::JoinSet<()>,
+fn spawn_telemetry_task(
+    tasks: &mut tokio::task::JoinSet<ExitCause>,
+    session: Session,
+    sd: &Shutdown,
 ) {
-    let session_for_downlink = session.clone();
-    tasks.spawn(async move {
-        let mut source = session_for_downlink.datagram_rx();
-        let mut sink = Tun(tun);
-        let _ = forward(&mut source, &mut sink, &shutdown).await;
-        session_for_downlink.close(0x102, b"downlink-ended");
-        shutdown.cancel();
-    });
+    let handle = sd.handle();
+    tasks.spawn(async move { crate::telemetry::run_client_telemetry(session, handle).await });
+}
+
+async fn downlink<S>(session: Session, tun: S, cancel: ShutdownHandle) -> ExitCause
+where
+    S: PacketSink + Unpin,
+{
+    let mut source = session.datagram_rx();
+    let mut sink = tun;
+    match forward(&mut source, &mut sink, &cancel).await {
+        Ok(()) => ExitCause::DownlinkEnded,
+        Err(e) => {
+            tracing::warn!("downlink ended with error: {e}");
+            ExitCause::DownlinkEnded
+        }
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +540,13 @@ mod tests {
             mtu: 1280,
             routes: vec![],
         }
+    }
+
+    fn repo(p: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("vpn crate nested under repo root")
+            .join(p)
     }
 
     #[tokio::test]
@@ -573,5 +742,84 @@ mod tests {
     fn test_validate_username_when_non_empty_returns_trimmed() {
         let got = validate_username("  alice  ").expect("non-empty must succeed");
         assert_eq!(got, "alice");
+    }
+
+    #[test]
+    fn test_exit_cause_code_reason_mapping() {
+        let cases = [
+            (ExitCause::Interrupted, 0, "client-shutdown"),
+            (ExitCause::ServerDisconnect, 0, "server-disconnect"),
+            (ExitCause::HeartbeatEnded, 0, "heartbeat-timeout"),
+            (ExitCause::UplinkEnded, 0x1, "uplink-ended"),
+            (ExitCause::DownlinkEnded, 0x1, "downlink-ended"),
+            (ExitCause::TelemetryEnded, 0, "telemetry-ended"),
+            (ExitCause::TaskPanicked, 0x2, "data-plane-panic"),
+        ];
+        for (cause, code, reason) in cases {
+            assert_eq!(cause.code(), code, "{cause:?}");
+            assert_eq!(cause.reason(), reason.as_bytes(), "{cause:?}");
+        }
+    }
+
+    #[test]
+    fn test_exit_cause_displays_are_distinct() {
+        let all: Vec<String> = ExitCause::ALL.iter().map(ToString::to_string).collect();
+        assert_displays_unique(&all);
+    }
+
+    #[test]
+    fn test_exit_cause_is_copy_and_eq() {
+        let a = ExitCause::HeartbeatEnded;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn test_established_client_field_order_construct_and_access() {
+        let client = quic_link::Client::builder()
+            .trust_ca(repo("cert.pem"))
+            .server_name("localhost")
+            .build()
+            .expect("build client");
+        let (session, channel) = connect_for_test(&client).await;
+        let est = EstablishedClient {
+            session,
+            channel,
+            params: test_params(),
+            endpoint: client,
+        };
+        assert_est_access(&est);
+    }
+
+    fn test_params() -> ClientTunParams {
+        ClientTunParams {
+            assigned_ip: Ipv4Addr::new(10, 0, 0, 2),
+            subnet: "10.0.0.0/24".parse().unwrap(),
+            gateway: Ipv4Addr::new(10, 0, 0, 1),
+            mtu: 1280,
+            routes: vec![],
+        }
+    }
+
+    fn assert_est_access(est: &EstablishedClient) {
+        assert_eq!(est.params.assigned_ip, Ipv4Addr::new(10, 0, 0, 2));
+        let _ = est.session.id();
+        let _ = est.params.subnet;
+    }
+
+    async fn connect_for_test(client: &quic_link::Client) -> (Session, Channel<ControlMessage>) {
+        let server = quic_link::Server::builder()
+            .tls_from_files(repo("cert.pem"), repo("key.pem"))
+            .build("127.0.0.1:0".parse().unwrap())
+            .expect("build server");
+        let addr = server.local_addr().unwrap();
+        let (server_result, session) = tokio::join!(server.accept(), client.connect(addr));
+        let _server_session = server_result.expect("server accept").expect("accept conn");
+        let session = session.expect("connect to server");
+        let channel = session
+            .open_stream::<ControlMessage>()
+            .await
+            .expect("open control stream");
+        (session, channel)
     }
 }

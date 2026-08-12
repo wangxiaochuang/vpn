@@ -6,7 +6,7 @@
 ## Requirements
 ### Requirement: 服务端从 ServerConfig 启动运行时
 
-系统 SHALL 提供 `server::run(config: ServerConfig) -> anyhow::Result<()>` 作为服务端运行入口（async）。`run` SHALL 完成：(1) 加载 cert/key PEM 构造 `rustls::ServerConfig`（无客户端认证，单证书）；(2) 包装为 `quinn::ServerConfig` 与 `quinn::Endpoint::server(...)` 监听 `config.listen`；(3) 创建 TUN 设备，IP 为 `config.tun_subnet` 的网关地址（池首地址，即 `.network()` 的下一跳 `.1`），MTU 为 `config.mtu`；(4) 构造共享状态 `Arc<ServerState>`，含 `UserStore`（从 `config.users` 构造）、`Mutex<IpPool>`（从 `config.tun_subnet` 构造）、`Mutex<SessionRegistry<ConnectionHandle>>`、`Arc<AsyncDevice>`、`Arc<ServerConfig>`；(5) spawn 全局下行泵 task；(6) 进入 accept loop。`run` SHALL 在 endpoint 绑定失败或 TUN 创建失败时立即返回 `Err`。
+系统 SHALL 提供 `server::run(config: ServerConfig) -> anyhow::Result<()>` 作为服务端运行入口（async）。`run` SHALL 完成：(1) 加载 cert/key PEM 构造 `rustls::ServerConfig`（无客户端认证，单证书）；(2) 包装为 `quinn::ServerConfig` 与 `quinn::Endpoint::server(...)` 监听 `config.listen`；(3) 创建 TUN 设备，IP 为 `config.tun_subnet` 的网关地址（池首地址，即 `.network()` 的下一跳 `.1`），MTU 为 `config.mtu`；(4) **构造五个独立 `Arc<T>`：`BootParams { config }`、`AuthStore { users }`、`ConnectionLedger { pool, registry }`、`TelemetryPlane { sinks }`、以及局部持有的 `Tun(Arc<AsyncDevice>)` 数据面资源**；`ServerState` 这个聚合 struct SHALL 被删除，SHALL NOT 再出现于 `vpn/src/server.rs` 或测试代码；(5) spawn 全局下行泵 task（持有 `Tun` clone 与 `Arc<ConnectionLedger>`）；(6) 进入 accept loop，每个接受的连接 spawn `ConnectionSupervisor`，按需持有 `Arc<ConnectionLedger>` + `Arc<TelemetryPlane>` + `Arc<AuthStore>` + 必要的 `BootParams` 字段。`run` SHALL 在 endpoint 绑定失败或 TUN 创建失败时立即返回 `Err`。
 
 #### Scenario: 合法配置启动后 accept loop 接受连接
 
@@ -18,9 +18,14 @@
 - **WHEN** `config.listen` 指向已被另一个 socket 占用的端口
 - **THEN** `server::run` 返回 `Err`，错误来源为 `quinn::Endpoint::server` 的 IO 错误
 
+#### Scenario: ServerState 聚合 struct 已被删除
+
+- **WHEN** 在 `vpn/src/server.rs` 与 `vpn/tests/` 中搜索 `struct ServerState`
+- **THEN** 无匹配项（聚合 struct 已拆分为五个独立 `Arc<T>`，不再以单 struct 形式存在）
+
 ### Requirement: 共享状态以 std::sync::Mutex 细粒度锁保护
 
-系统 SHALL 用 `std::sync::Mutex`（非 `tokio::sync::Mutex`）保护 `IpPool` 与 `SessionRegistry`，且任何 `Mutex` 临界区 SHALL NOT 包含 `.await` 点（cancel-safety 要求）。`UserStore` SHALL 不加锁（只读共享）。任一连接的认证、分配、注册操作 SHALL 持锁总时长不超过微秒级（HashMap 查 / 增删或位图翻转），且 SHALL NOT 与 argon2 校验（在锁外完成）嵌套。
+系统 SHALL 用 `std::sync::Mutex`（非 `tokio::sync::Mutex`）保护 `ConnectionLedger` 内部的 `IpPool` 与 `SessionRegistry`（共享一把锁），且任何 `Mutex` 临界区 SHALL NOT 包含 `.await` 点（cancel-safety 要求）。`UserStore` SHALL 不加锁（只读共享，封装在 `AuthStore` 内）。任一连接的认证、分配、注册操作 SHALL 持锁总时长不超过微秒级（HashMap 查 / 增删或位图翻转），且 SHALL NOT 与 argon2 校验（在锁外完成）嵌套。
 
 #### Scenario: 多连接并发认证不串行阻塞
 
@@ -29,8 +34,8 @@
 
 #### Scenario: 锁临界区不含 await
 
-- **WHEN** 静态检查 `server.rs` 中所有 `state.pool.lock()` 与 `state.registry.lock()` 调用
-- **THEN** 每个锁的 guard（`MutexGuard`）生命周期内不存在 `.await` 表达式
+- **WHEN** 静态检查 `vpn/src/ledger.rs` 中 `Mutex` 的所有 guard（`MutexGuard`）生命周期
+- **THEN** 每个锁的 guard 生命周期内不存在 `.await` 表达式
 
 ### Requirement: handle_conn 认证成功路径下发完整配置
 
@@ -67,17 +72,22 @@
 
 ### Requirement: 同名新连接顶替旧连接
 
-当 `registry.insert` 返回 `Ok(Some(Evicted{ ip, handle }))`，系统 SHALL：(1) 调用 `pool.free(evicted.ip)` 归还旧 IP；(2) 调用 `evicted.handle.conn.close(0, b"superseded")` 关闭旧连接（触发旧 conn 的所有 await 失败、其 per-conn task 退出）；(3) 继续向新连接下发 `AuthOk` 与启动 per-conn task。顶替 SHALL 在新连接 `AuthOk` 发送之前完成旧连接的 `close`。
+当 `ledger.register(username, ip, handle)` 返回 `Ok(Some(Evicted { ip, handle, reserved }))`，系统 SHALL：(1) 在同一锁内调用 `pool.reserve(evicted.ip)`（由 `register` 完成，上层无需手动调）；(2) 调用 `evicted.handle.session.close(0, b"superseded")` 关闭旧连接（触发旧 conn 的所有 await 失败、其 per-conn task 退出）；(3) 持有 `reserved` guard，传递给老 `ConnectionSupervisor` 用于后续 `retire`；(4) 继续向新连接下发 `AuthOk` 与启动 per-conn task。顶替 SHALL 在新连接 `AuthOk` 发送之前完成旧连接的 `close`。**旧 IP SHALL NOT 立即 free**，SHALL 在老 supervisor 显式 `retire` 时释放。
 
 #### Scenario: 第二个同名连接顶替第一个
 
 - **WHEN** alice 已连接（持有 IP `10.0.0.2`，控制 stream 活跃），第二个客户端以相同 `username: "alice"` + 正确密码连接
-- **THEN** 第二个客户端收到 `AuthOk{ assigned_ip: <不同于 10.0.0.2 的新地址，如 10.0.0.3> }`；第一个客户端的连接被关闭（其 `accept_bi` 或 stream 读失败）；旧 IP `10.0.0.2` 已被 `pool.free` 归还，可被后续其它用户分配到
+- **THEN** 第二个客户端收到 `AuthOk{ assigned_ip: <不同于 10.0.0.2 的新地址，如 10.0.0.3> }`；第一个客户端的连接被关闭；旧 IP `10.0.0.2` 处于 Reserved 状态（NOT Free），不能被并发的新连接（如 bob）分配到
 
-#### Scenario: 顶替后旧 IP 可被新分配
+#### Scenario: 顶替后老 supervisor 退出前旧 IP 不被复用
 
-- **WHEN** alice 顶替 alice 后，第三个客户端以 `username: "bob"` + 合法凭证连接
-- **THEN** bob 收到的 `AuthOk.assigned_ip` 可能是刚被归还的 `10.0.0.2`（取决于池分配策略）
+- **WHEN** alice 顶替 alice（旧 `.2` → 新 `.3`，`.2` 进 Reserved），在老 supervisor 退出前第三个客户端以 `username: "bob"` + 合法凭证连接
+- **THEN** bob 的 `AuthOk.assigned_ip` SHALL NOT 是 `10.0.0.2`（仍 Reserved）
+
+#### Scenario: 顶替后老 supervisor retire 后旧 IP 可被新分配
+
+- **WHEN** alice 顶替 alice（`.2` → Reserved），老 supervisor 退出调用 `retire(&h_old, guard)`，随后第三个客户端以 `username: "bob"` 连接
+- **THEN** bob 的 `AuthOk.assigned_ip` 可能是 `10.0.0.2`（已回到 Free）
 
 ### Requirement: per-conn 心跳保活与超时检测
 
@@ -115,7 +125,7 @@
 
 ### Requirement: per-conn 数据面上行泵
 
-系统 SHALL 为每个已认证连接 spawn 一个 task，接收一个 `CancellationToken`（由 `handle_conn` 传入），循环执行 `data::forward(quinn_datagram_source, tun_sink, cancel)`：读 quinn datagram、原样写入 TUN。该 task SHALL 在 `forward` 返回时退出——无论因 `read_datagram` 出错（通常因连接关闭）还是因 cancel 被取消。退出后 SHALL 触发 `conn.close`（若尚未关闭），使控制面 task 也退出，进而触发连接 cleanup。
+系统 SHALL 为每个已认证连接 spawn 一个 task，接收一个 `ShutdownHandle`（由 `ConnectionSupervisor` 传入），循环执行 `data::forward(quinn_datagram_source, tun_sink, cancel)`：读 quinn datagram、原样写入 TUN。`tun_sink` SHALL 由 supervisor 在 setup 时从 `run()` 持有的局部 `Tun(Arc<AsyncDevice>)` clone 而来（cheap `Arc` clone），作为 `PacketSink` 注入 uplink task；uplink task SHALL NOT 从任何全局 state 读取 tun。该 task SHALL 在 `forward` 返回时退出——无论因 `read_datagram` 出错（通常因连接关闭）还是因 cancel 被取消。退出后 SHALL 触发 `conn.close`（若尚未关闭），使控制面 task 也退出，进而触发连接 cleanup。
 
 #### Scenario: 客户端 datagram 包原样到达 TUN
 
@@ -130,11 +140,16 @@
 #### Scenario: cancel 触发后上行 task 干净退出
 
 - **WHEN** 已认证连接的上行 task 收到 cancel 信号（服务端优雅关闭），此时 `read_datagram` 正在挂起等待
-- **THEN** 上行 task 的 `forward` 因 cancel 返回 `Ok(()))`，task 退出，不消耗 CPU
+- **THEN** 上行 task 的 `forward` 因 cancel 返回 `Ok(())`，task 退出，不消耗 CPU
+
+#### Scenario: uplink task 接受任意 PacketSink 实现（含测试 mock）
+
+- **WHEN** 测试中以 mpsc 或 `Vec<u8>` 实现的 mock `PacketSink` 调用 `spawn_uplink_task`，且不构造 `Tun` 或 `ServerState`
+- **THEN** 编译通过且包被记录到 mock 中（验证 tun 不再是 ServerState 字段，测试无需 Option 开关）
 
 ### Requirement: 全局下行分发泵
 
-系统 SHALL 启动一个全局唯一的下行泵 task，循环执行 `data::downlink_pump(tun_source, registry_dispatcher)`。`registry_dispatcher` SHALL 实现 `DownlinkDispatcher`：每个从 TUN 读到的包，先调用 `data::dst_ipv4_addr` 解析目标 IPv4，命中则 `registry.lock().lookup(ip).cloned()`（短临界区，仅 lookup + clone handle 后释放锁），然后调用 `handle.conn.send_datagram(pkt)`。lookup miss（目标 IP 不在线）或包非 IPv4 / 畸形 SHALL 静默丢弃；`send_datagram` 失败（连接已关）SHALL 静默丢弃并可选 debug 日志。任一丢弃 SHALL NOT 终止下行泵。
+系统 SHALL 启动一个全局唯一的下行泵 task，循环执行 `data::downlink_pump(tun_source, registry_dispatcher)`。`registry_dispatcher` SHALL 实现 `DownlinkDispatcher`：每个从 TUN 读到的包，先调用 `data::dst_ipv4_addr` 解析目标 IPv4，命中则 `ledger.lookup_by_ip(ip)`（`Arc<ConnectionLedger>`，锁内仅 lookup + clone handle 后释放锁），然后调用 `handle.session.datagram_tx()` 发包。lookup miss（目标 IP 不在线）或包非 IPv4 / 畸形 SHALL 静默丢弃；`send_datagram` 失败（连接已关）SHALL 静默丢弃并可选 debug 日志。任一丢弃 SHALL NOT 终止下行泵。下行泵 SHALL 从 `run()` 持有的局部 `Tun` 读包，不从任何全局 state 读取 tun。
 
 #### Scenario: TUN 收到发往在线 IP 的包通过 datagram 到达客户端
 
@@ -153,17 +168,22 @@
 
 ### Requirement: 连接断开的幂等清理
 
-当连接的所有 per-conn task 退出（无论触发源：客户端断开、心跳超时、被顶替、上行 task 结束），系统 SHALL 执行 cleanup：`registry.lock().remove_by_ip(handle.ip)` 与 `pool.lock().free(handle.ip)`，两调用的返回值 SHALL 被丢弃（`let _ =`）。cleanup SHALL 幂等：被顶替场景下旧 conn 的 cleanup `remove_by_ip` / `free` 会 miss（`None` / `Err(NotAllocated)`），SHALL NOT 影响新连接的状态。
+当连接的所有 per-conn task 退出（无论触发源：客户端断开、心跳超时、被顶替、上行 task 结束），系统 SHALL 通过 `ConnectionSupervisor::run` 调用 `ledger.retire(&self.handle, self.reserved_guard.take())`：在 retire 内原子完成 `registry.remove_by_handle(&handle)` 与 `pool.release(ip)`。retire SHALL 幂等：被顶替场景下旧 conn 的 `remove_by_handle` 返回 `None`（已被顶替移除），但 `pool.release` SHALL 仍执行（因 evict 时已 reserve）——retire 通过 guard 携带的 ip 完成释放，SHALL NOT 依赖 registry 状态。系统 SHALL NOT 在 retire 路径上使用 `remove_by_ip`（防身份错位）。`ServerState::cleanup_session` 这个以 ip 为键的旧函数 SHALL 被删除。
 
 #### Scenario: 正常断开后 IP 归还并可重新分配
 
-- **WHEN** alice（IP `10.0.0.2`）主动关闭连接，服务端 cleanup 执行
-- **THEN** `10.0.0.2` 被 `pool.free` 归还，registry 中 `10.0.0.2` 与 `alice` 均不可命中；下一个合法认证的客户端可能被分配到 `10.0.0.2`
+- **WHEN** alice（IP `10.0.0.2`）主动关闭连接，supervisor 调 `retire(&h_alice, guard)`
+- **THEN** `10.0.0.2` 由 Allocated → Free（注：正常断开路径 ip 状态为 Allocated，retire 实现需处理"无对应 Reserved guard"或 supervisor 在 setup 时为正常 session 也取得 release 资格的场景）；registry 中 `10.0.0.2` 与 `alice` 均不可命中；下一个合法认证的客户端可能被分配到 `10.0.0.2`
 
-#### Scenario: 被顶替的旧连接 cleanup 不影响新连接
+#### Scenario: 被顶替的旧连接 retire 不影响新连接
 
-- **WHEN** alice 顶替 alice（旧 IP `10.0.0.2`，新 IP `10.0.0.3`），旧 conn 的 cleanup 随后执行
-- **THEN** 旧 cleanup 的 `remove_by_ip(10.0.0.2)` 返回 `None`（已被顶替移除），`free(10.0.0.2)` 返回 `Err(NotAllocated)`（已被顶替时归还）；新 alice 在 registry 中仍可由 `10.0.0.3` 命中，`10.0.0.3` 在 pool 中仍标记为已分配
+- **WHEN** alice 顶替 alice（旧 `.2` → 新 `.3`），老 supervisor 退出调 `retire(&h_old, guard)`（guard 携带 `.2`）
+- **THEN** retire 内 `remove_by_handle(&h_old)` 返回 `None`（已被顶替移除），`pool.release(.2)` 把 Reserved → Free；新 alice 在 registry 中仍可由 `.3` 命中，`.3` 在 pool 中仍标记为 Allocated
+
+#### Scenario: cleanup_session 旧函数已被删除
+
+- **WHEN** 在 `vpn/src/server.rs` 中搜索 `fn cleanup_session`
+- **THEN** 无匹配项（已被 `ConnectionLedger::retire` 取代）
 
 ### Requirement: 二进制入口与 CLI
 
@@ -191,7 +211,7 @@
 #### Scenario: Ctrl-C 后等连接清理再退出
 
 - **WHEN** 服务端有一个活跃连接（alice，IP 10.0.0.2），用户按 Ctrl-C
-- **THEN** 服务端打印关闭日志，alice 的 handle_conn task 收到 cancel 信号后退出并归还 IP，服务端在 alice 清理完成后退出；alice 的 IP 10.0.0.2 被 pool.free 归还
+- **THEN** 服务端打印关闭日志，alice 的 handle_conn task 收到 cancel 信号后退出并归还 IP，服务端在 alice 清理完成后退出；alice 的 IP 10.0.0.2 被 `ledger.retire` 归还
 
 #### Scenario: SIGTERM 触发优雅关闭
 
@@ -213,23 +233,9 @@
 - **WHEN** 服务端 accept loop 运行中，用户按 Ctrl-C 后有新客户端尝试连接
 - **THEN** `endpoint.close(...)` 已调用，新客户端的连接尝试失败（连接被拒绝或握手错误）
 
-### Requirement: ServerState 持有 TelemetrySink
-
-系统 SHALL 在 `ServerState` 中新增字段 `telemetry_sink: Arc<dyn TelemetrySink>`，由 `server::run` 在构造 `ServerState` 时初始化为 `ConsoleSink`（V1 唯一实现，打印到 tracing）。`telemetry_sink` SHALL 通过 `Arc` 共享给每个 `handle_conn`，使所有连接的遥测处理 task 共用同一 sink 实例。`ServerState` 的既有字段（`users` / `pool` / `registry` / `tun` / `config`）语义不变。
-
-#### Scenario: ServerState 构造时初始化 ConsoleSink
-
-- **WHEN** `server::run` 用合法 `ServerConfig` 构造 `ServerState`
-- **THEN** `state.telemetry_sink` 为 `Arc<dyn TelemetrySink>`，底层实现为 `ConsoleSink`
-
-#### Scenario: 多个连接共享同一 sink 实例
-
-- **WHEN** 两个客户端并发认证成功，各自的遥测处理 task 调用 `state.telemetry_sink.store(...)`
-- **THEN** 两次调用命中同一 `Arc` 指向的 `ConsoleSink` 实例（`Arc::ptr_eq` 为真）
-
 ### Requirement: handle_conn 在认证成功后 accept 遥测 stream 并 spawn 处理 task
 
-系统 SHALL 在 `handle_conn` 中、控制面认证成功并下发 `AuthOk` 之后、进入 ctrl loop 之前（或与之并行），调用 `session.accept_stream::<sysprobe::TelemetryMessage>()` 等待客户端开启遥测 stream。`accept_stream` SHALL 设有超时（默认 5 秒，复用 `FIRST_MSG_TIMEOUT` 或等价值）；超时内未收到遥测 stream SHALL 视为"客户端不支持遥测"，记录 debug 日志并跳过（不报错、不影响主流程）。accept 成功后 SHALL spawn 一个遥测处理 task 加入 `handle_conn` 的 task 编排（JoinSet 或 await 序列），传入：遥测 channel（split 为 reader / writer）、`state.telemetry_sink` clone、`SinkSource{ session_id: session.id(), username }`、`ShutdownHandle` clone。遥测处理 task 的退出 SHALL NOT 触发连接 cleanup（连接 cleanup 仍由 ctrl task 与 uplink task 退出驱动，与既有行为一致）。
+系统 SHALL 在 `handle_conn` 中、控制面认证成功并下发 `AuthOk` 之后、进入 ctrl loop 之前（或与之并行），调用 `session.accept_stream::<sysprobe::TelemetryMessage>()` 等待客户端开启遥测 stream。`accept_stream` SHALL 设有超时（默认 5 秒，复用 `FIRST_MSG_TIMEOUT` 或等价值）；超时内未收到遥测 stream SHALL 视为"客户端不支持遥测"，记录 debug 日志并跳过（不报错、不影响主流程）。accept 成功后 SHALL spawn 一个遥测处理 task 加入 `handle_conn` 的 task 编排（JoinSet 或 await 序列），传入：遥测 channel（split 为 reader / writer）、`Arc<TelemetryPlane>` clone、`SinkSource{ session_id: session.id(), username }`、`ShutdownHandle` clone。遥测处理 task 的退出 SHALL NOT 触发连接 cleanup（连接 cleanup 仍由 ctrl task 与 uplink task 退出驱动，与既有行为一致）。
 
 #### Scenario: 客户端开启遥测 stream 后服务端 accept 并 spawn task
 

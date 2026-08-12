@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 
 use crate::auth::{AuthError, UserStore};
-use crate::ipam::IpPool;
+use crate::ipam::IpPoolError;
 
 pub use crate::vpn::*;
 pub use msgx::KEEPALIVE_INTERVAL as HEARTBEAT_INTERVAL;
@@ -25,13 +25,13 @@ pub fn deny_reason_from(e: &ServerSideError) -> DenyReason {
 
 pub fn authenticate(
     store: &UserStore,
-    pool: &mut IpPool,
     req: &AuthRequest,
+    alloc: impl FnOnce() -> Result<Ipv4Addr, IpPoolError>,
 ) -> Result<Ipv4Addr, ServerSideError> {
     store
         .verify(&req.username, &req.password)
         .map_err(ServerSideError::Auth)?;
-    pool.alloc().map_err(|_| ServerSideError::PoolExhausted)
+    alloc().map_err(|_| ServerSideError::PoolExhausted)
 }
 
 #[cfg(test)]
@@ -48,6 +48,14 @@ mod tests {
     use prost::Message;
     use std::net::Ipv4Addr;
     use std::time::{Duration, Instant};
+
+    fn auth_with_pool(
+        store: &UserStore,
+        pool: &mut IpPool,
+        req: &AuthRequest,
+    ) -> Result<Ipv4Addr, ServerSideError> {
+        authenticate(store, req, || pool.alloc())
+    }
 
     fn hash_password(pw: &str) -> String {
         let salt = SaltString::generate(&mut OsRng);
@@ -280,7 +288,7 @@ mod tests {
             username: "alice".to_string(),
             password: "s3cret".to_string(),
         };
-        let result = authenticate(&store, &mut pool, &req);
+        let result = auth_with_pool(&store, &mut pool, &req);
         assert_eq!(result, Ok(Ipv4Addr::new(10, 0, 0, 2)));
         assert_eq!(pool.available_count(), before - 1);
     }
@@ -294,7 +302,7 @@ mod tests {
             username: "alice".to_string(),
             password: "wrong".to_string(),
         };
-        let result = authenticate(&store, &mut pool, &req);
+        let result = auth_with_pool(&store, &mut pool, &req);
         assert_eq!(
             result,
             Err(ServerSideError::Auth(AuthError::InvalidCredentials))
@@ -311,7 +319,7 @@ mod tests {
             username: "eve".to_string(),
             password: "anything".to_string(),
         };
-        let result = authenticate(&store, &mut pool, &req);
+        let result = auth_with_pool(&store, &mut pool, &req);
         assert_eq!(
             result,
             Err(ServerSideError::Auth(AuthError::InvalidCredentials))
@@ -328,7 +336,7 @@ mod tests {
             username: String::new(),
             password: "s3cret".to_string(),
         };
-        let result = authenticate(&store, &mut pool, &req);
+        let result = auth_with_pool(&store, &mut pool, &req);
         assert_eq!(
             result,
             Err(ServerSideError::Auth(AuthError::InvalidCredentials))
@@ -346,7 +354,7 @@ mod tests {
             username: "alice".to_string(),
             password: "s3cret".to_string(),
         };
-        let result = authenticate(&store, &mut pool, &req);
+        let result = auth_with_pool(&store, &mut pool, &req);
         assert_eq!(result, Err(ServerSideError::PoolExhausted));
     }
 
@@ -360,7 +368,7 @@ mod tests {
     fn test_authenticate_wrong_password_maps_to_auth_failed_deny_reason() {
         let store = alice_store();
         let mut pool = exhausted_pool();
-        let auth_err = authenticate(
+        let auth_err = auth_with_pool(
             &store,
             &mut pool,
             &AuthRequest {
@@ -376,7 +384,7 @@ mod tests {
     fn test_authenticate_pool_exhausted_maps_to_server_busy_deny_reason() {
         let store = alice_store();
         let mut pool = exhausted_pool();
-        let pool_err = authenticate(
+        let pool_err = auth_with_pool(
             &store,
             &mut pool,
             &AuthRequest {

@@ -60,8 +60,8 @@ impl Shutdown {
         self.token.cancelled()
     }
 
-    pub async fn drain(&self, tasks: &mut JoinSet<()>, label: &str) {
-        let joined = async { while tasks.join_next().await.is_some() {} };
+    pub async fn drain<T: 'static>(&self, tasks: &mut JoinSet<T>, label: &str) {
+        let joined = async { drain_all(tasks, label).await };
         if tokio::time::timeout(self.timeout, joined).await.is_ok() {
             tracing::info!("{label} graceful shutdown complete");
             return;
@@ -71,7 +71,15 @@ impl Shutdown {
         tracing::warn!(
             "{label} graceful shutdown timed out, aborted {remaining} remaining task(s)"
         );
-        while tasks.join_next().await.is_some() {}
+        drain_all(tasks, label).await;
+    }
+}
+
+async fn drain_all<T: 'static>(tasks: &mut JoinSet<T>, label: &str) {
+    while let Some(res) = tasks.join_next().await {
+        if let Err(e) = res {
+            tracing::error!("{label} task panicked: {e}");
+        }
     }
 }
 
@@ -168,7 +176,52 @@ pub async fn wait_for_interrupt(sd: &Shutdown) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Capture {
+        type Writer = CaptureWriter;
+        fn make_writer(&self) -> Self::Writer {
+            CaptureWriter(Arc::clone(&self.0))
+        }
+    }
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_logs() -> (Capture, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        (Capture(Arc::clone(&buf)), buf)
+    }
+
+    async fn drain_capturing_error_logs(
+        sd: &Shutdown,
+        tasks: &mut JoinSet<()>,
+        buf: Arc<Mutex<Vec<u8>>>,
+    ) {
+        let capture = Capture(Arc::clone(&buf));
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(capture)
+                .with_max_level(tracing::Level::ERROR)
+                .finish(),
+        );
+        sd.drain(tasks, "client").await;
+        drop(guard);
+    }
 
     #[tokio::test]
     async fn test_shutdown_trigger_broadcasts_to_cloned_tokens() {
@@ -239,6 +292,27 @@ mod tests {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_drain_when_task_panics_logs_error() {
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        tasks.spawn(async {
+            panic!("intentional panic for drain test");
+        });
+        let sd = Shutdown::new(Duration::from_secs(5));
+        let (_, buf) = captured_logs();
+        drain_capturing_error_logs(&sd, &mut tasks, buf.clone()).await;
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("client"),
+            "log should contain label, got: {output}"
+        );
+        assert!(
+            output.contains("panicked"),
+            "log should mention panic, got: {output}"
+        );
+        assert!(tasks.is_empty(), "JoinSet should be drained");
     }
 
     fn send_signal(sig: i32) {
