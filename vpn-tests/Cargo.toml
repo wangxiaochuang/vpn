@@ -1,0 +1,27 @@
+[package]
+name = "vpn-tests"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+vpn-core = { path = "../vpn-core" }
+vpn-client = { path = "../vpn-client" }
+vpn-server = { path = "../vpn-server" }
+msgx = { path = "../msgx" }
+quic-link = { path = "../quic-link" }
+shutdown = { path = "../shutdown" }
+sysprobe = { path = "../sysprobe" }
+quinn = { version = "0.11", features = ["rustls-aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "aws_lc_rs",
+] }
+rustls-pki-types = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+ipnet = "2"
+futures = "0.3"
+async-trait = "0.1"
+argon2 = "0.5"

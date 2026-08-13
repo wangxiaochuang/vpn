@@ -1,0 +1,41 @@
+[package]
+name = "vpn-client"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vpn-core = { path = "../vpn-core" }
+msgx = { path = "../msgx" }
+quic-link = { path = "../quic-link" }
+shutdown = { path = "../shutdown" }
+sysprobe = { path = "../sysprobe" }
+quinn = { version = "0.11", features = ["rustls-aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "aws_lc_rs",
+] }
+rustls-pki-types = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tun-rs = { version = "2", features = ["async"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+thiserror = "2"
+tokio-util = { version = "0.7", features = ["codec"] }
+ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+prost = "0.13"
+rpassword = "7.5"
+route_manager = "0.2"
+libc = "0.2"
+futures = "0.3"
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+libc = "0.2"
+tokio = { version = "1", features = ["test-util"] }

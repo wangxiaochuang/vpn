@@ -242,20 +242,20 @@ v2 采用**离散等级**而非连续分数。每级对应清晰的用户体验�
 
 ## 7.5 服务端运行时组成
 
-服务端运行时不再使用聚合的 `ServerState` 结构，改为**按生命周期与关注点拆分为独立 `Arc<T>`**，由 `server::run` 持有并按需注入每个 `ConnectionSupervisor`：
+服务端运行时不使用任何聚合 struct（`ServerState` / `ServerRuntime` / `BootParams` 均已删除），改为**按生命周期与关注点拆分为独立 `Arc<T>`**，由 `VpnServer::boot` 集中装配后注入 `AcceptLoop`（连接服务领域）与 `DownlinkDaemon`（数据面领域）。`ServerConfig` 在 `boot` 出口被各 `build_*` 按字段消化干净，不再以 `Arc<ServerConfig>` 整包穿透到每连接阶段：
 
 ```
-BootParams        { config: Arc<ServerConfig> }               // 启动只读
-AuthStore         { users: UserStore }                        // 静态认证表（不加锁）
-ConnectionLedger  { pool, registry }                          // 可变状态（单一 std Mutex）
-TelemetryPlane    { sinks: Vec<Arc<dyn TelemetrySink>> }      // 遥测 fan-out
-Tun(Arc<AsyncDevice>)                                        // data plane 局部资源
+ClientNetProfile   { subnet, gateway, mtu, routes }           // 每连接下发画像（gateway boot 时预算）
+AuthStore          { users: UserStore }                        // 静态认证表（不加锁）
+ConnectionLedger   { pool, registry }                          // 可变状态（单一 std Mutex）
+TelemetryPlane     { sinks: Vec<Arc<dyn TelemetrySink>> }      // 遥测 fan-out
+Tun(Arc<AsyncDevice>)                                         // data plane 局部资源
 ```
 
-- **`ConnectionLedger`**（`vpn/src/ledger.rs`）：`IpPool` 与 `SessionRegistry` 的唯一并发外壳，共用一把 `std::sync::Mutex`；提供 `register` / `retire(handle, guard)` / `alloc` / `lookup_by_ip` / `available_count`，锁内无 `.await`。`retire` 用 `remove_by_handle` 而非 `remove_by_ip`，从结构上杜绝"老 session 误删新主人"的身份错位。
+- **`ConnectionLedger`**（`vpn-server/src/ledger.rs`）：`IpPool` 与 `SessionRegistry` 的唯一并发外壳，共用一把 `std::sync::Mutex`；提供 `register` / `retire(handle, guard)` / `alloc` / `lookup_by_ip` / `available_count`，锁内无 `.await`。`retire` 用 `remove_by_handle` 而非 `remove_by_ip`，从结构上杜绝"老 session 误删新主人"的身份错位。
 - **`ReservedIp` guard**：`register` 触发 evict 时把旧 IP 从 Allocated 标记为 Reserved，返回 `Evicted { ip, handle, reserved }`；`reserved` 由老 `ConnectionSupervisor` 在退出时传入 `retire` 才真正释放 IP——**IP 生命周期严格等于 session 生命周期**，drain 期间旧 IP 不会被新客户端抢到。
-- **`TelemetryPlane`**：`server::run` 默认装配 `vec![Arc::new(ConsoleSink)]`，自身实现 `TelemetrySink`，`store` 遍历所有 sink 依次调用，单个 sink 失败 / 超时（默认 1 秒）记录 warn 并跳过，不阻断其它 sink。
-- **data plane 局部 `Tun`**：`tun` 不再是 state 字段，由 `run()` 构造并注入全局下行泵；每个 uplink task 由 supervisor 在 setup 时 clone 一份 `PacketSink` 注入。测试用 mpsc-based mock 直接替换，无需 `Option` 开关。
+- **`TelemetryPlane`**：`VpnServer::boot` 默认装配 `vec![Arc::new(ConsoleSink)]`，自身实现 `TelemetrySink`，`store` 遍历所有 sink 依次调用，单个 sink 失败 / 超时（默认 1 秒）记录 warn 并跳过，不阻断其它 sink。
+- **data plane 局部 `Tun`**：`tun` 不再是 state 字段，由 `VpnServer::boot` 构造，`run` 时注入全局下行泵；每个 uplink task 由 supervisor 在 setup 时 clone 一份 `PacketSink` 注入。测试用 mpsc-based mock 直接替换，无需 `Option` 开关。
 
 ## 8. 客户端运行流程演进
 
@@ -311,13 +311,13 @@ v1 技术栈全部保留。v2 倾向**最小新增依赖**：能复用 v1 既有
 | 客户端定位为交互式 CLI 用户 | 挑战机制硬依赖人工输入，无人值守场景不在 v2 范围 |
 | 不做 v1 客户端兼容（无版本协商） | 开发阶段整体升级，避免协议版本协商复杂度 |
 | 优雅关闭协调逻辑抽为独立 `shutdown` crate | "信号 → token → 带超时 drain"模式对任何 tokio 长驻服务通用，预期被其他服务复用；仿 `msgx` 以 workspace member + path 依赖形式共享，暂不发布 crates.io 待 API 打磨稳定 |
-| QUIC 连接管道抽为独立 `quic-link` crate | TLS 配置构建、Endpoint 建立、bidi stream→Channel 适配、datagram 收发、保活循环在 VPN 及后续 QUIC 项目中重复；提取为 `quic-link` 后调用方只写"握手+业务"，连接管道全复用。依赖方向：`quic-link → msgx`，`vpn → quic-link`。`Session` 私有封装 `quinn::Connection`，对外类型签名不含 `quinn::` 类型；`inner()` 逃生口标注为 `#[doc(hidden)]` |
-| 通用客户端信息采集抽为独立 `sysprobe` crate（遥测底座） | 采集数据模型（进程 / 端口 / 网卡 / 磁盘）、`Collector` trait + `CollectorRegistry`（cadence 调度 / pull 响应）、`TelemetrySink` trait 与传输完全解耦，可被 VPN 之外系统复用；依赖方向 `sysprobe` 无下游 VPN/QUIC 依赖，`vpn → sysprobe` |
+| QUIC 连接管道抽为独立 `quic-link` crate | TLS 配置构建、Endpoint 建立、bidi stream→Channel 适配、datagram 收发、保活循环在 VPN 及后续 QUIC 项目中重复；提取为 `quic-link` 后调用方只写"握手+业务"，连接管道全复用。依赖方向：`quic-link → msgx`，`vpn-core/vpn-client/vpn-server → quic-link`。`Session` 私有封装 `quinn::Connection`，对外类型签名不含 `quinn::` 类型；`inner()` 逃生口标注为 `#[doc(hidden)]` |
+| 通用客户端信息采集抽为独立 `sysprobe` crate（遥测底座） | 采集数据模型（进程 / 端口 / 网卡 / 磁盘）、`Collector` trait + `CollectorRegistry`（cadence 调度 / pull 响应）、`TelemetrySink` trait 与传输完全解耦，可被 VPN 之外系统复用；依赖方向 `sysprobe` 无下游 VPN/QUIC 依赖，`vpn-core → sysprobe` |
 | 遥测承载于独立 QUIC bidi stream（不复用控制 stream） | 控制 stream 的 keepalive 逻辑与大 payload 采集耦合会拖累心跳；独立 stream 实现流控隔离、task 隔离、故障隔离——遥测 stream 阻塞 / 解码失败 / 采集 panic 均 SHALL NOT 影响控制流与数据面 |
 | `DeviceAttestation` 作为 `SecurityCollector` 接入 sysprobe（不塞进控制 stream oneof） | 复用 v1 后期建立的遥测底座（`sysprobe` crate + 独立遥测 stream），无需新建协议消息；控制 stream 保持纯控制语义，避免大 payload 与 keepalive 耦合 |
 | 拆分聚合 `ServerState` 为独立 `Arc<T>`（BootParams / AuthStore / ConnectionLedger / TelemetryPlane / 局部 Tun） | 聚合 struct 把 6 个无关字段塞进一个购物袋，每个消费者被迫整包 clone；按生命周期分层后"读这层代码 = 读它持有什么"，且消除 pool 与 registry 两把锁无法表达原子的耦合 |
 | `ConnectionLedger` 合并 pool + registry 到单一 std `Mutex` | evict/cleanup 路径上"移除 registry + 释放 IP"必须原子，两把锁无法表达；合并后成对操作在同一临界区完成，从结构上消灭竞态窗口；临界区仍保持微秒级（HashMap 查增删 + 位图翻转），argon2 在锁外 |
 | `IpPool` 增加 reserved 中间态 + `ReservedIp` guard，evict 的 IP 直到老 supervisor 显式 `retire` 才 free | 让 IP 生命周期严格等于 session 生命周期：drain 期间旧 IP 既不被新连接拿到，也不会被老 supervisor 误释放；guard 为 `!Copy !Clone` 的 RAII 令牌，把"老 session 未退出"编进类型系统 |
 | `retire` 用 `remove_by_handle` 而非 `remove_by_ip` | 顶替场景下老 supervisor 的 cleanup 若按 IP 删会误删新主人的 registry 项；按 handle 删除从结构上杜绝身份错位，被顶替时返回 `None` 但 IP 仍由 guard 释放 |
-| `tun: Option<Arc<...>>` 字段删除，改为 `run()` 局部资源 + `PacketSink`/`PacketSource` trait 注入 | Option 反模式要求测试构造 TUN 才能跑数据面；`vpn::data::Tun` 已是现成的 `PacketSource` + `PacketSink` 抽象，测试用 mpsc mock 直接替换，无需新建 trait 或 `#[cfg(test)]` 分支 |
+| `tun: Option<Arc<...>>` 字段删除，改为 `run()` 局部资源 + `PacketSink`/`PacketSource` trait 注入 | Option 反模式要求测试构造 TUN 才能跑数据面；`vpn-core::data::Tun` 已是现成的 `PacketSource` + `PacketSink` 抽象，测试用 mpsc mock 直接替换，无需新建 trait 或 `#[cfg(test)]` 分支 |
 | 遥测 sink 升级为 `TelemetryPlane` fan-out 多路复用 | 多 sink 是明确的演进方向；fan-out 是最简单的多路语义，向后兼容单 sink（一个元素的 Vec）；per-sink 超时（1 秒）保证单个慢/失败 sink 不阻塞整个遥测 task |

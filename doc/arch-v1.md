@@ -67,7 +67,7 @@
 │   - 防止 MITM 截获应用层凭证                              │
 │   - 服务端持有由 CA 签发的证书（含匹配的 SAN）            │
 │   - 客户端配置信任的 CA 证书，按标准 WebPKI 校验服务端    │
-│   - CA 由运营者自建（自签根 CA），用 vpn/examples/tlsgen 生成 │
+│   - CA 由运营者自建（自签根 CA），用 `rcgen` 自签（历史实现见 `vpn/examples/tlsgen.rs`）生成 │
 ├──────────────────────────────────────────────────────────┤
 │ 应用层: 用户名 / 密码                                     │
 │   - 服务端配置文件存储用户列表                            │
@@ -148,9 +148,14 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
     `shutdown`（`Shutdown` 持有 `CancellationToken` + drain 超时；`spawn_signal_watchdog`
     注册 SIGINT/SIGTERM → `trigger`；`wait_for_interrupt` 内联 select 兜底 ctrl_c）。
     调用方负责 conn/endpoint 的 close 顺序编排，crate 不持有传输资源。
-  - 服务端采用两级 supervisor 结构：
-    全局 supervisor（`server::run`）：accept loop + `conn_set: JoinSet<ConnExitCause>` +
-      `daemon_set: JoinSet<()>`（全局下行泵纳入追踪，非 fire-and-forget）。
+  - 服务端采用三层领域对象结构：
+    顶层编排 `VpnServer`：`boot(config)` 集中装配（endpoint / TUN / 四独立 `Arc<T>` /
+      `Shutdown`），`run(self)` 消费自身完成生命周期（信号注册 → 下行泵 spawn →
+      accept 阻塞 → `graceful_stop` 统一收尾），`run` 返回即资源已清理。
+    连接服务 `AcceptLoop`：持有 endpoint/tun/四依赖 + `conn_set: JoinSet<ConnExitCause>`，
+      编排 accept 循环 → `handle_conn`（认证 + spawn supervisor），提供 `close()` 与 `drain()`。
+    数据面 `DownlinkDaemon`：持有 `JoinSet<()>`，`spawn` 全局唯一 `downlink_pump`，
+      提供 `drain()`。
     每连接 supervisor（`ConnectionSupervisor`）：spawn ctrl/uplink/telemetry 三个 task
       进 `JoinSet<ConnExitCause>`，`run` 以 `select!`(biased) 决定退出原因。
   - `ConnExitCause` 关闭协议（纯枚举"遗言"契约）：
@@ -162,10 +167,11 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
       不再静默）。
     不引入 per-conn cancel token、绝不 trigger 全局 sd——session.close 自然打断所有 task。
   - 服务端 Ctrl-C/SIGTERM: `spawn_signal_watchdog` 捕获信号 → `Shutdown::trigger()` 广播
-    取消 → 停止 accept → 每连接 supervisor 收 ServerShutdown → ctrl task best-effort 发送
-      Disconnect { reason: "server-shutdown" } → drain → close → retire (释放 IP、移除 registry)；
-    endpoint.close → `sd.drain(conn_set)` 等所有连接清理 → `sd.drain(daemon_set)` 等下行泵
-      (各带 5s 超时保护) → 超时 abort_all 兜底退出。
+      取消 → 停止 accept → 每连接 supervisor 收 ServerShutdown → ctrl task best-effort 发送
+        Disconnect { reason: "server-shutdown" } → drain → close → retire (释放 IP、移除 registry)。
+    `VpnServer::graceful_stop` 统一收尾（顺序确定）：`sd.trigger()` → `accept.close()`
+      → `accept.drain()` 等所有连接清理 → `daemon.drain()` 等下行泵 (各带 5s 超时保护)
+      → 超时 abort_all 兜底退出。
   - 认证失败下发 AuthDenied: `channel.send(deny)` → `drop(channel)` 触发 stream FIN
     （AuthDenied 必然按序送达）→ `timeout(AUTH_DENY_CONFIRM=1s, session.closed())` 等对端确认
     → `session.close(0, b"auth-denied")` 兜底。确定性 FIN 握手替代 sleep(100ms) 时间 hack。
@@ -202,7 +208,7 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 
 ### 8.1 客户端运行流程（方案 A）
 
-`vpn client --config client.toml` 的运行流程（与服务端对称，客户端是主动方）：
+`vpn-client --config client.toml` 的运行流程（与服务端对称，客户端是主动方）：
 
 ```
  1. 交互式读取用户名（rpassword，不回显），空用户名直接退出；再交互式读取密码（rpassword，不回显）
@@ -236,6 +242,56 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 ```
 
 **方案 A 路由说明（split tunneling）**：客户端把 `subnet` 内的流量导入 TUN（Linux 上执行 `ip route add <subnet> dev <dev>`，幂等；macOS/BSD 依赖 tun-rs `associate_route` 自动加/删路由）。此外服务端可通过配置 `routes` 字段声明需通过 VPN 访问的额外子网（如服务端背后的办公内网 `192.168.100.0/24`），认证成功后随 `AuthOk` 下发给客户端；客户端用 `route_manager` crate 程序化将这些路由绑定到 TUN 接口（跨平台：Linux netlink / macOS-BSD PF_ROUTE / Windows IP Helper），不 shell out 调用系统命令。`0.0.0.0/0`（默认路由）被配置阶段拒绝。V1 **不做全流量代理**（方案 B：默认路由 + server `/32` 例外），因此外网流量不经由服务端转发。macOS 上若 `associate_route` 被环境关闭则无路由，客户端在 TUN 构造时显式开启，不依赖默认值。
+
+### 8.2 服务端 per-conn 处理阶段
+
+服务端接受一个 QUIC 连接后，按三个明确阶段处理。阶段顺序不可颠倒，各阶段边界在代码主流程中肉眼可辨（线性编排，不嵌套于返回重语义的黑盒中）。以下为阶段级抽象图，具体函数组织见代码。
+
+**图 1：三阶段流水线**
+
+```
+每连接处理:
+  ┌─ 阶段 1: 控制面 + 认证 (同步, 线性) ──────────────────┐
+  │  接受控制 stream (客户端打开的第一条 bidi stream)       │
+  │  接收 AuthRequest (5s 超时)                            │
+  │  认证 → { 失败: 发 AuthDenied → 等确认 → close → 结束  │
+  │           成功: 注册会话(含同名顶替) → 发 AuthOk }      │
+  │  ⚠ 认证未通过前不启动任何后续 task                     │
+  ├───────────────────────────────────────────────────────┤
+  │  阶段 2: 三面并行 (认证成功后同时启动)                  │
+  │    控制面     心跳保活 (keepalive, 10s 发 / 30s 判死)   │
+  │    数据面上行 datagram_rx → TUN                        │
+  │    采集面     telemetry stream accept + 上报循环        │
+  │    ⚠ 采集面退出不触发连接 cleanup (隔离语义)            │
+  ├───────────────────────────────────────────────────────┤
+  │  阶段 3: 统一收尾 (单一 supervisor 入口)                │
+  │    等待退出原因 (全局 shutdown 或任一 task 遗言)        │
+  │    → close 连接 → drain 残留 task → retire (释放 IP)    │
+  └───────────────────────────────────────────────────────┘
+
+全局 (独立于 per-conn):
+  数据面下行  TUN 读包 → 查路由表 → 分发至各在线连接
+              ⚠ 全局唯一 task, 生命周期绑定 server::run,
+                不随单连接退出而停止
+```
+
+**图 2：心智模型——控制面先于认证**
+
+```
+常见误读:  "先认证, 再建控制面"  ✗
+
+正确理解:  控制 stream 是认证的载体, 认证不可能先于控制面存在
+          ┌─────────────┐
+          │ QUIC 连接建立 │
+          └──────┬───────┘
+                 ▼
+          ┌─────────────────────────┐
+          │ 客户端打开 bidi stream 0 │ ← 这条 stream 既是"控制面"
+          │ 发送 AuthRequest         │   也是"认证通道"
+          └─────────────────────────┘
+```
+
+QUIC stream 有消息边界，AuthRequest 必须在某条 stream 上传输。客户端连接后打开的第一条 bidi stream 既是控制面（后续心跳也走这条 stream），也是认证通道（首条消息即 AuthRequest）。因此"控制面建立"与"认证"是同一阶段的两个步骤，不可拆分为独立阶段。
 
 ## 9. 配置形态（示意）
 
@@ -329,22 +385,25 @@ ca_cert = "ca.crt"                # 信任的 CA 证书，用于校验服务端
 
 ## 13. 程序结构
 
-单一二进制 + clap 子命令：
+两个独立二进制（无子命令层）：
 
 ```
-vpn server --config server.toml   # 以服务端模式运行
-vpn client --config client.toml   # 以客户端模式运行
+vpn-server --config server.toml   # 以服务端模式运行
+vpn-client --config client.toml   # 以客户端模式运行
 ```
 
-`vpn client --config <PATH>` 启动流程：加载 `ClientConfig` → 交互式提示输入用户名（不回显，空用户名直接退出）→ 交互式提示输入密码（不回显）→ 连接、认证、建 TUN、转发。任一步骤失败以非零退出码退出并打印错误；认证失败会打印 `AuthDenied` 的可读原因（认证失败 / 服务端繁忙）。
+`vpn-client --config <PATH>` 启动流程：加载 `ClientConfig` → 交互式提示输入用户名（不回显，空用户名直接退出）→ 交互式提示输入密码（不回显）→ 连接、认证、建 TUN、转发。任一步骤失败以非零退出码退出并打印错误；认证失败会打印 `AuthDenied` 的可读原因（认证失败 / 服务端繁忙）。
 
-协议定义、加密、配置解析、数据泵等共享代码置于 `vpn` crate 的 library（`vpn/src/lib.rs`），两个子命令复用。
+共享纯逻辑（proto 生成代码、framing、数据面、TUN 设置、共享 telemetry 类型）置于 `vpn-core` crate；客户端逻辑置于 `vpn-client`，服务端逻辑置于 `vpn-server`，二者均依赖 `vpn-core`；端到端集成测试置于 `vpn-tests`（dev-dependencies 同时依赖两端与 core）。
 
 Cargo workspace 成员：
 
 | crate | 职责 |
 |-------|------|
-| `vpn` | 主库与主二进制：QUIC 控制面/数据面、TUN、路由、配置、认证 |
+| `vpn-core` | 共享纯逻辑 + proto：framing/ctrl 协议、数据面（forward/downlink_pump）、TUN 设置、共享 telemetry 类型与配置工具 |
+| `vpn-client` | 客户端 lib + bin：QUIC 控制面/数据面客户端、TUN、OS 路由、客户端配置、客户端 telemetry |
+| `vpn-server` | 服务端 lib + bin：QUIC 控制面/数据面服务端、认证（argon2）、IPAM、SessionRegistry、服务端配置、服务端 telemetry |
+| `vpn-tests` | 端到端集成测试（dev-dependencies 依赖 vpn-client/vpn-server/vpn-core） |
 | `msgx` | 控制面 framing + length-prefixed codec + 心跳 tracker（QUIC stream 适配） |
 | `quic-link` | QUIC 连接管道：TLS 配置、Endpoint、bidi stream → Channel 适配、datagram 收发、保活循环（`Session` 封装 `quinn::Connection`，对外不含 `quinn::` 类型） |
 | `shutdown` | 通用的 tokio 长驻服务优雅关闭协调（`Shutdown`：信号 → token → drain，含超时/abort 兜底） |

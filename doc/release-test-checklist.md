@@ -14,7 +14,7 @@
 
 ## 跨平台 TUN 真机
 
-- [ ] 以 root 运行 `vpn server --config server.toml`，确认 TUN 设备被创建，其 IPv4 地址等于配置 subnet 的网关（池首地址 `.1`），掩码等于 subnet 前缀，MTU 等于配置值（默认 1280）
+- [ ] 以 root 运行 `vpn-server --config server.toml`，确认 TUN 设备被创建，其 IPv4 地址等于配置 subnet 的网关（池首地址 `.1`），掩码等于 subnet 前缀，MTU 等于配置值（默认 1280）
 - [ ] Linux：TUN 设备创建 + IP forwarding + NAT 配置后，客户端能上网
 - [ ] macOS：utun 设备创建成功（注意 utun 命名限制）
 - [ ] 服务端 TUN subnet 内网关地址可达（ping gateway）
@@ -22,10 +22,10 @@
 
 ## 服务端启动流程（Q3）
 
-1. [ ] 生成或准备自签证书：`cargo run -p vpn --example tlsgen`（产出 `cert.pem` / `key.pem`）
+1. [ ] 生成或准备自签证书：仓库根目录已有 `cert.pem` / `key.pem` 可直接使用；如需重新生成，参考 `vpn/examples/tlsgen.rs`（历史实现，用 `rcgen` 自签）
 2. [ ] 编写 `server.toml`（参考 `doc/arch-v1.md` §9），含 `[server]` 段与至少一个 `[[users]]`
-3. [ ] `cargo build --release --bin vpn`
-4. [ ] 以 root 运行：`sudo ./target/release/vpn server --config server.toml`
+3. [ ] `cargo build --release -p vpn-server`
+4. [ ] 以 root 运行：`sudo ./target/release/vpn-server --config server.toml`
 5. [ ] 确认 tracing 输出含 `listening on <addr>`，进程进入 accept loop 阻塞
 6. [ ] 按 Ctrl+C，确认进程干净退出（endpoint close，无 panic）
 
@@ -69,7 +69,7 @@ echo "nat on en0 from 10.0.0.0/24 to any -> (en0)" | sudo pfctl -ef -
 
 ### 客户端启动与凭据输入
 
-1. [ ] `cargo build --release --bin vpn` 后运行 `sudo ./target/release/vpn client --config client.toml`
+1. [ ] `cargo build --release -p vpn-client` 后运行 `sudo ./target/release/vpn-client --config client.toml`
 2. [ ] 先提示「请输入用户名：」（不回显）；输入空行或纯空白后立即报「用户名不能为空」退出，**不**进入密码阶段、**不**读取 CA、**不**发起连接
 3. [ ] 输入正确用户名后再提示「请输入密码：」（不回显），输入正确密码后完成认证、建立 TUN
 

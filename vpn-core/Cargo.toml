@@ -1,0 +1,30 @@
+[package]
+name = "vpn-core"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+msgx = { path = "../msgx" }
+quic-link = { path = "../quic-link" }
+shutdown = { path = "../shutdown" }
+sysprobe = { path = "../sysprobe" }
+tokio = { version = "1", features = ["full"] }
+tun-rs = { version = "2", features = ["async"] }
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tokio-util = { version = "0.7", features = ["codec"] }
+ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+prost = "0.13"
+futures = "0.3"
+async-trait = "0.1"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
