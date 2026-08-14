@@ -197,8 +197,7 @@ fn deny_reason_text(reason: i32) -> &'static str {
 }
 
 pub async fn run(config: ClientConfig) -> anyhow::Result<()> {
-    let sd = Shutdown::new(Shutdown::DEFAULT_DRAIN_TIMEOUT);
-    let _ = shutdown::spawn_signal_watchdog(sd.clone()).await;
+    let sd = Shutdown::with_signal_watchdog().await;
     let pre = connect_and_recv_hello(&config).await?;
     let mut collector = CliCredentialCollector;
     establish_and_run(pre, &mut collector, sd).await
@@ -631,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_signal_watchdog_cancels_on_sigint() {
         let sd = Shutdown::default();
-        let ready = shutdown::spawn_signal_watchdog(sd.clone());
+        let ready = sd.spawn_signal_watchdog();
         ready
             .await
             .expect("watchdog should finish registering the SIGINT handler");

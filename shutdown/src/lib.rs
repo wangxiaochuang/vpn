@@ -83,6 +83,50 @@ impl Shutdown {
         );
         drain_all(tasks, label).await;
     }
+
+    /// Spawn a watchdog task that listens for SIGINT/SIGTERM.
+    ///
+    /// On registration success it sends `()` on the returned [`oneshot::Receiver`]
+    /// (the "ready" handshake) so callers can `await` it before doing blocking work
+    /// that needs a signal handler installed (e.g. interactive password reads).
+    /// When either signal arrives the watchdog calls `self.trigger()`.
+    ///
+    /// The watchdog task owns its own clone, so callers never pass a copy in.
+    /// Callers that do not need the ready handshake may drop the returned receiver:
+    /// `Sender::send` fails silently and the watchdog keeps working.
+    ///
+    /// If signal-handler registration fails, the watchdog logs a warning and exits
+    /// without triggering; callers should keep a fallback `ctrl_c()` path.
+    pub fn spawn_signal_watchdog(&self) -> oneshot::Receiver<()> {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        tokio::spawn(watchdog_task(self.clone(), ready_tx));
+        ready_rx
+    }
+
+    /// Inline interrupt wait for callers that do not need a pre-spawned watchdog.
+    ///
+    /// Resolves immediately if `self` is already triggered; otherwise waits for
+    /// Ctrl-C (SIGINT) and then calls `self.trigger()`. Does not spawn a task.
+    pub async fn wait_for_interrupt(&self) {
+        tokio::select! {
+            biased;
+            () = self.triggered() => {}
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received Ctrl+C, initiating graceful shutdown");
+                self.trigger();
+            }
+        }
+    }
+
+    /// Construct a `Shutdown` with [`Self::DEFAULT_DRAIN_TIMEOUT`] and a signal
+    /// watchdog installed, resolving only after the SIGINT/SIGTERM handlers are
+    /// registered. If registration fails the watchdog logs a warning and exits;
+    /// callers should keep a fallback `ctrl_c()` path.
+    pub async fn with_signal_watchdog() -> Self {
+        let sd = Self::new(Self::DEFAULT_DRAIN_TIMEOUT);
+        let _ = sd.spawn_signal_watchdog().await;
+        sd
+    }
 }
 
 async fn drain_all<T: 'static>(tasks: &mut JoinSet<T>, label: &str) {
@@ -117,24 +161,6 @@ impl ShutdownHandle {
     }
 }
 
-/// Spawn a watchdog task that listens for SIGINT/SIGTERM.
-///
-/// On registration success it sends `()` on the returned [`oneshot::Receiver`]
-/// (the "ready" handshake) so callers can `await` it before doing blocking work
-/// that needs a signal handler installed (e.g. interactive password reads).
-/// When either signal arrives the watchdog calls `sd.trigger()`.
-///
-/// Callers that do not need the ready handshake may drop the returned receiver:
-/// `Sender::send` fails silently and the watchdog keeps working.
-///
-/// If signal-handler registration fails, the watchdog logs a warning and exits
-/// without triggering; callers should keep a fallback `ctrl_c()` path.
-pub fn spawn_signal_watchdog(sd: Shutdown) -> oneshot::Receiver<()> {
-    let (ready_tx, ready_rx) = oneshot::channel();
-    tokio::spawn(watchdog_task(sd, ready_tx));
-    ready_rx
-}
-
 async fn watchdog_task(sd: Shutdown, ready_tx: oneshot::Sender<()>) {
     let Some((mut sigint, mut sigterm)) = register_handlers() else {
         return;
@@ -164,21 +190,6 @@ async fn wait_for_signal(sigint: &mut Signal, sigterm: &mut Signal) {
     tokio::select! {
         _ = sigint.recv() => tracing::info!("received SIGINT, initiating graceful shutdown"),
         _ = sigterm.recv() => tracing::info!("received SIGTERM, initiating graceful shutdown"),
-    }
-}
-
-/// Inline interrupt wait for callers that do not need a pre-spawned watchdog.
-///
-/// Resolves immediately if `sd` is already triggered; otherwise waits for
-/// Ctrl-C (SIGINT) and then calls `sd.trigger()`. Does not spawn a task.
-pub async fn wait_for_interrupt(sd: &Shutdown) {
-    tokio::select! {
-        biased;
-        () = sd.triggered() => {}
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received Ctrl+C, initiating graceful shutdown");
-            sd.trigger();
-        }
     }
 }
 
@@ -346,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_signal_watchdog_ready_fires_after_handler_registered() {
         let sd = Shutdown::default();
-        let ready = spawn_signal_watchdog(sd);
+        let ready = sd.spawn_signal_watchdog();
         let result = tokio::time::timeout(Duration::from_secs(2), ready).await;
         assert!(
             result.is_ok(),
@@ -358,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_signal_watchdog_triggers_on_sigint() {
         let sd = Shutdown::default();
-        let ready = spawn_signal_watchdog(sd.clone());
+        let ready = sd.spawn_signal_watchdog();
         let _ = ready.await;
         let triggered = trigger_via_signal(libc::SIGINT, &sd, Duration::from_secs(3)).await;
         assert!(triggered, "watchdog should trigger Shutdown on SIGINT");
@@ -367,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_signal_watchdog_triggers_on_sigterm() {
         let sd = Shutdown::default();
-        let ready = spawn_signal_watchdog(sd.clone());
+        let ready = sd.spawn_signal_watchdog();
         let _ = ready.await;
         let triggered = trigger_via_signal(libc::SIGTERM, &sd, Duration::from_secs(3)).await;
         assert!(triggered, "watchdog should trigger Shutdown on SIGTERM");
@@ -378,12 +389,28 @@ mod tests {
         let _guard = tokio::signal::unix::signal(SignalKind::interrupt())
             .expect("install guard SIGINT handler so the process survives pre-registration");
         let sd = Shutdown::default();
-        drop(spawn_signal_watchdog(sd.clone()));
+        drop(sd.spawn_signal_watchdog());
         let triggered = trigger_via_signal(libc::SIGINT, &sd, Duration::from_secs(3)).await;
         assert!(
             triggered,
             "watchdog should trigger even when ready receiver is dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn test_with_signal_watchdog_triggers_on_sigint_immediately_after_return() {
+        let sd = Shutdown::with_signal_watchdog().await;
+        let triggered = trigger_via_signal(libc::SIGINT, &sd, Duration::from_secs(3)).await;
+        assert!(
+            triggered,
+            "factory should have installed the watchdog before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_signal_watchdog_uses_default_drain_timeout() {
+        let sd = Shutdown::with_signal_watchdog().await;
+        assert_eq!(sd.timeout, Shutdown::DEFAULT_DRAIN_TIMEOUT);
     }
 
     // handler-registration failure cannot be reliably reproduced in a normal unix
@@ -396,7 +423,7 @@ mod tests {
         let sd = Shutdown::default();
         sd.trigger();
         let result =
-            tokio::time::timeout(Duration::from_millis(100), wait_for_interrupt(&sd)).await;
+            tokio::time::timeout(Duration::from_millis(100), sd.wait_for_interrupt()).await;
         assert!(
             result.is_ok(),
             "should return immediately when already triggered, not wait for ctrl_c"
@@ -409,7 +436,7 @@ mod tests {
             .expect("install guard SIGINT handler so the process survives pre-registration");
         let sd = Shutdown::default();
         let sd_for_task = sd.clone();
-        let wait_task = tokio::spawn(async move { wait_for_interrupt(&sd_for_task).await });
+        let wait_task = tokio::spawn(async move { sd_for_task.wait_for_interrupt().await });
         tokio::task::yield_now().await;
         let triggered = trigger_via_signal(libc::SIGINT, &sd, Duration::from_secs(3)).await;
         assert!(

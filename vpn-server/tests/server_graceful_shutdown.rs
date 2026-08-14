@@ -133,7 +133,7 @@ async fn test_shutdown_on_sigterm_sends_disconnect_to_client() {
         Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap(),
     )
     .await;
-    let ready = shutdown::spawn_signal_watchdog(sd.clone());
+    let ready = sd.spawn_signal_watchdog();
     ready
         .await
         .expect("watchdog should finish registering signal handlers");

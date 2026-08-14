@@ -279,13 +279,13 @@ Tun(Arc<AsyncDevice>)                                         // data plane 局�
 
 ### 10.2 优雅关闭
 
-"信号 → 取消令牌 → JoinSet 带超时 drain"的协调逻辑抽为独立 workspace crate **`shutdown`**（`Shutdown` 持有 `CancellationToken` + drain 超时默认 5s，超时 `abort_all`；`spawn_signal_watchdog` 注册 SIGINT/SIGTERM → `trigger`，含 ready oneshot 握手；`wait_for_interrupt` 内联 select 兜底 ctrl_c）。调用方负责 conn/endpoint 的 close 顺序编排，crate 不持有传输资源。
+"信号 → 取消令牌 → JoinSet 带超时 drain"的协调逻辑抽为独立 workspace crate **`shutdown`**（`Shutdown` 持有 `CancellationToken` + drain 超时默认 5s，超时 `abort_all`；`Shutdown::spawn_signal_watchdog` 方法注册 SIGINT/SIGTERM → `trigger`，clone 在方法内部吸收，含 ready oneshot 握手；`wait_for_interrupt` 方法内联 select 兜底 ctrl_c；`Shutdown::with_signal_watchdog` 工厂一步完成"构造 + 装信号源 + ready 握手"）。调用方负责 conn/endpoint 的 close 顺序编排，crate 不持有传输资源。
 
 **`ConnExitCause` 关闭协议**（纯枚举"遗言"契约）：`ServerShutdown`（全局 sd 触发）/ `CtrlEnded` / `UplinkEnded` / `TelemetryEnded`（被忽略）/ `TaskPanicked` → 各自映射 close code/reason。`ServerShutdown` 时先 drain 后 close（让 ctrl task 发送 Disconnect 通知再关连接），其他 cause 先 close 后 drain（session.close 打断卡住的 recv）。每 task 返回 ConnExitCause；task panic 经 JoinSet::join_next Err 可见（error! 日志）。不引入 per-conn cancel token、绝不 trigger 全局 sd——session.close 自然打断所有 task。
 
 服务端 Ctrl-C/SIGTERM：
 
-- `spawn_signal_watchdog` 捕获信号 → `Shutdown::trigger()` 广播取消 → 停止 accept；
+- watchdog（`sd.spawn_signal_watchdog()`）捕获信号 → `Shutdown::trigger()` 广播取消 → 停止 accept；
 - 每连接 supervisor 收 `ServerShutdown` → ctrl task best-effort 发送 `Disconnect{ reason: "server-shutdown" }` → drain → close → retire（释放 IP、移除 registry）；
 - `VpnServer::graceful_stop` 统一收尾（顺序确定）：`sd.trigger()` → `accept.close()` → `accept.drain()` 等所有连接清理 → `daemon.drain()` 等下行泵（各带 5s 超时保护）→ 超时 abort_all 兜底退出。
 

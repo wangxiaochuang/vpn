@@ -94,42 +94,39 @@ pub struct VpnServer {
     ledger: Arc<ConnectionLedger<ConnectionHandle>>,
     accept: AcceptLoop,
     daemon: Option<DownlinkDaemon>,
-    sd: Shutdown,
 }
 
 impl VpnServer {
     pub fn boot(config: ServerConfig) -> anyhow::Result<Self> {
         let (accept, tun, ledger) = build_accept(config)?;
-        let sd = Shutdown::default();
         Ok(Self {
             tun,
             ledger,
             accept,
             daemon: None,
-            sd,
         })
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
-        let _ = shutdown::spawn_signal_watchdog(self.sd.clone()).await;
-        let sd_handle = self.sd.handle();
+        let sd = Shutdown::with_signal_watchdog().await;
+        let sd_handle = sd.handle();
         self.daemon = Some(DownlinkDaemon::spawn(
             self.tun.clone(),
             self.ledger.clone(),
             sd_handle.clone(),
         ));
         self.accept.serve(&sd_handle).await;
-        self.graceful_stop().await;
+        self.graceful_stop(&sd).await;
         Ok(())
     }
 
-    async fn graceful_stop(&mut self) {
+    async fn graceful_stop(&mut self, sd: &Shutdown) {
         tracing::info!("initiating graceful shutdown");
-        self.sd.trigger();
+        sd.trigger();
         self.accept.close();
-        self.accept.drain(&self.sd).await;
+        self.accept.drain(sd).await;
         if let Some(daemon) = &mut self.daemon {
-            daemon.drain(&self.sd).await;
+            daemon.drain(sd).await;
         }
     }
 }
