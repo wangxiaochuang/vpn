@@ -1,5 +1,4 @@
 use std::net::Ipv4Addr;
-use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use ipnet::Ipv4Net;
@@ -119,6 +118,8 @@ pub enum ClientError {
     InvalidRoute(String),
     #[error("authentication failed: {0}")]
     AuthDenied(String),
+    #[error("incompatible protocol version: server={server}, client={client}", server = .0, client = crate::ctrl::PROTOCOL_VERSION)]
+    IncompatibleVersion(u32),
     #[error("protocol error: {0}")]
     Protocol(String),
 }
@@ -193,12 +194,13 @@ fn deny_reason_text(reason: i32) -> &'static str {
 }
 
 pub async fn run(config: ClientConfig) -> anyhow::Result<()> {
-    let sd = Shutdown::new(Duration::from_secs(5));
+    let sd = Shutdown::new(Shutdown::DEFAULT_DRAIN_TIMEOUT);
     let ready = shutdown::spawn_signal_watchdog(sd.clone());
     let _ = ready.await;
+    let pre = connect_and_recv_hello(&config).await?;
     let username = read_username().await?;
     let password = read_password().await?;
-    run_with_credentials(config, username, password, sd).await
+    establish_and_run(pre, &username, password, sd).await
 }
 
 async fn read_username() -> anyhow::Result<String> {
@@ -229,26 +231,48 @@ pub async fn run_with_credentials(
     password: String,
     sd: Shutdown,
 ) -> anyhow::Result<()> {
-    let est = connect_and_auth(&config, &username, password).await?;
+    let pre = connect_and_recv_hello(&config).await?;
+    establish_and_run(pre, &username, password, sd).await
+}
+
+async fn establish_and_run(
+    mut pre: PreAuthClient,
+    username: &str,
+    password: String,
+    sd: Shutdown,
+) -> anyhow::Result<()> {
+    let params = authenticate(&mut pre.channel, username, password).await?;
+    let est = EstablishedClient {
+        session: pre.session,
+        channel: pre.channel,
+        params,
+        endpoint: pre.endpoint,
+    };
     let tun = setup_tun(&est.params)?;
-    tracing::info!(
-        "authenticated as {}, assigned_ip={}, subnet={}, mtu={}",
-        username,
-        est.params.assigned_ip,
-        est.params.subnet,
-        est.params.mtu
-    );
+    log_client_authenticated(username, &est.params);
     let plane = DataPlane::spawn(est.session.clone(), Tun(tun), est.channel, &sd);
     let cause = plane.run(sd).await;
     tracing::info!("client exited: {cause}");
     Ok(())
 }
 
-async fn connect_and_auth(
-    config: &ClientConfig,
-    username: &str,
-    password: String,
-) -> anyhow::Result<EstablishedClient> {
+fn log_client_authenticated(username: &str, params: &ClientTunParams) {
+    tracing::info!(
+        "authenticated as {}, assigned_ip={}, subnet={}, mtu={}",
+        username,
+        params.assigned_ip,
+        params.subnet,
+        params.mtu
+    );
+}
+
+pub struct PreAuthClient {
+    pub session: Session,
+    pub channel: Channel<ControlMessage>,
+    endpoint: quic_link::Client,
+}
+
+pub async fn connect_and_recv_hello(config: &ClientConfig) -> anyhow::Result<PreAuthClient> {
     let client = quic_link::Client::builder()
         .trust_ca(config.ca_cert.clone())
         .server_name(config.server_name.clone())
@@ -257,13 +281,39 @@ async fn connect_and_auth(
     let session = client.connect(config.server).await?;
     tracing::info!("connected to {}", config.server);
     let mut channel = open_control_stream(&session).await?;
-    let params = authenticate(&mut channel, username, password).await?;
-    Ok(EstablishedClient {
+    send_open_signal(&mut channel).await?;
+    recv_and_validate_hello(&mut channel).await?;
+    Ok(PreAuthClient {
         session,
         channel,
-        params,
         endpoint: client,
     })
+}
+
+async fn send_open_signal(channel: &mut Channel<ControlMessage>) -> anyhow::Result<()> {
+    channel
+        .send(ControlMessage { msg: None })
+        .await
+        .context("failed to open control stream on peer")
+}
+
+async fn recv_and_validate_hello(channel: &mut Channel<ControlMessage>) -> Result<(), ClientError> {
+    let first = channel
+        .recv()
+        .await
+        .map_err(|e| ClientError::Protocol(format!("failed to receive ServerHello: {e}")))?
+        .ok_or_else(|| ClientError::Protocol("control stream closed before ServerHello".into()))?;
+    match first.msg {
+        Some(Msg::ServerHello(h)) => {
+            if h.protocol_version != crate::ctrl::PROTOCOL_VERSION {
+                return Err(ClientError::IncompatibleVersion(h.protocol_version));
+            }
+            Ok(())
+        }
+        _ => Err(ClientError::Protocol(
+            "expected ServerHello as first control message".into(),
+        )),
+    }
 }
 
 async fn open_control_stream(session: &Session) -> anyhow::Result<Channel<ControlMessage>> {
@@ -530,6 +580,8 @@ where
     clippy::many_single_char_names
 )]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn auth_ok() -> AuthOk {
@@ -551,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_signal_watchdog_cancels_on_sigint() {
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         let ready = shutdown::spawn_signal_watchdog(sd.clone());
         ready
             .await
@@ -703,6 +755,7 @@ mod tests {
             .to_string(),
             ClientError::GatewayIsNetworkAddr(Ipv4Addr::new(10, 0, 0, 0)).to_string(),
             ClientError::AuthDenied("wrong password".into()).to_string(),
+            ClientError::IncompatibleVersion(99).to_string(),
             ClientError::Protocol("unexpected msg".into()).to_string(),
             ClientError::InvalidRoute("not-a-cidr".into()).to_string(),
         ]
@@ -719,8 +772,9 @@ mod tests {
         assert!(all[3].contains("1280"));
         assert!(all[4].contains("65535"));
         assert!(all[7].contains("authentication failed"));
-        assert!(all[8].contains("protocol"));
-        assert!(all[9].contains("route"));
+        assert!(all[8].contains("incompatible"));
+        assert!(all[9].contains("protocol"));
+        assert!(all[10].contains("route"));
     }
 
     #[test]

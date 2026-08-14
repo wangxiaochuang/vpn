@@ -94,7 +94,7 @@ async fn test_data_plane_core_task_end_triggers_teardown() {
     let pair = common::make_connected_pair().await;
     let (channel, server_sender) = open_control_pair(&pair).await;
 
-    let sd = Shutdown::new(Duration::from_secs(5));
+    let sd = Shutdown::default();
     let plane = DataPlane::spawn(client_session(&pair), MockTun::new(MODE_ERR), channel, &sd);
 
     let cause = plane.run(sd.clone()).await;
@@ -126,7 +126,7 @@ async fn test_data_plane_telemetry_end_ignored_and_wait_continues() {
             .unwrap()
     });
 
-    let sd = Shutdown::new(Duration::from_secs(5));
+    let sd = Shutdown::default();
     let sd_for_run = sd.clone();
     let plane = DataPlane::spawn(
         client_session(&pair),
@@ -163,7 +163,7 @@ async fn test_data_plane_task_panic_maps_to_task_panicked() {
     let pair = common::make_connected_pair().await;
     let (channel, server_sender) = open_control_pair(&pair).await;
 
-    let sd = Shutdown::new(Duration::from_secs(5));
+    let sd = Shutdown::default();
     let plane = DataPlane::spawn(
         client_session(&pair),
         MockTun::new(MODE_PANIC),

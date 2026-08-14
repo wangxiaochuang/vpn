@@ -38,7 +38,17 @@ impl Clone for Shutdown {
     }
 }
 
+impl Default for Shutdown {
+    /// 等价于 `Shutdown::new(Shutdown::DEFAULT_DRAIN_TIMEOUT)`。
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_DRAIN_TIMEOUT)
+    }
+}
+
 impl Shutdown {
+    /// drain 阶段的默认超时：worker 任务有 5 秒优雅退出，超时则整体 abort。
+    pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
     pub fn new(timeout: Duration) -> Self {
         Self {
             token: CancellationToken::new(),
@@ -225,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shutdown_trigger_broadcasts_to_cloned_tokens() {
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         let cloned = sd.clone();
         let handle = sd.handle();
         sd.trigger();
@@ -246,7 +256,7 @@ mod tests {
         for _ in 0..3 {
             tasks.spawn(async {});
         }
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         let completed = tokio::time::timeout(Duration::from_secs(2), async {
             sd.drain(&mut tasks, "test").await;
         })
@@ -278,7 +288,7 @@ mod tests {
         tasks.spawn(async {
             std::future::pending::<()>().await;
         });
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         tokio::select! {
             biased;
             () = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -300,7 +310,7 @@ mod tests {
         tasks.spawn(async {
             panic!("intentional panic for drain test");
         });
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         let (_, buf) = captured_logs();
         drain_capturing_error_logs(&sd, &mut tasks, buf.clone()).await;
         let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -335,7 +345,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_signal_watchdog_ready_fires_after_handler_registered() {
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         let ready = spawn_signal_watchdog(sd);
         let result = tokio::time::timeout(Duration::from_secs(2), ready).await;
         assert!(
@@ -347,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_signal_watchdog_triggers_on_sigint() {
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         let ready = spawn_signal_watchdog(sd.clone());
         let _ = ready.await;
         let triggered = trigger_via_signal(libc::SIGINT, &sd, Duration::from_secs(3)).await;
@@ -356,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_signal_watchdog_triggers_on_sigterm() {
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         let ready = spawn_signal_watchdog(sd.clone());
         let _ = ready.await;
         let triggered = trigger_via_signal(libc::SIGTERM, &sd, Duration::from_secs(3)).await;
@@ -367,7 +377,7 @@ mod tests {
     async fn test_spawn_signal_watchdog_dropped_ready_still_triggers() {
         let _guard = tokio::signal::unix::signal(SignalKind::interrupt())
             .expect("install guard SIGINT handler so the process survives pre-registration");
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         drop(spawn_signal_watchdog(sd.clone()));
         let triggered = trigger_via_signal(libc::SIGINT, &sd, Duration::from_secs(3)).await;
         assert!(
@@ -383,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_interrupt_returns_immediately_when_already_triggered() {
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         sd.trigger();
         let result =
             tokio::time::timeout(Duration::from_millis(100), wait_for_interrupt(&sd)).await;
@@ -397,7 +407,7 @@ mod tests {
     async fn test_wait_for_interrupt_triggers_on_ctrl_c() {
         let _guard = tokio::signal::unix::signal(SignalKind::interrupt())
             .expect("install guard SIGINT handler so the process survives pre-registration");
-        let sd = Shutdown::new(Duration::from_secs(5));
+        let sd = Shutdown::default();
         let sd_for_task = sd.clone();
         let wait_task = tokio::spawn(async move { wait_for_interrupt(&sd_for_task).await });
         tokio::task::yield_now().await;

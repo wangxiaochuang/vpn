@@ -50,7 +50,7 @@ async fn test_client_exits_immediately_on_server_disconnect() {
         quic_link::Session::new(pair.client.clone()),
         client_reader,
         client_sender,
-        shutdown::Shutdown::new(Duration::from_secs(5)).handle(),
+        shutdown::Shutdown::default().handle(),
     ));
 
     server_writer
@@ -75,7 +75,7 @@ async fn test_client_heartbeat_exits_on_cancel() {
     let (client_sender, client_reader, server_writer, server_reader) =
         open_control_halves(&pair).await;
 
-    let sd = shutdown::Shutdown::new(Duration::from_secs(5));
+    let sd = shutdown::Shutdown::default();
     let hb_task = tokio::spawn(heartbeat_loop(
         quic_link::Session::new(pair.client.clone()),
         client_reader,

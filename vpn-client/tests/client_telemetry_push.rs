@@ -69,7 +69,7 @@ async fn test_client_push_loop_sends_report_when_collector_due() {
         calls: calls.clone(),
     }));
 
-    let sd = shutdown::Shutdown::new(Duration::from_secs(5));
+    let sd = shutdown::Shutdown::default();
     let handle = sd.handle();
     let loop_task = tokio::spawn(async move {
         client_telemetry_loop(client_writer, client_reader, &mut registry, &handle).await;
@@ -120,7 +120,7 @@ async fn test_client_push_loop_responds_to_collect_request() {
     }));
     registry.register(Box::new(DiskCollector::new()));
 
-    let sd = shutdown::Shutdown::new(Duration::from_secs(5));
+    let sd = shutdown::Shutdown::default();
     let handle = sd.handle();
     let loop_task = tokio::spawn(async move {
         client_telemetry_loop(client_writer, client_reader, &mut registry, &handle).await;

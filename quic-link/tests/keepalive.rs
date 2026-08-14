@@ -46,7 +46,7 @@ fn pair() -> (Channel<TestMsg>, Channel<TestMsg>) {
 }
 
 fn sd_handle() -> shutdown::ShutdownHandle {
-    shutdown::Shutdown::new(Duration::from_secs(5)).handle()
+    shutdown::Shutdown::default().handle()
 }
 
 #[derive(Clone)]

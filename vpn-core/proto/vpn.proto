@@ -4,12 +4,17 @@ package vpn;
 
 message ControlMessage {
   oneof msg {
+    ServerHello server_hello = 6;
     AuthRequest auth_request = 1;
     AuthOk auth_ok = 2;
     AuthDenied auth_denied = 3;
     Heartbeat heartbeat = 4;
     Disconnect disconnect = 5;
   }
+}
+
+message ServerHello {
+  uint32 protocol_version = 1;
 }
 
 message AuthRequest {

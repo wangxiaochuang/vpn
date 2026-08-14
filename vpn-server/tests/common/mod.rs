@@ -292,7 +292,7 @@ pub async fn start_test_server_with_routes(
         .expect("server endpoint");
     let state = test_state_with_subnet_and_routes(subnet, users, routes);
 
-    let handle = shutdown::Shutdown::new(std::time::Duration::from_secs(5)).handle();
+    let handle = shutdown::Shutdown::default().handle();
     spawn_accept_loop(endpoint.clone(), state.clone(), handle.clone()).await;
     (endpoint, state, handle)
 }
@@ -319,7 +319,7 @@ pub async fn start_test_server_with_shutdown(
         .expect("server endpoint");
     let state = test_state_with_subnet(subnet, users);
 
-    let sd = shutdown::Shutdown::new(std::time::Duration::from_secs(5));
+    let sd = shutdown::Shutdown::default();
     spawn_accept_loop(endpoint.clone(), state.clone(), sd.handle()).await;
     (endpoint, state, sd)
 }
@@ -360,6 +360,7 @@ pub async fn send_auth_request(framed: &mut ClientFramed, username: &str, passwo
         })
         .await
         .expect("send auth request");
+    recv_server_hello(framed).await;
 }
 
 pub async fn send_heartbeat(framed: &mut ClientFramed) {
@@ -371,6 +372,23 @@ pub async fn send_heartbeat(framed: &mut ClientFramed) {
         })
         .await
         .expect("send heartbeat");
+}
+
+pub async fn send_open_signal(framed: &mut ClientFramed) {
+    use futures::SinkExt;
+    framed
+        .send(vpn_server::ctrl::ControlMessage { msg: None })
+        .await
+        .expect("send open signal");
+}
+
+pub async fn recv_server_hello(framed: &mut ClientFramed) -> vpn_server::ctrl::ServerHello {
+    use vpn_server::ctrl::control_message::Msg;
+    let msg = recv_control(framed).await.expect("expected ServerHello");
+    match msg.msg {
+        Some(Msg::ServerHello(h)) => h,
+        other => panic!("expected ServerHello, got {other:?}"),
+    }
 }
 
 pub async fn recv_control(framed: &mut ClientFramed) -> Option<vpn_server::ctrl::ControlMessage> {

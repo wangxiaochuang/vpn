@@ -11,7 +11,7 @@ use quic_link::{DatagramRx, PacketSink, forward};
 use tokio::sync::mpsc;
 
 fn sd_handle() -> shutdown::ShutdownHandle {
-    shutdown::Shutdown::new(Duration::from_secs(5)).handle()
+    shutdown::Shutdown::default().handle()
 }
 
 struct ChannelSink {

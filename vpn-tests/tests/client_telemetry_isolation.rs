@@ -81,7 +81,7 @@ async fn test_telemetry_stream_close_does_not_affect_control_stream() {
         Session::new(pair.client.clone()),
         client_receiver,
         client_sender,
-        shutdown::Shutdown::new(Duration::from_secs(5)).handle(),
+        shutdown::Shutdown::default().handle(),
     ));
 
     let (client_reader, server_reader) = open_telemetry_pair(&pair).await;
@@ -130,7 +130,7 @@ async fn test_telemetry_loop_exits_on_shutdown_cancel() {
     let (_server_writer, server_reader) = server_channel.split();
 
     let mut registry = CollectorRegistry::new();
-    let sd = shutdown::Shutdown::new(Duration::from_secs(5));
+    let sd = shutdown::Shutdown::default();
     let handle = sd.handle();
     let telemetry_task = tokio::spawn(async move {
         client_telemetry_loop(client_writer, client_reader, &mut registry, &handle).await;

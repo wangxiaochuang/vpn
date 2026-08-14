@@ -9,7 +9,7 @@ use vpn_client::ctrl::control_message::Msg;
 use vpn_client::ctrl::{ControlMessage, Disconnect, Heartbeat};
 
 fn sd_handle() -> shutdown::ShutdownHandle {
-    shutdown::Shutdown::new(Duration::from_secs(5)).handle()
+    shutdown::Shutdown::default().handle()
 }
 
 fn hb() -> ControlMessage {

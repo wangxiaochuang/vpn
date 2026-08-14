@@ -90,9 +90,6 @@ cargo fmt --check           # 格式检查
 - 错误用 thiserror 分层，不滥用 unwrap
 ```
 
-## OpenSpec 工作流
+## 项目状态
 
-本项目使用 OpenSpec 管理变更提案（`openspec/` 目录）：
-- 实现新功能/变更前，先创建 change 提案（proposal + design + tasks）。
-- 探索阶段用 `/opsx-explore`，提案用 `/opsx-propose`，实现用 `/opsx-apply-change`。
-- 详细流程见 `.opencode/skills/` 下的相关 skill。
+当前处于开发阶段，还未发布。不考虑兼容性。

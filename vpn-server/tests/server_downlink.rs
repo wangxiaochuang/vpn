@@ -12,7 +12,7 @@ use vpn_server::data::{DownlinkDispatcher, PacketSource, downlink_pump};
 use vpn_server::server::RegistryDispatcher;
 
 fn sd_handle() -> shutdown::ShutdownHandle {
-    shutdown::Shutdown::new(std::time::Duration::from_secs(5)).handle()
+    shutdown::Shutdown::default().handle()
 }
 
 struct ChannelSource {

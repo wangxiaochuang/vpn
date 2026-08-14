@@ -76,7 +76,7 @@ mod tests {
     use super::*;
 
     fn sd_handle() -> ShutdownHandle {
-        shutdown::Shutdown::new(Duration::from_secs(5)).handle()
+        shutdown::Shutdown::default().handle()
     }
 
     struct ChannelSource {

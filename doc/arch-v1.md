@@ -46,7 +46,7 @@
 - **消息格式**：Protobuf（`prost`）。
 - **传输方式**：连接期间使用**一条双向 stream**；消息以 **4 字节大端 length prefix 分帧**（length-prefixed framing），在字节流上界定消息边界。
 - **心跳**：双方定期互发心跳；超时未收到对方心跳即判定连接死亡，触发 IP 释放（见 §6、§8）。
-- **典型流程**：连接建立后客户端打开控制 stream，发送认证请求；服务端校验后下发分配结果。
+- **典型流程**：连接建立后客户端打开控制 stream，服务端立即发送 `ServerHello`（声明协议版本），客户端校验版本后发送认证请求，服务端校验后下发分配结果。
 
 ## 4. 数据面（QUIC Datagram）
 
@@ -83,6 +83,8 @@ username  ──门禁──►  能不能进 (密码对不对)
 username  ──身份──►  在线期间你是哪一个
 username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, §8)
 ```
+
+**握手时序（服务端先说话）**：客户端打开控制 stream 后，服务端**立即**发送 `ServerHello{ protocol_version }`（`PROTOCOL_VERSION = 1`），**不等待**客户端任何消息。客户端校验版本兼容后再交互式收集用户名密码并发送 `AuthRequest`。此设计确保服务端不可达时用户不被提示输入密码，并为 V2 预留协议协商口子。
 
 ## 6. IP 分配
 
@@ -128,8 +130,10 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 ```
 建立:
   QUIC 握手 (TLS, CA 校验)
-    → 客户端开控制 stream → 发 {username, password}
-    → 服务端校验密码
+    → 客户端开控制 stream
+    → 服务端先发 ServerHello{ protocol_version } (不等客户端消息)
+    → 客户端校验版本兼容后, 发 {username, password}
+    → 服务端校验密码 (AuthRequest 超时 60s)
     → 若存在同名旧连接: 顶替 (同一锁内把旧 IP 标记 Reserved, 关闭旧连接;
        IP 直到老 supervisor 显式 retire 才回到 Free, 见下方顶替规则说明)
     → 从空闲池分配 IP, 写入路由表与 username→连接表
@@ -211,34 +215,38 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 `vpn-client --config client.toml` 的运行流程（与服务端对称，客户端是主动方）：
 
 ```
- 1. 交互式读取用户名（rpassword，不回显），空用户名直接退出；再交互式读取密码（rpassword，不回显）
- 2. connect_and_auth(config, username, password)
-    → Client::builder + connect 建立 QUIC 连接（quic-link 封装，TLS 校验由 trust_ca/server_name 配置）
-    → 打开控制 stream，发送 AuthRequest{ username, password }
-    → 匹配首条响应:
-       - AuthOk{ assigned_ip, subnet, gateway, mtu }
-           → parse_auth_ok 校验（IPv4 / Ipv4Net / mtu≥1280 / gateway 在 subnet 内）
-           → 返回 EstablishedClient（session / channel / params / endpoint，endpoint 字段声明在最后
-             → 析构顺序保证 endpoint 活得比所有使用 session 的 task 更久，无需 std::mem::forget）
-       - AuthDenied{ reason } → 打印可读信息退出（不建 TUN）
- 3. setup_tun(&est.params)
-    → create_client_tun(assigned_ip, subnet, mtu)
-        TUN 地址 = 服务端分配的虚拟 IP（区别于服务端的网关地址）
-        macOS 显式 associate_route(true)
-    → ensure_subnet_route(dev, subnet) + add_routes(dev, &params.routes)
- 4. DataPlane::spawn(est.session.clone(), Tun(tun), est.channel, &sd)
-    → 4 个数据面 task 一批 spawn 进 JoinSet<ExitCause>：
-      心跳（keepalive_loop：每 10s 发心跳，30s 判死；收到 Disconnect → LoopControl::Break）
-      上行 forward(Tun, datagram_tx, cancel)、下行 forward(datagram_rx, Tun, cancel)、遥测
-    → 每个 task 返回 ExitCause（"遗言"契约：Interrupted/ServerDisconnect/HeartbeatEnded/
-      UplinkEnded/DownlinkEnded/TelemetryEnded/TaskPanicked）
- 5. plane.run(sd).await（DataPlane supervisor）
-    → tokio::select!(biased) 监听 sd.triggered()（Ctrl+C/SIGTERM → Interrupted）
-      与 JoinSet::join_next()（首个 task 遗言；JoinError → error! + TaskPanicked）
-    → TelemetryEnded 被忽略并 continue（遥测退出 SHALL NOT 触发整体关闭）
-    → 其余 ExitCause → session.close(cause.code(), cause.reason()) 通知对端
-    → sd.trigger() 广播取消 → sd.drain(&mut tasks) 等待清理（5s 超时 abort）
- 6. run 返回后 EstablishedClient 按字段顺序析构（session 先、endpoint 最后），进程退出（V1 不自动重连）
+ 1. connect_and_recv_hello(config)
+     → Client::builder + connect 建立 QUIC 连接（quic-link 封装，TLS 校验由 trust_ca/server_name 配置）
+     → 打开控制 stream，发送 open signal（触发服务端 accept_bi）
+     → 接收 ServerHello，校验 protocol_version == PROTOCOL_VERSION（不兼容则退出，不提示密码）
+ 2. 交互式读取用户名（rpassword，不回显），空用户名直接退出；再交互式读取密码（rpassword，不回显）
+     → 凭据收集移至连接建立之后，服务端不可达时不白问密码
+ 3. authenticate(channel, username, password)
+     → 发送 AuthRequest{ username, password }
+     → 匹配首条响应:
+        - AuthOk{ assigned_ip, subnet, gateway, mtu }
+            → parse_auth_ok 校验（IPv4 / Ipv4Net / mtu≥1280 / gateway 在 subnet 内）
+            → 返回 EstablishedClient（session / channel / params / endpoint，endpoint 字段声明在最后
+              → 析构顺序保证 endpoint 活得比所有使用 session 的 task 更久，无需 std::mem::forget）
+        - AuthDenied{ reason } → 打印可读信息退出（不建 TUN）
+ 4. setup_tun(&est.params)
+     → create_client_tun(assigned_ip, subnet, mtu)
+         TUN 地址 = 服务端分配的虚拟 IP（区别于服务端的网关地址）
+         macOS 显式 associate_route(true)
+     → ensure_subnet_route(dev, subnet) + add_routes(dev, &params.routes)
+ 5. DataPlane::spawn(est.session.clone(), Tun(tun), est.channel, &sd)
+     → 4 个数据面 task 一批 spawn 进 JoinSet<ExitCause>：
+       心跳（keepalive_loop：每 10s 发心跳，30s 判死；收到 Disconnect → LoopControl::Break）
+       上行 forward(Tun, datagram_tx, cancel)、下行 forward(datagram_rx, Tun, cancel)、遥测
+     → 每个 task 返回 ExitCause（"遗言"契约：Interrupted/ServerDisconnect/HeartbeatEnded/
+       UplinkEnded/DownlinkEnded/TelemetryEnded/TaskPanicked）
+ 6. plane.run(sd).await（DataPlane supervisor）
+     → tokio::select!(biased) 监听 sd.triggered()（Ctrl+C/SIGTERM → Interrupted）
+       与 JoinSet::join_next()（首个 task 遗言；JoinError → error! + TaskPanicked）
+     → TelemetryEnded 被忽略并 continue（遥测退出 SHALL NOT 触发整体关闭）
+     → 其余 ExitCause → session.close(cause.code(), cause.reason()) 通知对端
+     → sd.trigger() 广播取消 → sd.drain(&mut tasks) 等待清理（5s 超时 abort）
+ 7. run 返回后 EstablishedClient 按字段顺序析构（session 先、endpoint 最后），进程退出（V1 不自动重连）
 ```
 
 **方案 A 路由说明（split tunneling）**：客户端把 `subnet` 内的流量导入 TUN（Linux 上执行 `ip route add <subnet> dev <dev>`，幂等；macOS/BSD 依赖 tun-rs `associate_route` 自动加/删路由）。此外服务端可通过配置 `routes` 字段声明需通过 VPN 访问的额外子网（如服务端背后的办公内网 `192.168.100.0/24`），认证成功后随 `AuthOk` 下发给客户端；客户端用 `route_manager` crate 程序化将这些路由绑定到 TUN 接口（跨平台：Linux netlink / macOS-BSD PF_ROUTE / Windows IP Helper），不 shell out 调用系统命令。`0.0.0.0/0`（默认路由）被配置阶段拒绝。V1 **不做全流量代理**（方案 B：默认路由 + server `/32` 例外），因此外网流量不经由服务端转发。macOS 上若 `associate_route` 被环境关闭则无路由，客户端在 TUN 构造时显式开启，不依赖默认值。
@@ -253,7 +261,8 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 每连接处理:
   ┌─ 阶段 1: 控制面 + 认证 (同步, 线性) ──────────────────┐
   │  接受控制 stream (客户端打开的第一条 bidi stream)       │
-  │  接收 AuthRequest (5s 超时)                            │
+  │  立即发送 ServerHello{ protocol_version }              │
+  │  接收 AuthRequest (60s 超时, 覆盖交互式密码输入)        │
   │  认证 → { 失败: 发 AuthDenied → 等确认 → close → 结束  │
   │           成功: 注册会话(含同名顶替) → 发 AuthOk }      │
   │  ⚠ 认证未通过前不启动任何后续 task                     │
@@ -281,17 +290,18 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 常见误读:  "先认证, 再建控制面"  ✗
 
 正确理解:  控制 stream 是认证的载体, 认证不可能先于控制面存在
-          ┌─────────────┐
-          │ QUIC 连接建立 │
-          └──────┬───────┘
-                 ▼
-          ┌─────────────────────────┐
-          │ 客户端打开 bidi stream 0 │ ← 这条 stream 既是"控制面"
-          │ 发送 AuthRequest         │   也是"认证通道"
-          └─────────────────────────┘
+           ┌─────────────┐
+           │ QUIC 连接建立 │
+           └──────┬───────┘
+                  ▼
+           ┌─────────────────────────────┐
+           │ 客户端打开 bidi stream 0     │ ← 这条 stream 既是"控制面"
+           │ 服务端发 ServerHello         │   也是"认证通道"
+           │ 客户端发 AuthRequest         │
+           └─────────────────────────────┘
 ```
 
-QUIC stream 有消息边界，AuthRequest 必须在某条 stream 上传输。客户端连接后打开的第一条 bidi stream 既是控制面（后续心跳也走这条 stream），也是认证通道（首条消息即 AuthRequest）。因此"控制面建立"与"认证"是同一阶段的两个步骤，不可拆分为独立阶段。
+QUIC stream 有消息边界，消息必须在某条 stream 上传输。客户端连接后打开的第一条 bidi stream 既是控制面（后续心跳也走这条 stream），也是认证通道。服务端接受 stream 后**先发 `ServerHello`**（声明协议版本），客户端校验版本后再发 `AuthRequest`。因此"控制面建立"与"认证"是同一阶段的两个步骤，不可拆分为独立阶段。
 
 ## 9. 配置形态（示意）
 
@@ -381,6 +391,8 @@ ca_cert = "ca.crt"                # 信任的 CA 证书，用于校验服务端
 | 虚拟 IP 绑定 QUIC 连接（CID）而非传输地址 | NAT rebinding 下连接不断、IP 不必释放；为 V2 主动 migration 留纯增量接口，成本几乎为零 |
 | V1 仅做被动 NAT rebinding，不做主动 migration | quinn 默认免费支持被动 rebinding；主动迁移需额外写 OS 网络变化检测器，V1 收益与工作量不匹配，留待 V2 |
 | 客户端密码交互式输入（rpassword，不落盘） | 配置不存明文密码，安全性好；无自动登录需求 |
+| 服务端先发 ServerHello，再等 AuthRequest（握手时序） | 确立"服务端先说话"骨架，客户端先确认服务端可达再弹密码框；为 V2 版本协商/auth 方式协商预留口子；多 1 RTT 被用户打字时间掩盖 |
+| AuthRequest 超时 60s（原 5s） | 客户端收到 ServerHello 后交互式输入密码，5s 不够用户打字；60s 覆盖正常输入，且未认证连接不分配 IP/不进路由表，攻击成本与现状等价 |
 | 客户端方案 A 路由（仅 subnet 内，非全流量代理） | 实现最简、无需 NAT；V1 定位内网互通，全流量代理（方案 B）留待后续 |
 
 ## 13. 程序结构
@@ -392,7 +404,7 @@ vpn-server --config server.toml   # 以服务端模式运行
 vpn-client --config client.toml   # 以客户端模式运行
 ```
 
-`vpn-client --config <PATH>` 启动流程：加载 `ClientConfig` → 交互式提示输入用户名（不回显，空用户名直接退出）→ 交互式提示输入密码（不回显）→ 连接、认证、建 TUN、转发。任一步骤失败以非零退出码退出并打印错误；认证失败会打印 `AuthDenied` 的可读原因（认证失败 / 服务端繁忙）。
+`vpn-client --config <PATH>` 启动流程：加载 `ClientConfig` → 建立 QUIC 连接 → 接收 `ServerHello` 并校验协议版本 → 交互式提示输入用户名（不回显，空用户名直接退出）→ 交互式提示输入密码（不回显）→ 认证、建 TUN、转发。任一步骤失败以非零退出码退出并打印错误；认证失败会打印 `AuthDenied` 的可读原因（认证失败 / 服务端繁忙）。
 
 共享纯逻辑（proto 生成代码、framing、数据面、TUN 设置、共享 telemetry 类型）置于 `vpn-core` crate；客户端逻辑置于 `vpn-client`，服务端逻辑置于 `vpn-server`，二者均依赖 `vpn-core`；端到端集成测试置于 `vpn-tests`（dev-dependencies 同时依赖两端与 core）。
 

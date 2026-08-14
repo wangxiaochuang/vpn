@@ -292,7 +292,7 @@ pub async fn start_test_server_with_routes(
         .expect("server endpoint");
     let state = test_state_with_subnet_and_routes(subnet, users, routes);
 
-    let handle = shutdown::Shutdown::new(std::time::Duration::from_secs(5)).handle();
+    let handle = shutdown::Shutdown::default().handle();
     spawn_accept_loop(endpoint.clone(), state.clone(), handle.clone()).await;
     (endpoint, state, handle)
 }
@@ -319,7 +319,7 @@ pub async fn start_test_server_with_shutdown(
         .expect("server endpoint");
     let state = test_state_with_subnet(subnet, users);
 
-    let sd = shutdown::Shutdown::new(std::time::Duration::from_secs(5));
+    let sd = shutdown::Shutdown::default();
     spawn_accept_loop(endpoint.clone(), state.clone(), sd.handle()).await;
     (endpoint, state, sd)
 }
@@ -348,9 +348,19 @@ pub async fn open_control(conn: &quinn::Connection) -> ClientFramed {
     )
 }
 
+pub async fn send_open_signal(framed: &mut ClientFramed) {
+    use futures::SinkExt;
+    framed
+        .send(vpn_core::ctrl::ControlMessage { msg: None })
+        .await
+        .expect("send open signal");
+}
+
 pub async fn send_auth_request(framed: &mut ClientFramed, username: &str, password: &str) {
     use futures::SinkExt;
     use vpn_core::ctrl::control_message::Msg;
+    send_open_signal(framed).await;
+    recv_server_hello(framed).await;
     framed
         .send(vpn_core::ctrl::ControlMessage {
             msg: Some(Msg::AuthRequest(vpn_core::ctrl::AuthRequest {
@@ -360,6 +370,15 @@ pub async fn send_auth_request(framed: &mut ClientFramed, username: &str, passwo
         })
         .await
         .expect("send auth request");
+}
+
+pub async fn recv_server_hello(framed: &mut ClientFramed) {
+    use vpn_core::ctrl::control_message::Msg;
+    let msg = recv_control(framed).await.expect("expected ServerHello");
+    assert!(
+        matches!(msg.msg, Some(Msg::ServerHello(_))),
+        "expected ServerHello, got {msg:?}"
+    );
 }
 
 pub async fn send_heartbeat(framed: &mut ClientFramed) {
