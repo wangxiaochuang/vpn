@@ -1,10 +1,6 @@
-use std::net::Ipv4Addr;
-
-use crate::auth::{AuthError, UserStore};
-use crate::ipam::IpPoolError;
+use crate::auth::AuthError;
 
 pub use vpn_core::ctrl::*;
-pub use vpn_core::vpn::AuthRequest;
 pub use vpn_core::vpn::DenyReason;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,56 +16,14 @@ pub fn deny_reason_from(e: &ServerSideError) -> DenyReason {
     }
 }
 
-pub fn authenticate(
-    store: &UserStore,
-    req: &AuthRequest,
-    alloc: impl FnOnce() -> Result<Ipv4Addr, IpPoolError>,
-) -> Result<Ipv4Addr, ServerSideError> {
-    store
-        .verify(&req.username, &req.password)
-        .map_err(ServerSideError::Auth)?;
-    alloc().map_err(|_| ServerSideError::PoolExhausted)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::auth::UserStore;
-    use crate::ipam::IpPool;
-    use argon2::password_hash::SaltString;
-    use argon2::password_hash::rand_core::OsRng;
-    use argon2::{Argon2, PasswordHasher};
-    use ipnet::Ipv4Net;
     use prost::Message;
-    use std::net::Ipv4Addr;
     use std::time::{Duration, Instant};
     use vpn_core::vpn::ControlMessage;
     use vpn_core::vpn::control_message::Msg;
-
-    fn auth_with_pool(
-        store: &UserStore,
-        pool: &mut IpPool,
-        req: &AuthRequest,
-    ) -> Result<Ipv4Addr, ServerSideError> {
-        authenticate(store, req, || pool.alloc())
-    }
-
-    fn hash_password(pw: &str) -> String {
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(pw.as_bytes(), &salt)
-            .unwrap()
-            .to_string()
-    }
-
-    fn alice_store() -> UserStore {
-        UserStore::from_users([("alice".to_string(), hash_password("s3cret"))]).unwrap()
-    }
-
-    fn net24() -> IpPool {
-        IpPool::new(Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 24)).unwrap()
-    }
 
     fn roundtrip(msg: &ControlMessage) -> ControlMessage {
         let buf = msg.encode_to_vec();
@@ -77,11 +31,14 @@ mod tests {
     }
 
     #[test]
-    fn test_control_message_auth_request_roundtrip_preserves_fields() {
+    fn test_control_message_auth_init_roundtrip_preserves_fields() {
+        use vpn_core::vpn::auth_init::Method;
         let msg = ControlMessage {
-            msg: Some(Msg::AuthRequest(AuthRequest {
+            msg: Some(Msg::AuthInit(vpn_core::vpn::AuthInit {
                 username: "alice".to_string(),
-                password: "s3cret".to_string(),
+                method: Some(Method::Password(vpn_core::vpn::PasswordAuth {
+                    password: "s3cret".to_string(),
+                })),
             })),
         };
         assert_eq!(roundtrip(&msg), msg);
@@ -136,21 +93,6 @@ mod tests {
         };
         let decoded = roundtrip(&msg);
         assert!(matches!(decoded.msg, Some(Msg::Heartbeat(_))));
-        assert!(!matches!(decoded.msg, Some(Msg::AuthRequest(_))));
-        assert!(!matches!(decoded.msg, Some(Msg::AuthOk(_))));
-        assert!(!matches!(decoded.msg, Some(Msg::AuthDenied(_))));
-        assert!(!matches!(decoded.msg, Some(Msg::Disconnect(_))));
-    }
-
-    #[test]
-    fn test_auth_request_multibyte_password_roundtrip_preserves_value() {
-        let msg = ControlMessage {
-            msg: Some(Msg::AuthRequest(AuthRequest {
-                username: "bob".to_string(),
-                password: "密码".to_string(),
-            })),
-        };
-        assert_eq!(roundtrip(&msg), msg);
     }
 
     #[test]
@@ -275,123 +217,6 @@ mod tests {
     #[test]
     fn test_max_frame_length_equals_64kib() {
         assert_eq!(MAX_FRAME_LENGTH, 65_536);
-    }
-
-    #[test]
-    fn test_authenticate_when_valid_credentials_returns_allocated_ip_and_decrements() {
-        let store = alice_store();
-        let mut pool = net24();
-        let before = pool.available_count();
-        let req = AuthRequest {
-            username: "alice".to_string(),
-            password: "s3cret".to_string(),
-        };
-        let result = auth_with_pool(&store, &mut pool, &req);
-        assert_eq!(result, Ok(Ipv4Addr::new(10, 0, 0, 2)));
-        assert_eq!(pool.available_count(), before - 1);
-    }
-
-    #[test]
-    fn test_authenticate_when_wrong_password_returns_auth_error_and_pool_unchanged() {
-        let store = alice_store();
-        let mut pool = net24();
-        let before = pool.available_count();
-        let req = AuthRequest {
-            username: "alice".to_string(),
-            password: "wrong".to_string(),
-        };
-        let result = auth_with_pool(&store, &mut pool, &req);
-        assert_eq!(
-            result,
-            Err(ServerSideError::Auth(AuthError::InvalidCredentials))
-        );
-        assert_eq!(pool.available_count(), before);
-    }
-
-    #[test]
-    fn test_authenticate_when_unknown_user_returns_auth_error_and_pool_unchanged() {
-        let store = alice_store();
-        let mut pool = net24();
-        let before = pool.available_count();
-        let req = AuthRequest {
-            username: "eve".to_string(),
-            password: "anything".to_string(),
-        };
-        let result = auth_with_pool(&store, &mut pool, &req);
-        assert_eq!(
-            result,
-            Err(ServerSideError::Auth(AuthError::InvalidCredentials))
-        );
-        assert_eq!(pool.available_count(), before);
-    }
-
-    #[test]
-    fn test_authenticate_when_empty_username_returns_auth_error_and_pool_unchanged() {
-        let store = alice_store();
-        let mut pool = net24();
-        let before = pool.available_count();
-        let req = AuthRequest {
-            username: String::new(),
-            password: "s3cret".to_string(),
-        };
-        let result = auth_with_pool(&store, &mut pool, &req);
-        assert_eq!(
-            result,
-            Err(ServerSideError::Auth(AuthError::InvalidCredentials))
-        );
-        assert_eq!(pool.available_count(), before);
-    }
-
-    #[test]
-    fn test_authenticate_when_pool_exhausted_returns_pool_exhausted() {
-        let store = alice_store();
-        let mut pool = IpPool::new(Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 30)).unwrap();
-        pool.alloc().unwrap();
-        assert_eq!(pool.available_count(), 0);
-        let req = AuthRequest {
-            username: "alice".to_string(),
-            password: "s3cret".to_string(),
-        };
-        let result = auth_with_pool(&store, &mut pool, &req);
-        assert_eq!(result, Err(ServerSideError::PoolExhausted));
-    }
-
-    fn exhausted_pool() -> IpPool {
-        let mut pool = IpPool::new(Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 30)).unwrap();
-        pool.alloc().unwrap();
-        pool
-    }
-
-    #[test]
-    fn test_authenticate_wrong_password_maps_to_auth_failed_deny_reason() {
-        let store = alice_store();
-        let mut pool = exhausted_pool();
-        let auth_err = auth_with_pool(
-            &store,
-            &mut pool,
-            &AuthRequest {
-                username: "alice".to_string(),
-                password: "wrong".to_string(),
-            },
-        )
-        .unwrap_err();
-        assert_eq!(deny_reason_from(&auth_err), DenyReason::AuthFailed);
-    }
-
-    #[test]
-    fn test_authenticate_pool_exhausted_maps_to_server_busy_deny_reason() {
-        let store = alice_store();
-        let mut pool = exhausted_pool();
-        let pool_err = auth_with_pool(
-            &store,
-            &mut pool,
-            &AuthRequest {
-                username: "alice".to_string(),
-                password: "s3cret".to_string(),
-            },
-        )
-        .unwrap_err();
-        assert_eq!(deny_reason_from(&pool_err), DenyReason::ServerBusy);
     }
 
     #[test]

@@ -87,29 +87,29 @@
 - **WHEN** 配置中 `tun_subnet = "10.0.0.0/33"`（解析为 Ipv4Net 失败）
 - **THEN** 返回 `Err(ConfigError::Parse(_))`
 
-### Requirement: 用户列表语义校验
+### Requirement: 服务端配置构造 Authenticator
 
-系统 SHALL 校验 `users` 列表：每个 `username` SHALL 非空；`username` SHALL 在列表内唯一；`password_hash` SHALL 是合法 argon2 PHC 格式串。任一不满足 SHALL 返回对应的 `ConfigError` 变体（`EmptyUsername` / `DuplicateUser` / `InvalidHash`）。校验 SHALL 复用 `auth::UserStore::from_users` 的判定，保证配置层与认证层的接受标准一致。
+系统 SHALL 在 `ServerConfig::from_raw` 中构造 `PasswordAuthenticator`（内部封装 `UserStore::from_users(user_pairs)` 的校验逻辑），而非直接暴露 `UserStore`。`ServerConfig` 的 `users: Vec<UserConfig>` 字段 SHALL 保持不变（`UserConfig{username, password_hash}`）。构造 `PasswordAuthenticator` 时 SHALL 复用 `UserStore::from_users` 的所有校验规则（空用户名 `EmptyUsername`、重复用户名 `DuplicateUser`、畸形哈希 `InvalidHash`），`ConfigError` 映射 SHALL 不变。`PasswordAuthenticator` 的 `supported_methods` SHALL 为 `[PASSWORD]`。当 `UserStore::from_users` 返回 `Ok` 时，系统 SHALL 将其包装为 `PasswordAuthenticator`；返回 `Err` 时 SHALL 映射为对应的 `ConfigError`（与改造前一致）。
 
-#### Scenario: 合法单用户通过校验
+#### Scenario: 合法配置构造 PasswordAuthenticator
 
-- **WHEN** 配置含一个 `username="alice"` 与合法 PHC `password_hash` 的 `[[users]]`
-- **THEN** `ServerConfig::load` 返回 `Ok`
+- **WHEN** 用含一个合法用户（合法 argon2 哈希）的配置文件加载 `ServerConfig`
+- **THEN** 构造成功，内部 `PasswordAuthenticator` 可认证该用户
 
-#### Scenario: 空用户名返回 EmptyUsername
+#### Scenario: 空用户名构造返回 EmptyUsername
 
-- **WHEN** 配置含一个 `username=""` 的 `[[users]]`
-- **THEN** 返回 `Err(ConfigError::EmptyUsername)`
+- **WHEN** 配置含 `username = ""` 的用户
+- **THEN** `ServerConfig::load` 返回 `Err(ConfigError::EmptyUsername)`（与改造前一致）
 
-#### Scenario: 重复用户名返回 DuplicateUser
+#### Scenario: 重复用户名构造返回 DuplicateUser
 
-- **WHEN** 配置含两个 `[[users]]` 均为 `username="alice"`
-- **THEN** 返回 `Err(ConfigError::DuplicateUser("alice"))`
+- **WHEN** 配置含两条同名用户
+- **THEN** `ServerConfig::load` 返回 `Err(ConfigError::DuplicateUser(name))`（与改造前一致）
 
-#### Scenario: 非法 PHC 串返回 InvalidHash
+#### Scenario: 畸形哈希构造返回 InvalidHash
 
-- **WHEN** 配置含一个 `password_hash="not-a-valid-hash"`
-- **THEN** 返回 `Err(ConfigError::InvalidHash)`
+- **WHEN** 配置含非法 PHC 哈希串
+- **THEN** `ServerConfig::load` 返回 `Err(ConfigError::InvalidHash)`（与改造前一致）
 
 ### Requirement: ConfigError 错误分层与可区分
 

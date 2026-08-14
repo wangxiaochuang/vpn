@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use self::conn::build_net_profile;
 use self::downlink::DownlinkDaemon;
-use crate::auth::UserStore;
+use crate::auth::{PasswordAuthenticator, UserStore};
 use crate::config::ServerConfig;
 use crate::ledger::ConnectionLedger;
 use crate::telemetry::TelemetryPlane;
@@ -181,8 +181,12 @@ fn build_auth_store(config: &ServerConfig) -> anyhow::Result<Arc<AuthStore>> {
         .iter()
         .map(|u| (u.username.clone(), u.password_hash.clone()))
         .collect();
-    let users = UserStore::from_users(user_pairs)?;
-    Ok(Arc::new(AuthStore { users }))
+    let store = UserStore::from_users(user_pairs)?;
+    let authenticator = PasswordAuthenticator::new(store);
+    Ok(Arc::new(AuthStore {
+        authenticator: Arc::new(authenticator),
+        supported_methods: vec![vpn_core::vpn::AuthMethod::Password],
+    }))
 }
 
 fn build_ledger(subnet: Ipv4Net) -> anyhow::Result<Arc<ConnectionLedger<ConnectionHandle>>> {

@@ -6,7 +6,7 @@
 ## Requirements
 ### Requirement: 服务端从 ServerConfig 启动运行时
 
-系统 SHALL 提供 `server::run(config: ServerConfig) -> anyhow::Result<()>` 作为服务端运行入口（async）。`run` SHALL 完成：(1) 加载 cert/key PEM 构造 `rustls::ServerConfig`（无客户端认证，单证书）；(2) 包装为 `quinn::ServerConfig` 与 `quinn::Endpoint::server(...)` 监听 `config.listen`；(3) 创建 TUN 设备，IP 为 `config.tun_subnet` 的网关地址（池首地址，即 `.network()` 的下一跳 `.1`），MTU 为 `config.mtu`；(4) **构造五个独立 `Arc<T>`：`BootParams { config }`、`AuthStore { users }`、`ConnectionLedger { pool, registry }`、`TelemetryPlane { sinks }`、以及局部持有的 `Tun(Arc<AsyncDevice>)` 数据面资源**；`ServerState` 这个聚合 struct SHALL 被删除，SHALL NOT 再出现于 `vpn/src/server.rs` 或测试代码；(5) spawn 全局下行泵 task（持有 `Tun` clone 与 `Arc<ConnectionLedger>`）；(6) 进入 accept loop，每个接受的连接 spawn `ConnectionSupervisor`，按需持有 `Arc<ConnectionLedger>` + `Arc<TelemetryPlane>` + `Arc<AuthStore>` + 必要的 `BootParams` 字段。`run` SHALL 在 endpoint 绑定失败或 TUN 创建失败时立即返回 `Err`。
+系统 SHALL 提供 `server::run(config: ServerConfig) -> anyhow::Result<()>` 作为服务端运行入口（async）。`run` SHALL 完成：(1) 加载 cert/key PEM 构造 `rustls::ServerConfig`（无客户端认证，单证书）；(2) 包装为 `quinn::ServerConfig` 与 `quinn::Endpoint::server(...)` 监听 `config.listen`；(3) 创建 TUN 设备，IP 为 `config.tun_subnet` 的网关地址（池首地址，即 `.network()` 的下一跳 `.1`），MTU 为 `config.mtu`；(4) **构造五个独立 `Arc<T>`：`BootParams { config }`、`AuthStore { authenticator, supported_methods }`、`ConnectionLedger { pool, registry }`、`TelemetryPlane { sinks }`、以及局部持有的 `Tun(Arc<AsyncDevice>)` 数据面资源**；`ServerState` 这个聚合 struct SHALL 被删除，SHALL NOT 再出现于 `vpn/src/server.rs` 或测试代码；(5) spawn 全局下行泵 task（持有 `Tun` clone 与 `Arc<ConnectionLedger>`）；(6) 进入 accept loop，每个接受的连接 spawn `ConnectionSupervisor`，按需持有 `Arc<ConnectionLedger>` + `Arc<TelemetryPlane>` + `Arc<AuthStore>` + 必要的 `BootParams` 字段。`run` SHALL 在 endpoint 绑定失败或 TUN 创建失败时立即返回 `Err`。
 
 #### Scenario: 合法配置启动后 accept loop 接受连接
 
@@ -25,11 +25,11 @@
 
 ### Requirement: 共享状态以 std::sync::Mutex 细粒度锁保护
 
-系统 SHALL 用 `std::sync::Mutex`（非 `tokio::sync::Mutex`）保护 `ConnectionLedger` 内部的 `IpPool` 与 `SessionRegistry`（共享一把锁），且任何 `Mutex` 临界区 SHALL NOT 包含 `.await` 点（cancel-safety 要求）。`UserStore` SHALL 不加锁（只读共享，封装在 `AuthStore` 内）。任一连接的认证、分配、注册操作 SHALL 持锁总时长不超过微秒级（HashMap 查 / 增删或位图翻转），且 SHALL NOT 与 argon2 校验（在锁外完成）嵌套。
+系统 SHALL 用 `std::sync::Mutex`（非 `tokio::sync::Mutex`）保护 `ConnectionLedger` 内部的 `IpPool` 与 `SessionRegistry`（共享一把锁），且任何 `Mutex` 临界区 SHALL NOT 包含 `.await` 点（cancel-safety 要求）。`Authenticator` SHALL 不加锁（只读共享，封装在 `AuthStore` 内）。任一连接的认证、分配、注册操作 SHALL 持锁总时长不超过微秒级（HashMap 查 / 增删或位图翻转），且 SHALL NOT 与 argon2 校验（在锁外完成）嵌套。
 
 #### Scenario: 多连接并发认证不串行阻塞
 
-- **WHEN** 两个客户端并发发起连接并发送 AuthRequest（不同 username），服务端单线程 runtime
+- **WHEN** 两个客户端并发发起连接并发送 AuthInit（不同 username），服务端单线程 runtime
 - **THEN** 两个连接的认证（含 argon2 计算）总耗时接近两倍单次认证，而非线性叠加超过 5 倍（即 argon2 期间不持任何共享锁）
 
 #### Scenario: 锁临界区不含 await
@@ -37,43 +37,63 @@
 - **WHEN** 静态检查 `vpn/src/ledger.rs` 中 `Mutex` 的所有 guard（`MutexGuard`）生命周期
 - **THEN** 每个锁的 guard 生命周期内不存在 `.await` 表达式
 
-### Requirement: handle_conn 认证成功路径下发完整配置
+### Requirement: handle_conn 认证路径采用 challenge-response loop 并在认证完全完成后分配 IP
 
-系统 SHALL 为每个接受的连接执行：通过 `session.accept_stream::<ControlMessage>()` 接受控制 stream；**接受 stream 后立即通过控制 stream 发送 `ServerHello{ protocol_version: ctrl::PROTOCOL_VERSION }`，不等待客户端任何消息**；随后用 `channel.recv_timeout(AUTH_REQUEST_TIMEOUT)` 解码读取客户端发来的首个 `ControlMessage`（`AUTH_REQUEST_TIMEOUT` SHALL 为 60 秒，超时 SHALL 视为协议错误关闭连接）；若客户端首条消息为 `AuthRequest`，SHALL 调用 `ctrl::authenticate(&users, req, || ledger.alloc())`。成功时 SHALL 构造 `ConnectionHandle`，调用 `ledger.register(&username, ip, handle)`（拿 `Option<Evicted>`，处理同名顶替），随后 SHALL 通过控制 stream 发送 `AuthOk{ assigned_ip, subnet, gateway, mtu, routes }`。`AuthOk` 的字段 SHALL 与客户端用于配置 TUN 的参数一致。
+系统 SHALL 为每个接受的连接执行：通过 `session.accept_stream::<ControlMessage>()` 接受控制 stream；**接受 stream 后立即通过控制 stream 发送 `ServerHello{ protocol_version: ctrl::PROTOCOL_VERSION, supported_methods }`**，其中 `supported_methods` 由 `AuthStore` 携带；随后用 `channel.recv_timeout(AUTH_REQUEST_TIMEOUT)` 解码读取客户端发来的首个 `ControlMessage`（`AUTH_REQUEST_TIMEOUT` SHALL 为 60 秒，超时 SHALL 视为协议错误关闭连接）；若客户端首条消息为 `AuthInit`，SHALL 调用 `authenticator.begin(init)` 进入认证 loop。认证 loop 的每次迭代 SHALL 根据 `AuthOutcome` 执行：`Completed(identity)` → 调用 `ledger.alloc()` 分配 IP（**仅在认证完全通过后**），构造 `ConnectionHandle`，调用 `ledger.register`，发送 `AuthOk{ assigned_ip, subnet, gateway, mtu, routes }`，退出 loop；`Denied(err)` → 发送 `AuthDenied{ deny_reason_from(&err) }`，关闭连接，退出 loop；`Challenge(handler)` → 发送 `handler.describe()` 构造的 `AuthChallenge`，接收客户端的 `AuthResponse`，调用 `handler.respond(response)` 得到新 `AuthOutcome`，继续 loop。**认证未达到 `Completed` 前 SHALL NOT 调用 `ledger.alloc()`，SHALL NOT 分配 IP。** 客户端首条消息非 `AuthInit` 时 SHALL 视为协议错误关闭连接。纯密码认证时 `begin` 直接返回 `Completed`，loop 第一轮即退出，行为与改造前一致。
 
-#### Scenario: 服务端在控制 stream 上首先发送 ServerHello
+#### Scenario: 服务端在控制 stream 上首先发送 ServerHello（含 supported_methods）
 
-- **WHEN** 客户端连接并打开控制 stream，服务端 `handle_conn` 进入 `try_authenticate`
-- **THEN** 服务端在控制 stream 上发送的第一条消息为 `ServerHello{ protocol_version: 1 }`，且该发送发生在服务端读取任何客户端消息之前
+- **WHEN** 客户端连接并打开控制 stream，服务端进入 `try_authenticate`
+- **THEN** 服务端在控制 stream 上发送的第一条消息为 `ServerHello{ protocol_version: 1, supported_methods: [PASSWORD] }`，且该发送发生在服务端读取任何客户端消息之前
 
-#### Scenario: 合法凭证认证成功并收到 AuthOk
+#### Scenario: 纯密码认证零挑战直接 AuthOk
 
-- **WHEN** 客户端连接后收到 ServerHello，随后发送 `AuthRequest{ username: "alice", password: "s3cret" }`，服务端配置含 alice 的正确 argon2 哈希，池有空闲
-- **THEN** 客户端在控制 stream 上收到 `AuthOk`，其 `assigned_ip` 为池中首个可分配地址（如 `10.0.0.2`），`subnet` 为配置的 `tun_subnet` 字符串，`gateway` 为该 subnet 的 `.1`，`mtu` 为配置值
+- **WHEN** 客户端发送 `AuthInit{username:"alice", PasswordAuth{password:"s3cret"}}`，服务端配置含 alice 的正确 argon2 哈希，池有空闲
+- **THEN** `PasswordAuthenticator::begin` 返回 `Completed`，服务端在 loop 第一轮分配 IP 并回 `AuthOk`，不发送任何 `AuthChallenge`
 
-#### Scenario: 客户端首条消息非 AuthRequest 关闭连接
+#### Scenario: 错误凭证收到 AuthDenied
 
-- **WHEN** 服务端发送 ServerHello 后，客户端发来的首条控制消息为 `Heartbeat` 而非 `AuthRequest`
-- **THEN** 服务端关闭连接（不发 AuthOk、不发 AuthDenied，连接终止），客户端 stream 读收到 EOF 或连接关闭
-
-#### Scenario: 认证阶段超时未收到 AuthRequest 关闭连接
-
-- **WHEN** 服务端发送 ServerHello 后，客户端在 `AUTH_REQUEST_TIMEOUT`（60 秒）内未发送任何控制消息（如用户未输入完密码）
-- **THEN** 服务端按超时处理关闭连接，不进入认证路径，不分配 IP
-
-### Requirement: handle_conn 认证失败路径下发 AuthDenied 并关闭
-
-当 `authenticate` 返回 `Err(ServerSideError)`，系统 SHALL 通过控制 stream 发送 `AuthDenied{ reason: ctrl::deny_reason_from(&err) }`，随后 SHALL 关闭该 QUIC 连接（`conn.close(...)`）。`Auth` 错误 SHALL 映射为 `DenyReason::AuthFailed`；`PoolExhausted` SHALL 映射为 `DenyReason::ServerBusy`。失败路径 SHALL NOT 调用 `registry.insert`，SHALL NOT 启动 per-conn task。
-
-#### Scenario: 错误凭证收到 AuthFailed
-
-- **WHEN** 客户端发送 `AuthRequest{ username: "alice", password: "wrong" }`，服务端配置含 alice 的正确哈希
-- **THEN** 客户端收到 `AuthDenied{ reason: AUTH_FAILED }`，随后连接被关闭
+- **WHEN** 客户端发送 `AuthInit{username:"alice", PasswordAuth{password:"wrong"}}`
+- **THEN** `begin` 返回 `Denied(AuthError::InvalidCredentials)`，服务端发送 `AuthDenied{AUTH_FAILED}` 并关闭连接
 
 #### Scenario: 池耗尽收到 ServerBusy
 
-- **WHEN** 客户端发送合法凭证，但服务端 `IpPool` 已无空闲地址
-- **THEN** 客户端收到 `AuthDenied{ reason: SERVER_BUSY }`，随后连接被关闭
+- **WHEN** 客户端发送合法凭证且 `begin` 返回 `Completed`，但 `ledger.alloc()` 返回池耗尽
+- **THEN** 服务端发送 `AuthDenied{SERVER_BUSY}` 并关闭连接
+
+#### Scenario: 多步认证 challenge-response loop
+
+- **WHEN** `begin` 返回 `Challenge(handler)`，服务端发送 `handler.describe()` 构造的 `AuthChallenge`，客户端回 `AuthResponse`，`handler.respond(response)` 返回 `Completed`
+- **THEN** 服务端在 `Completed` 后分配 IP 并发送 `AuthOk`
+
+#### Scenario: 认证未完成前不碰 IP 池
+
+- **WHEN** `begin` 返回 `Challenge`（密码正确但还需 TOTP），或 `Denied`
+- **THEN** `ledger.alloc()` 未被调用，IP 池可用计数不变
+
+#### Scenario: 客户端首条消息非 AuthInit 关闭连接
+
+- **WHEN** 服务端发送 ServerHello 后，客户端发来的首条控制消息为 `Heartbeat` 而非 `AuthInit`
+- **THEN** 服务端关闭连接（不发 AuthOk、不发 AuthDenied，连接终止）
+
+#### Scenario: 认证阶段超时未收到 AuthInit 关闭连接
+
+- **WHEN** 服务端发送 ServerHello 后，客户端在 `AUTH_REQUEST_TIMEOUT`（60 秒）内未发送任何控制消息
+- **THEN** 服务端按超时处理关闭连接，不进入认证路径，不分配 IP
+
+### Requirement: AuthStore 持有 Authenticator trait object
+
+系统 SHALL 将 `AuthStore` 从持有 `UserStore` 改为持有 `Arc<dyn Authenticator>` 与 `supported_methods: Vec<AuthMethod>`。`AuthStore` 在 `VpnServer::boot` 时由 `ServerConfig` 构造，作为只读共享 `Arc<AuthStore>` 注入 `AcceptLoop`。`supported_methods` SHALL 从 `Authenticator` 的能力派生（`PasswordAuthenticator` → `[PASSWORD]`），用于填充 `ServerHello`。`AuthStore` SHALL NOT 持有 `IpPool` 或 `SessionRegistry`——那些在 `ConnectionLedger` 中。
+
+#### Scenario: AuthStore 持有 PasswordAuthenticator
+
+- **WHEN** `VpnServer::boot` 从含 `[[users]]` 的 `ServerConfig` 构造 `AuthStore`
+- **THEN** `AuthStore.authenticator` 为 `PasswordAuthenticator` 实例，`supported_methods` 为 `[PASSWORD]`
+
+#### Scenario: ServerHello 的 supported_methods 由 AuthStore 派生
+
+- **WHEN** 握手层构造 `ServerHello`
+- **THEN** `supported_methods` 从 `AuthStore.supported_methods` 取值
 
 ### Requirement: 同名新连接顶替旧连接
 

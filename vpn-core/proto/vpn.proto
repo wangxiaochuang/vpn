@@ -5,7 +5,9 @@ package vpn;
 message ControlMessage {
   oneof msg {
     ServerHello server_hello = 6;
-    AuthRequest auth_request = 1;
+    AuthInit auth_init = 1;
+    AuthChallenge auth_challenge = 7;
+    AuthResponse auth_response = 8;
     AuthOk auth_ok = 2;
     AuthDenied auth_denied = 3;
     Heartbeat heartbeat = 4;
@@ -15,11 +17,38 @@ message ControlMessage {
 
 message ServerHello {
   uint32 protocol_version = 1;
+  repeated AuthMethod supported_methods = 2;
 }
 
-message AuthRequest {
+message AuthInit {
   string username = 1;
-  string password = 2;
+  oneof method {
+    PasswordAuth password = 10;
+  }
+}
+
+message PasswordAuth {
+  string password = 1;
+}
+
+message AuthChallenge {
+  oneof challenge {
+    TotpChallenge totp = 1;
+  }
+}
+
+message TotpChallenge {
+  string prompt = 1;
+}
+
+message AuthResponse {
+  oneof response {
+    TotpResponse totp = 1;
+  }
+}
+
+message TotpResponse {
+  string code = 1;
 }
 
 message AuthOk {
@@ -37,6 +66,11 @@ message AuthDenied {
 enum DenyReason {
   AUTH_FAILED = 0;
   SERVER_BUSY = 1;
+}
+
+enum AuthMethod {
+  PASSWORD = 0;
+  TOTP = 1;
 }
 
 message Heartbeat {}

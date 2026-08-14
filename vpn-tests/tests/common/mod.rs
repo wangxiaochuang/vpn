@@ -13,7 +13,8 @@ use bytes::Bytes;
 use ipnet::Ipv4Net;
 use quic_link::PacketSink;
 use sysprobe::sink::TelemetrySink;
-use vpn_server::auth::UserStore;
+use vpn_core::vpn::AuthMethod;
+use vpn_server::auth::{PasswordAuthenticator, UserStore};
 use vpn_server::config::ServerConfig;
 use vpn_server::ledger::ConnectionLedger;
 use vpn_server::server::AuthStore;
@@ -82,8 +83,11 @@ pub fn net_profile(subnet: Ipv4Net, routes: Vec<Ipv4Net>) -> Arc<ClientNetProfil
 }
 
 pub fn auth_store(users: Vec<(String, String)>) -> Arc<AuthStore> {
+    let store = UserStore::from_users(users).unwrap();
+    let authenticator = PasswordAuthenticator::new(store);
     Arc::new(AuthStore {
-        users: UserStore::from_users(users).unwrap(),
+        authenticator: Arc::new(authenticator),
+        supported_methods: vec![AuthMethod::Password],
     })
 }
 
@@ -358,18 +362,21 @@ pub async fn send_open_signal(framed: &mut ClientFramed) {
 
 pub async fn send_auth_request(framed: &mut ClientFramed, username: &str, password: &str) {
     use futures::SinkExt;
+    use vpn_core::ctrl::auth_init::Method;
     use vpn_core::ctrl::control_message::Msg;
     send_open_signal(framed).await;
     recv_server_hello(framed).await;
     framed
         .send(vpn_core::ctrl::ControlMessage {
-            msg: Some(Msg::AuthRequest(vpn_core::ctrl::AuthRequest {
+            msg: Some(Msg::AuthInit(vpn_core::ctrl::AuthInit {
                 username: username.to_string(),
-                password: password.to_string(),
+                method: Some(Method::Password(vpn_core::ctrl::PasswordAuth {
+                    password: password.to_string(),
+                })),
             })),
         })
         .await
-        .expect("send auth request");
+        .expect("send auth init");
 }
 
 pub async fn recv_server_hello(framed: &mut ClientFramed) {

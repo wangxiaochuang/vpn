@@ -37,6 +37,10 @@ async fn test_server_hello_is_first_message_before_any_client_data() {
     match msg.msg {
         Some(Msg::ServerHello(h)) => {
             assert_eq!(h.protocol_version, PROTOCOL_VERSION);
+            assert_eq!(
+                h.supported_methods,
+                vec![vpn_server::ctrl::AuthMethod::Password as i32]
+            );
         }
         other => panic!("expected ServerHello, got {other:?}"),
     }
@@ -106,15 +110,18 @@ async fn test_server_hello_then_auth_request_succeeds() {
     assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
 
     use futures::SinkExt;
+    use vpn_server::ctrl::auth_init::Method;
     framed
         .send(ControlMessage {
-            msg: Some(Msg::AuthRequest(vpn_server::ctrl::AuthRequest {
+            msg: Some(Msg::AuthInit(vpn_server::ctrl::AuthInit {
                 username: "alice".to_string(),
-                password: common::ALICE_PASSWORD.to_string(),
+                method: Some(Method::Password(vpn_server::ctrl::PasswordAuth {
+                    password: common::ALICE_PASSWORD.to_string(),
+                })),
             })),
         })
         .await
-        .expect("send auth request");
+        .expect("send auth init");
     let msg = common::recv_control(&mut framed).await.expect("auth reply");
     match msg.msg {
         Some(Msg::AuthOk(ok)) => {

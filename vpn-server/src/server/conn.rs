@@ -2,13 +2,14 @@ use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use crate::auth::UserStore;
+use crate::auth::Authenticator;
 use crate::config::ServerConfig;
 use crate::ledger::ReservedIp;
 use crate::telemetry::TelemetryTxSlot;
 use crate::telemetry::make_telemetry_tx_slot;
 use ipnet::Ipv4Net;
 use vpn_core::tun_setup::gateway_addr;
+use vpn_core::vpn::AuthMethod;
 
 /// 每连接 supervisor 的退出原因（"遗言"契约）。纯枚举，不携带错误信息。
 ///
@@ -148,9 +149,9 @@ pub(super) fn build_net_profile(config: ServerConfig) -> Arc<ClientNetProfile> {
     })
 }
 
-/// 认证存储（只读共享）。
 pub struct AuthStore {
-    pub users: UserStore,
+    pub authenticator: Arc<dyn Authenticator>,
+    pub supported_methods: Vec<AuthMethod>,
 }
 
 #[cfg(test)]

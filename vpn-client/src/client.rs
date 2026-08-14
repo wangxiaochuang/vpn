@@ -6,6 +6,9 @@ use thiserror::Error;
 
 use crate::config::ClientConfig;
 use crate::config::MIN_MTU;
+use crate::credentials::CliCredentialCollector;
+use crate::credentials::CredentialCollector;
+use crate::credentials::StaticCredentialCollector;
 use crate::data::{PacketSink, PacketSource, Tun, forward};
 use crate::vpn::AuthOk;
 use crate::vpn::ControlMessage;
@@ -195,34 +198,10 @@ fn deny_reason_text(reason: i32) -> &'static str {
 
 pub async fn run(config: ClientConfig) -> anyhow::Result<()> {
     let sd = Shutdown::new(Shutdown::DEFAULT_DRAIN_TIMEOUT);
-    let ready = shutdown::spawn_signal_watchdog(sd.clone());
-    let _ = ready.await;
+    let _ = shutdown::spawn_signal_watchdog(sd.clone()).await;
     let pre = connect_and_recv_hello(&config).await?;
-    let username = read_username().await?;
-    let password = read_password().await?;
-    establish_and_run(pre, &username, password, sd).await
-}
-
-async fn read_username() -> anyhow::Result<String> {
-    let raw = tokio::task::spawn_blocking(|| rpassword::prompt_password("请输入用户名："))
-        .await
-        .context("username prompt task panicked")??;
-    validate_username(&raw)
-}
-
-fn validate_username(raw: &str) -> anyhow::Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("用户名不能为空");
-    }
-    Ok(trimmed.to_string())
-}
-
-async fn read_password() -> anyhow::Result<String> {
-    tokio::task::spawn_blocking(move || rpassword::prompt_password("请输入密码："))
-        .await
-        .context("password prompt task panicked")?
-        .map_err(Into::into)
+    let mut collector = CliCredentialCollector;
+    establish_and_run(pre, &mut collector, sd).await
 }
 
 pub async fn run_with_credentials(
@@ -232,16 +211,17 @@ pub async fn run_with_credentials(
     sd: Shutdown,
 ) -> anyhow::Result<()> {
     let pre = connect_and_recv_hello(&config).await?;
-    establish_and_run(pre, &username, password, sd).await
+    let mut collector = StaticCredentialCollector { username, password };
+    establish_and_run(pre, &mut collector, sd).await
 }
 
-async fn establish_and_run(
+async fn establish_and_run<C: CredentialCollector>(
     mut pre: PreAuthClient,
-    username: &str,
-    password: String,
+    collector: &mut C,
     sd: Shutdown,
 ) -> anyhow::Result<()> {
-    let params = authenticate(&mut pre.channel, username, password).await?;
+    let methods = pre.supported_methods.clone();
+    let params = authenticate(&mut pre.channel, &methods, collector).await?;
     let est = EstablishedClient {
         session: pre.session,
         channel: pre.channel,
@@ -249,26 +229,35 @@ async fn establish_and_run(
         endpoint: pre.endpoint,
     };
     let tun = setup_tun(&est.params)?;
-    log_client_authenticated(username, &est.params);
+    log_client_authenticated(&est.params);
     let plane = DataPlane::spawn(est.session.clone(), Tun(tun), est.channel, &sd);
     let cause = plane.run(sd).await;
     tracing::info!("client exited: {cause}");
     Ok(())
 }
 
-fn log_client_authenticated(username: &str, params: &ClientTunParams) {
+fn log_client_authenticated(params: &ClientTunParams) {
     tracing::info!(
-        "authenticated as {}, assigned_ip={}, subnet={}, mtu={}",
-        username,
+        "authenticated, assigned_ip={}, subnet={}, mtu={}",
         params.assigned_ip,
         params.subnet,
         params.mtu
     );
 }
 
+#[cfg(test)]
+fn validate_username(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("用户名不能为空");
+    }
+    Ok(trimmed.to_string())
+}
+
 pub struct PreAuthClient {
     pub session: Session,
     pub channel: Channel<ControlMessage>,
+    pub supported_methods: Vec<crate::vpn::AuthMethod>,
     endpoint: quic_link::Client,
 }
 
@@ -282,10 +271,11 @@ pub async fn connect_and_recv_hello(config: &ClientConfig) -> anyhow::Result<Pre
     tracing::info!("connected to {}", config.server);
     let mut channel = open_control_stream(&session).await?;
     send_open_signal(&mut channel).await?;
-    recv_and_validate_hello(&mut channel).await?;
+    let supported_methods = recv_and_validate_hello(&mut channel).await?;
     Ok(PreAuthClient {
         session,
         channel,
+        supported_methods,
         endpoint: client,
     })
 }
@@ -297,7 +287,9 @@ async fn send_open_signal(channel: &mut Channel<ControlMessage>) -> anyhow::Resu
         .context("failed to open control stream on peer")
 }
 
-async fn recv_and_validate_hello(channel: &mut Channel<ControlMessage>) -> Result<(), ClientError> {
+async fn recv_and_validate_hello(
+    channel: &mut Channel<ControlMessage>,
+) -> Result<Vec<crate::vpn::AuthMethod>, ClientError> {
     let first = channel
         .recv()
         .await
@@ -308,12 +300,18 @@ async fn recv_and_validate_hello(channel: &mut Channel<ControlMessage>) -> Resul
             if h.protocol_version != crate::ctrl::PROTOCOL_VERSION {
                 return Err(ClientError::IncompatibleVersion(h.protocol_version));
             }
-            Ok(())
+            Ok(parse_supported_methods(&h.supported_methods))
         }
         _ => Err(ClientError::Protocol(
             "expected ServerHello as first control message".into(),
         )),
     }
+}
+
+fn parse_supported_methods(raw: &[i32]) -> Vec<crate::vpn::AuthMethod> {
+    raw.iter()
+        .filter_map(|&i| crate::vpn::AuthMethod::try_from(i).ok())
+        .collect()
 }
 
 async fn open_control_stream(session: &Session) -> anyhow::Result<Channel<ControlMessage>> {
@@ -323,48 +321,77 @@ async fn open_control_stream(session: &Session) -> anyhow::Result<Channel<Contro
         .context("failed to open control stream")
 }
 
-async fn authenticate(
+async fn authenticate<C: CredentialCollector>(
     channel: &mut Channel<ControlMessage>,
-    username: &str,
-    password: String,
+    methods: &[crate::vpn::AuthMethod],
+    collector: &mut C,
 ) -> anyhow::Result<ClientTunParams> {
-    send_auth_request(channel, username, password).await?;
-    let first = channel
-        .recv()
-        .await
-        .map_err(|e| anyhow!("failed to decode first response: {e}"))?
-        .ok_or_else(|| anyhow!("control stream closed before AuthOk"))?;
-    interpret_auth_response(first)
+    let init = collector.collect_init(methods).await;
+    send_auth_init(channel, init).await?;
+    loop {
+        let msg = channel
+            .recv()
+            .await
+            .map_err(|e| anyhow!("failed to receive auth response: {e}"))?
+            .ok_or_else(|| anyhow!("control stream closed during auth"))?;
+        match handle_auth_msg(channel, msg, collector).await? {
+            AuthLoopExit::Ok(params) => return Ok(params),
+            AuthLoopExit::Continue => {}
+        }
+    }
 }
 
-async fn send_auth_request(
+enum AuthLoopExit {
+    Ok(ClientTunParams),
+    Continue,
+}
+
+async fn handle_auth_msg<C: CredentialCollector>(
     channel: &mut Channel<ControlMessage>,
-    username: &str,
-    password: String,
-) -> anyhow::Result<()> {
-    channel
-        .send(ControlMessage {
-            msg: Some(Msg::AuthRequest(crate::vpn::AuthRequest {
-                username: username.to_string(),
-                password,
-            })),
-        })
-        .await
-        .context("failed to send AuthRequest")
-}
-
-fn interpret_auth_response(first: ControlMessage) -> anyhow::Result<ClientTunParams> {
-    match first.msg {
-        Some(Msg::AuthOk(ok)) => parse_auth_ok(&ok).map_err(Into::into),
-        Some(Msg::AuthDenied(denied)) => {
-            let reason = deny_reason_text(denied.reason);
+    msg: ControlMessage,
+    collector: &mut C,
+) -> anyhow::Result<AuthLoopExit> {
+    match msg.msg {
+        Some(Msg::AuthOk(ok)) => {
+            let params = parse_auth_ok(&ok)?;
+            Ok(AuthLoopExit::Ok(params))
+        }
+        Some(Msg::AuthDenied(d)) => {
+            let reason = deny_reason_text(d.reason);
             tracing::error!("{reason}");
             Err(ClientError::AuthDenied(reason.to_string()).into())
         }
-        _ => Err(
-            ClientError::Protocol("expected AuthOk but got an unexpected message".into()).into(),
-        ),
+        Some(Msg::AuthChallenge(challenge)) => {
+            let response = collector.collect_response(&challenge).await;
+            send_auth_response(channel, response).await?;
+            Ok(AuthLoopExit::Continue)
+        }
+        _ => Err(ClientError::Protocol("unexpected message during auth loop".into()).into()),
     }
+}
+
+async fn send_auth_init(
+    channel: &mut Channel<ControlMessage>,
+    init: crate::vpn::AuthInit,
+) -> anyhow::Result<()> {
+    channel
+        .send(ControlMessage {
+            msg: Some(Msg::AuthInit(init)),
+        })
+        .await
+        .context("failed to send AuthInit")
+}
+
+async fn send_auth_response(
+    channel: &mut Channel<ControlMessage>,
+    response: crate::vpn::AuthResponse,
+) -> anyhow::Result<()> {
+    channel
+        .send(ControlMessage {
+            msg: Some(Msg::AuthResponse(response)),
+        })
+        .await
+        .context("failed to send AuthResponse")
 }
 
 fn setup_tun(params: &ClientTunParams) -> anyhow::Result<std::sync::Arc<tun_rs::AsyncDevice>> {

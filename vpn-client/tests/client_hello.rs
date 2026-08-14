@@ -27,6 +27,16 @@ fn client_config(addr: std::net::SocketAddr) -> ClientConfig {
     }
 }
 
+fn server_hello(version: u32) -> ControlMessage {
+    use vpn_client::vpn::AuthMethod;
+    ControlMessage {
+        msg: Some(Msg::ServerHello(ServerHello {
+            protocol_version: version,
+            supported_methods: vec![AuthMethod::Password as i32],
+        })),
+    }
+}
+
 async fn mock_server(first: ControlMessage) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let server = quic_link::Server::builder()
         .tls_from_files(repo("cert.pem"), repo("key.pem"))
@@ -55,11 +65,7 @@ fn mismatch_config(addr: std::net::SocketAddr) -> ClientConfig {
 
 #[tokio::test]
 async fn test_connect_and_recv_hello_when_connection_fails_returns_err() {
-    let good = ControlMessage {
-        msg: Some(Msg::ServerHello(ServerHello {
-            protocol_version: vpn_client::ctrl::PROTOCOL_VERSION,
-        })),
-    };
+    let good = server_hello(vpn_client::ctrl::PROTOCOL_VERSION);
     let (addr, _guard) = mock_server(good).await;
     let err = tokio::time::timeout(
         Duration::from_secs(5),
@@ -75,11 +81,7 @@ async fn test_connect_and_recv_hello_when_connection_fails_returns_err() {
 
 #[tokio::test]
 async fn test_connect_and_recv_hello_when_version_mismatch_returns_incompatible() {
-    let bad = ControlMessage {
-        msg: Some(Msg::ServerHello(ServerHello {
-            protocol_version: 99,
-        })),
-    };
+    let bad = server_hello(99);
     let (addr, _guard) = mock_server(bad).await;
     let err = match connect_and_recv_hello(&client_config(addr)).await {
         Ok(_) => panic!("version mismatch must fail"),
@@ -118,11 +120,7 @@ async fn test_connect_and_recv_hello_when_first_not_server_hello_returns_protoco
 
 #[tokio::test]
 async fn test_connect_and_recv_hello_when_valid_server_hello_returns_ok() {
-    let good = ControlMessage {
-        msg: Some(Msg::ServerHello(ServerHello {
-            protocol_version: vpn_client::ctrl::PROTOCOL_VERSION,
-        })),
-    };
+    let good = server_hello(vpn_client::ctrl::PROTOCOL_VERSION);
     let (addr, _guard) = mock_server(good).await;
     let pre = tokio::time::timeout(
         Duration::from_secs(5),

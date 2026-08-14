@@ -11,11 +11,14 @@ mod tests {
     use crate::vpn::control_message::Msg;
     use tokio_util::codec::{Decoder, Encoder};
 
-    fn auth_request() -> ControlMessage {
+    fn auth_init() -> ControlMessage {
+        use crate::vpn::auth_init::Method;
         ControlMessage {
-            msg: Some(Msg::AuthRequest(crate::vpn::AuthRequest {
+            msg: Some(Msg::AuthInit(crate::vpn::AuthInit {
                 username: "alice".to_string(),
-                password: "s3cret".to_string(),
+                method: Some(Method::Password(crate::vpn::PasswordAuth {
+                    password: "s3cret".to_string(),
+                })),
             })),
         }
     }
@@ -58,7 +61,7 @@ mod tests {
     fn test_control_branches_roundtrip_preserve_fields() {
         let mut codec = ControlCodec::new();
         for msg in [
-            auth_request(),
+            auth_init(),
             auth_ok(),
             auth_denied(),
             heartbeat(),

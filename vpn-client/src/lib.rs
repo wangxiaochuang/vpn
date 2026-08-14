@@ -17,6 +17,7 @@
 
 pub mod client;
 pub mod config;
+pub mod credentials;
 pub mod route;
 pub mod telemetry;
 

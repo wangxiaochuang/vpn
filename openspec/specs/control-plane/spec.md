@@ -8,26 +8,31 @@
 
 ### Requirement: 顶层消息 envelope 支持全部控制面消息且编解码保真
 
-系统 SHALL 定义一个顶层 `ControlMessage`，其 `msg` 字段为 `oneof`，容纳 `server_hello` / `auth_request` / `auth_ok` / `auth_denied` / `heartbeat` / `disconnect` 六种分支。系统 SHALL 保证任意一个合法分支实例经 protobuf 编码后再解码，得到与原值逐字段相等的结果。
+系统 SHALL 定义一个顶层 `ControlMessage`，其 `msg` 字段为 `oneof`，容纳 `server_hello` / `auth_init` / `auth_ok` / `auth_denied` / `auth_challenge` / `auth_response` / `heartbeat` / `disconnect` 八种分支。系统 SHALL 保证任意一个合法分支实例经 protobuf 编码后再解码，得到与原值逐字段相等的结果。`auth_request` 分支 SHALL 被移除。
 
 #### Scenario: 各分支 round-trip 保真
 
-- **WHEN** 分别构造 `ControlMessage` 的六种分支实例（含 `ServerHello`），逐一执行 encode 后 decode
+- **WHEN** 分别构造 `ControlMessage` 的八种分支实例（含 `auth_init`、`auth_challenge`、`auth_response`），逐一执行 encode 后 decode
 - **THEN** 解码结果与原实例逐字段相等（oneof 分支标签与载荷均一致）
 
 #### Scenario: oneof 互斥语义保持
 
-- **WHEN** 构造一个 `ControlMessage` 并在 encode 前设置其 `msg` 为 `server_hello` 分支
-- **THEN** decode 后 `msg` 恰为 `server_hello` 分支，不出现其他分支同时被设置的情况
+- **WHEN** 构造一个 `ControlMessage` 并在 encode 前设置其 `msg` 为 `auth_init` 分支
+- **THEN** decode 后 `msg` 恰为 `auth_init` 分支，不出现其他分支同时被设置的情况
 
-### Requirement: ServerHello 消息声明服务端协议版本
+### Requirement: ServerHello 消息声明服务端协议版本与支持的认证方式
 
-系统 SHALL 用 `ServerHello` 表达服务端在认证前对客户端的协议声明，其字段 `protocol_version: uint32` 承载服务端支持的协议版本号。系统 SHALL 定义常量 `PROTOCOL_VERSION: u32 = 1`（置于 `vpn-core/src/ctrl.rs`），客户端与服务端均引用此常量。`ServerHello` 编解码保真。
+系统 SHALL 用 `ServerHello` 表达服务端在认证前对客户端的协议声明，其字段 `protocol_version: uint32` 承载服务端支持的协议版本号，`supported_methods: repeated AuthMethod` 承载服务端支持的认证方式列表。系统 SHALL 定义常量 `PROTOCOL_VERSION: u32 = 1`（置于 `vpn-core/src/ctrl.rs`），客户端与服务端均引用此常量。`ServerHello` 编解码保真。
 
-#### Scenario: ServerHello round-trip 保真
+#### Scenario: ServerHello round-trip 保真（含 supported_methods）
 
-- **WHEN** 构造 `ServerHello{ protocol_version: 1 }` 并 encode 后 decode
-- **THEN** 解码结果 `protocol_version` 等于 `1`
+- **WHEN** 构造 `ServerHello{ protocol_version: 1, supported_methods: [PASSWORD] }` 并 encode 后 decode
+- **THEN** 解码结果 `protocol_version` 等于 `1`，`supported_methods` 等于 `[PASSWORD]`
+
+#### Scenario: ServerHello 空 supported_methods round-trip 保真
+
+- **WHEN** 构造 `ServerHello{ protocol_version: 1, supported_methods: [] }` 并 encode 后 decode
+- **THEN** 解码结果 `supported_methods` 为空列表
 
 #### Scenario: PROTOCOL_VERSION 常量值为 1
 
@@ -48,19 +53,51 @@
 - **WHEN** 客户端打开控制 stream 后收到的第一条消息为 `AuthOk`（如旧版本服务端不发送 ServerHello）
 - **THEN** 客户端视为协议错误，返回 `Err`，不提示输入密码
 
-### Requirement: 认证请求携带用户名与密码
+### Requirement: AuthInit 消息携带用户名与认证方式
 
-系统 SHALL 用 `AuthRequest` 表达客户端认证请求，字段 `username: string`、`password: string`，二者均编解码保真。
+系统 SHALL 用 `AuthInit` 表达客户端认证请求，替换原 `AuthRequest`。字段 `username: string` 承载用户名；`method` 为 `oneof`，容纳 `password: PasswordAuth`（当前唯一分支）。`PasswordAuth` 含 `password: string` 字段。`AuthInit` 与 `PasswordAuth` 均编解码保真。proto field number SHALL 跳开预留（`username = 1`，`password = 10`）。
 
-#### Scenario: 用户名与密码 round-trip 保真
+#### Scenario: AuthInit 含密码 round-trip 保真
 
-- **WHEN** 构造 `AuthRequest{username:"alice", password:"s3cret"}` 并 encode 后 decode
-- **THEN** 解码结果的 `username` 与 `password` 与原值逐字节相等
+- **WHEN** 构造 `AuthInit{ username: "alice", method: PasswordAuth{ password: "s3cret" } }` 并 encode 后 decode
+- **THEN** 解码结果 `username` 为 `"alice"`，`method` 为 `PasswordAuth{ password: "s3cret" }`
 
-#### Scenario: 含多字节字符的密码 round-trip 保真
+#### Scenario: AuthInit 含多字节字符密码 round-trip 保真
 
-- **WHEN** 构造 `AuthRequest` 的 `password` 为含多字节 UTF-8 字符的串（如 `"密码"`）并 encode 后 decode
+- **WHEN** 构造 `AuthInit` 的 `PasswordAuth.password` 为含多字节 UTF-8 字符的串（如 `"密码"`）并 encode 后 decode
 - **THEN** 解码结果的 `password` 与原串相等
+
+### Requirement: AuthChallenge 消息表达服务端要求额外认证因素
+
+系统 SHALL 用 `AuthChallenge` 表达服务端在认证过程中要求客户端提供额外认证因素（如 TOTP）。`challenge` 为 `oneof`，容纳 `totp: TotpChallenge`（当前唯一分支，`TotpChallenge` 含 `prompt: string` 字段承载给用户的提示文字）。`AuthChallenge` 及其子消息均编解码保真。
+
+#### Scenario: AuthChallenge 含 TotpChallenge round-trip 保真
+
+- **WHEN** 构造 `AuthChallenge{ challenge: TotpChallenge{ prompt: "Enter TOTP code" } }` 并 encode 后 decode
+- **THEN** 解码结果 `challenge` 为 `TotpChallenge{ prompt: "Enter TOTP code" }`
+
+### Requirement: AuthResponse 消息表达客户端对挑战的应答
+
+系统 SHALL 用 `AuthResponse` 表达客户端对 `AuthChallenge` 的应答。`response` 为 `oneof`，容纳 `totp: TotpResponse`（当前唯一分支，`TotpResponse` 含 `code: string` 字段承载验证码）。`AuthResponse` 及其子消息均编解码保真。
+
+#### Scenario: AuthResponse 含 TotpResponse round-trip 保真
+
+- **WHEN** 构造 `AuthResponse{ response: TotpResponse{ code: "123456" } }` 并 encode 后 decode
+- **THEN** 解码结果 `response` 为 `TotpResponse{ code: "123456" }`
+
+### Requirement: AuthMethod 枚举声明认证方式
+
+系统 SHALL 定义 `AuthMethod` 枚举，取值 `PASSWORD = 0`（用户名/密码）、`TOTP = 1`（基于时间的一次性密码）。`AuthMethod` 用于 `ServerHello.supported_methods` 字段。枚举值编解码保真。
+
+#### Scenario: PASSWORD 枚举值 round-trip 保真
+
+- **WHEN** 构造含 `AuthMethod::PASSWORD` 的 `ServerHello.supported_methods` 并 encode 后 decode
+- **THEN** 解码结果含 `PASSWORD`
+
+#### Scenario: TOTP 枚举值 round-trip 保真
+
+- **WHEN** 构造含 `AuthMethod::TOTP` 的 `ServerHello.supported_methods` 并 encode 后 decode
+- **THEN** 解码结果含 `TOTP`
 
 ### Requirement: 认证成功响应内联完整隧道配置
 
@@ -150,40 +187,6 @@
 
 - **WHEN** framing 配置确定后
 - **THEN** 长度前缀按大端序解释（与 arch-v1 §3 一致），不存在运行期切换字节序的入口
-
-### Requirement: 认证决策编排纯函数
-
-系统 SHALL 提供纯函数 `authenticate(store: &UserStore, pool: &mut IpPool, req: &AuthRequest) -> Result<Ipv4Addr, ServerSideError>`，按固定时序编排 `auth` 与 `ipam`：先调用 `store.verify(&req.username, &req.password)`，若返回 `Err(e)` 则 SHALL 返回 `Err(ServerSideError::Auth(e))` 且**不调用** `pool.alloc()`（pool 可用计数不变）；若 `verify` 成功，再调用 `pool.alloc()`，失败（`PoolExhausted`）SHALL 返回 `Err(ServerSideError::PoolExhausted)`，成功 SHALL 返回 `Ok(分配到的虚拟IP)`。函数 SHALL 不进行任何 IO，唯一的状态变更是 `pool.alloc()` 对池内部位图的占用（且仅在 verify 成功后发生）。`AuthRequest` 的 `username` 为空字符串时，SHALL 经由 `verify` 走到 `InvalidCredentials`（因 `UserStore::from_users` 拒绝空用户名，空串对 verify 而言是未知用户），返回 `Err(ServerSideError::Auth(InvalidCredentials))`。
-
-#### Scenario: 凭证正确且池有空闲返回分配的 IP
-
-- **WHEN** 构造含用户 `alice`（密码 `s3cret` 的 argon2 哈希）的 `UserStore` 与一个 `/24` 的 `IpPool`，调用 `authenticate(&store, &mut pool, AuthRequest{username:"alice", password:"s3cret"})`
-- **THEN** 返回 `Ok(10.0.0.2)`（池首可分配地址），且 `pool.available_count()` 较调用前减 1
-
-#### Scenario: 凭证错误返回 Auth 错误且不占用池
-
-- **WHEN** 对含用户 `alice` 的 store 与 `/24` pool 调用 `authenticate`，`password` 传错（如 `"wrong"`）
-- **THEN** 返回 `Err(ServerSideError::Auth(AuthError::InvalidCredentials))`，且 `pool.available_count()` 与调用前相等（未调用 `alloc`）
-
-#### Scenario: 未知用户返回 Auth 错误
-
-- **WHEN** 对含用户 `alice` 的 store 调用 `authenticate`，`username` 传不存在的 `"eve"`
-- **THEN** 返回 `Err(ServerSideError::Auth(AuthError::InvalidCredentials))`（与密码错的错误不可区分，防枚举）
-
-#### Scenario: 空用户名返回 Auth 错误
-
-- **WHEN** 对含用户 `alice` 的 store 调用 `authenticate`，`username` 传空串 `""`
-- **THEN** 返回 `Err(ServerSideError::Auth(AuthError::InvalidCredentials))`
-
-#### Scenario: 凭证正确但池耗尽返回 PoolExhausted
-
-- **WHEN** 对含用户 `alice` 的 store 与一个已耗尽的 `IpPool`（如 `/30` 且唯一可分配地址已被 alloc）调用 `authenticate`，凭证正确
-- **THEN** 返回 `Err(ServerSideError::PoolExhausted)`
-
-#### Scenario: authenticate 串联后 deny_reason_from 映射正确
-
-- **WHEN** `authenticate` 返回 `Err(ServerSideError::Auth(_))`
-- **THEN** `deny_reason_from` 将其映射为 `DenyReason::AuthFailed`；当返回 `Err(ServerSideError::PoolExhausted)` 时映射为 `DenyReason::ServerBusy`（复用既有映射，端到端一致）
 
 ### Requirement: 心跳判活状态机复用 msgx::KeepaliveTracker
 
