@@ -1195,6 +1195,7 @@ dependencies = [
  "futures",
  "msgx",
  "prost",
+ "quic-link",
  "quinn",
  "rustls",
  "rustls-pki-types",

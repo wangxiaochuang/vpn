@@ -113,7 +113,7 @@ impl VpnServer {
         self.daemon = Some(DownlinkDaemon::spawn(
             self.tun.clone(),
             self.ledger.clone(),
-            sd_handle.clone(),
+            sd.handle(),
         ));
         self.accept.serve(&sd_handle).await;
         self.graceful_stop(&sd).await;

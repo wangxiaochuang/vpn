@@ -13,8 +13,8 @@ use quic_link::Session;
 use shutdown::Shutdown;
 use sysprobe::proto::TelemetryMessage;
 use vpn_client::client::{DataPlane, ExitCause};
-use vpn_client::ctrl::control_message::Msg;
-use vpn_client::ctrl::{ControlMessage, Heartbeat};
+use vpn_core::ctrl::control_message::Msg;
+use vpn_core::ctrl::{ControlMessage, Heartbeat};
 
 fn hb() -> ControlMessage {
     ControlMessage {
@@ -39,7 +39,7 @@ impl MockTun {
     }
 }
 
-impl vpn_client::data::PacketSource for MockTun {
+impl vpn_core::data::PacketSource for MockTun {
     fn recv(&mut self) -> impl Future<Output = io::Result<Bytes>> + Send {
         let mode = self.mode.load(Ordering::SeqCst);
         async move {
@@ -52,7 +52,7 @@ impl vpn_client::data::PacketSource for MockTun {
     }
 }
 
-impl vpn_client::data::PacketSink for MockTun {
+impl vpn_core::data::PacketSink for MockTun {
     fn send(&mut self, _pkt: Bytes) -> impl Future<Output = io::Result<()>> + Send {
         async { Ok(()) }
     }

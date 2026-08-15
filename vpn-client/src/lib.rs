@@ -20,9 +20,3 @@ pub mod config;
 pub mod credentials;
 pub mod route;
 pub mod telemetry;
-
-pub use vpn_core::ctrl;
-pub use vpn_core::data;
-pub use vpn_core::framing;
-pub use vpn_core::tun_setup;
-pub use vpn_core::vpn;

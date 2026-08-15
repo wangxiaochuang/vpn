@@ -204,6 +204,7 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 ### 8.2 采集与调度
 
 - **proto 模型**（`sysprobe` crate 自带）：`TelemetryMessage`（oneof: `TelemetryReport{ ts_ms, items }` / `CollectRequest{ kinds }`）、`InfoSnapshot`（oneof payload）、enum `InfoKind`。
+- **符号归属**：`vpn-core` 仅保留双端共享的遥测消息 helper（`TelemetryChannel/Sender/Receiver` 类型别名、`TelemetryError`、`report_msg` / `collect_req_msg` / `kinds_from_i32`）；仅客户端消费的 `build_default_registry` / `open_telemetry_stream` 定义于 `vpn-client/src/telemetry.rs`，仅服务端消费的 `TelemetryPlane` / `TelemetryTxSlot` / `make_telemetry_tx_slot` 定义于 `vpn-server/src/telemetry.rs`（双端 telemetry 模块各自持有真实现，不做整模块 re-export 转发）。
 - **`Collector` trait + `CollectorRegistry`**：每个 collector 声明 `kind` / `cadence`（`None` 表示仅 pull）；registry 支持 push 调度（`push_due` / `mark_pushed`，客户端每 1s tick 检查）与 pull 响应（`collect_by_kinds`）。
 - **内置跨平台 collectors**：进程摘要（30s，top5 CPU）、进程全量（5min）、端口（1min）、网卡（10min）、磁盘（仅 pull）。
 
@@ -456,12 +457,12 @@ Cargo workspace 成员：
 
 | crate | 职责 |
 |-------|------|
-| `vpn-core` | 共享纯逻辑 + proto：framing/ctrl 协议、数据面（forward/downlink_pump）、TUN 设置、共享 telemetry 类型与配置工具 |
-| `vpn-client` | 客户端 lib + bin：QUIC 控制面/数据面客户端、TUN、OS 路由、客户端配置、客户端 telemetry |
-| `vpn-server` | 服务端 lib + bin：QUIC 控制面/数据面服务端、认证（argon2）、IPAM、SessionRegistry、服务端配置、服务端 telemetry |
+| `vpn-core` | 共享纯逻辑 + proto：framing/ctrl 协议、数据面（forward/downlink_pump）、TUN 设置、共享遥测消息 helper（`TelemetryChannel/Sender/Receiver` 别名、`TelemetryError`、消息构造函数） |
+| `vpn-client` | 客户端 lib + bin：QUIC 控制面/数据面客户端、TUN、OS 路由、客户端配置、客户端 telemetry（`build_default_registry` / `open_telemetry_stream` / push-pull 循环） |
+| `vpn-server` | 服务端 lib + bin：QUIC 控制面/数据面服务端、认证（argon2）、IPAM、SessionRegistry、服务端配置、服务端 telemetry（`TelemetryPlane` fan-out / `TelemetryTxSlot` / `request_collect`） |
 | `vpn-tests` | 端到端集成测试（dev-dependencies 依赖 vpn-client/vpn-server/vpn-core） |
 | `msgx` | 控制面 framing + length-prefixed codec + 心跳 tracker（`ProtoCodec` / `Channel` / `KeepaliveTracker`） |
-| `quic-link` | QUIC 连接管道：TLS 配置、Endpoint、bidi stream → Channel 适配、datagram 收发、保活循环（`Session` 封装 `quinn::Connection`，对外不含 `quinn::` 类型）；依赖方向 `quic-link → msgx` |
+| `quic-link` | QUIC 连接管道：TLS 配置、Endpoint、bidi stream → Channel 适配、datagram 收发、保活循环（`Session` 封装 `quinn::Connection`，对外不含 `quinn::` 类型）；依赖方向 `quic-link → msgx`；`test-util` feature（仅 dev-dependencies 引用）提供测试脚手架（`NoVerify` 免校验 verifier、`no_verify_client_config` / `make_session_pair` 工厂、`repo_file`），下游测试复用而非重写 |
 | `shutdown` | 通用的 tokio 长驻服务优雅关闭协调（`Shutdown`：信号 → token → drain，含超时/abort 兜底） |
 | `sysprobe` | 通用客户端信息采集框架：proto 数据模型、`Collector` trait + `CollectorRegistry`（cadence 调度 / pull 响应）、内置跨平台 collectors（进程/端口/网卡/磁盘）、`TelemetrySink` trait + `ConsoleSink`；与传输完全解耦 |
 | `xtask` | 开发/运维工具（`cargo xtask add-user` 交互式添加用户/改密） |

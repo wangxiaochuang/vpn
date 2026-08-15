@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use ipnet::Ipv4Net;
-use vpn_server::ctrl::control_message::Msg;
+use vpn_core::ctrl::control_message::Msg;
 
 #[tokio::test]
 async fn test_second_same_username_supersedes_first_connection() {

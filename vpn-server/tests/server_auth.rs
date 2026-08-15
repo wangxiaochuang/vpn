@@ -5,8 +5,8 @@ mod common;
 use std::net::Ipv4Addr;
 
 use ipnet::Ipv4Net;
-use vpn_server::ctrl::DenyReason;
-use vpn_server::ctrl::control_message::Msg;
+use vpn_core::ctrl::DenyReason;
+use vpn_core::ctrl::control_message::Msg;
 
 #[tokio::test]
 async fn test_valid_credentials_receive_auth_ok() {

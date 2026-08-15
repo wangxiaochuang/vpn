@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::conn::{AuthStore, ClientNetProfile, ConnectionHandle};
 use crate::auth::AuthOutcome;
-use crate::ctrl::{self, ServerSideError};
+use crate::ctrl::ServerSideError;
 use crate::ledger::{ConnectionLedger, Evicted, ReservedIp};
 use msgx::Channel;
 use quic_link::Session;
@@ -48,7 +48,7 @@ async fn send_server_hello(channel: &mut Channel<ControlMessage>, auth: &AuthSto
 fn build_server_hello(methods: &[vpn_core::vpn::AuthMethod]) -> ControlMessage {
     ControlMessage {
         msg: Some(Msg::ServerHello(ServerHello {
-            protocol_version: ctrl::PROTOCOL_VERSION,
+            protocol_version: vpn_core::ctrl::PROTOCOL_VERSION,
             supported_methods: methods.iter().map(|m| *m as i32).collect(),
         })),
     }
@@ -318,7 +318,7 @@ mod tests {
         let Msg::ServerHello(hello) = msg.msg.expect("ServerHello") else {
             panic!("expected ServerHello");
         };
-        assert_eq!(hello.protocol_version, ctrl::PROTOCOL_VERSION);
+        assert_eq!(hello.protocol_version, vpn_core::ctrl::PROTOCOL_VERSION);
         assert_eq!(
             hello.supported_methods,
             vec![vpn_core::vpn::AuthMethod::Password as i32]

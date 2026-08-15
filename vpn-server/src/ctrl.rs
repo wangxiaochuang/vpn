@@ -1,7 +1,5 @@
 use crate::auth::AuthError;
-
-pub use vpn_core::ctrl::*;
-pub use vpn_core::vpn::DenyReason;
+use vpn_core::vpn::DenyReason;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerSideError {
@@ -22,6 +20,10 @@ mod tests {
     use super::*;
     use prost::Message;
     use std::time::{Duration, Instant};
+    use vpn_core::ctrl::HEARTBEAT_INTERVAL;
+    use vpn_core::ctrl::HEARTBEAT_TIMEOUT;
+    use vpn_core::ctrl::HeartbeatTracker;
+    use vpn_core::ctrl::MAX_FRAME_LENGTH;
     use vpn_core::vpn::ControlMessage;
     use vpn_core::vpn::control_message::Msg;
 

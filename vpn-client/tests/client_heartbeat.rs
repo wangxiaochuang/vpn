@@ -5,8 +5,8 @@ mod common;
 use std::time::Duration;
 
 use vpn_client::client::{ExitCause, heartbeat_loop};
-use vpn_client::ctrl::control_message::Msg;
-use vpn_client::ctrl::{ControlMessage, Disconnect, Heartbeat};
+use vpn_core::ctrl::control_message::Msg;
+use vpn_core::ctrl::{ControlMessage, Disconnect, Heartbeat};
 
 fn sd_handle() -> shutdown::ShutdownHandle {
     shutdown::Shutdown::default().handle()

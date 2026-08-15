@@ -8,9 +8,9 @@ use std::time::Duration;
 use futures::SinkExt;
 use futures::StreamExt;
 use ipnet::Ipv4Net;
-use vpn_server::ctrl::ControlMessage;
-use vpn_server::ctrl::PROTOCOL_VERSION;
-use vpn_server::ctrl::control_message::Msg;
+use vpn_core::ctrl::ControlMessage;
+use vpn_core::ctrl::PROTOCOL_VERSION;
+use vpn_core::ctrl::control_message::Msg;
 
 #[tokio::test]
 async fn test_server_hello_is_first_message_before_any_client_data() {
@@ -39,7 +39,7 @@ async fn test_server_hello_is_first_message_before_any_client_data() {
             assert_eq!(h.protocol_version, PROTOCOL_VERSION);
             assert_eq!(
                 h.supported_methods,
-                vec![vpn_server::ctrl::AuthMethod::Password as i32]
+                vec![vpn_core::ctrl::AuthMethod::Password as i32]
             );
         }
         other => panic!("expected ServerHello, got {other:?}"),
@@ -110,12 +110,12 @@ async fn test_server_hello_then_auth_request_succeeds() {
     assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
 
     use futures::SinkExt;
-    use vpn_server::ctrl::auth_init::Method;
+    use vpn_core::ctrl::auth_init::Method;
     framed
         .send(ControlMessage {
-            msg: Some(Msg::AuthInit(vpn_server::ctrl::AuthInit {
+            msg: Some(Msg::AuthInit(vpn_core::ctrl::AuthInit {
                 username: "alice".to_string(),
-                method: Some(Method::Password(vpn_server::ctrl::PasswordAuth {
+                method: Some(Method::Password(vpn_core::ctrl::PasswordAuth {
                     password: common::ALICE_PASSWORD.to_string(),
                 })),
             })),

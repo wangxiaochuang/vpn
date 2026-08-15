@@ -10,12 +10,6 @@ msgx = { path = "../msgx" }
 quic-link = { path = "../quic-link" }
 shutdown = { path = "../shutdown" }
 sysprobe = { path = "../sysprobe" }
-quinn = { version = "0.11", features = ["rustls-aws-lc-rs"] }
-rustls = { version = "0.23", default-features = false, features = [
-    "std",
-    "aws_lc_rs",
-] }
-rustls-pki-types = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tun-rs = { version = "2", features = ["async"] }
@@ -36,6 +30,13 @@ futures = "0.3"
 async-trait = "0.1"
 
 [dev-dependencies]
+quic-link = { path = "../quic-link", features = ["test-util"] }
+quinn = { version = "0.11", features = ["rustls-aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "aws_lc_rs",
+] }
+rustls-pki-types = "1"
 tempfile = "3"
 libc = "0.2"
 tokio = { version = "1", features = ["test-util"] }

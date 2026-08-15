@@ -100,7 +100,7 @@ impl ConnectionHandle {
     pub async fn request_collect(
         &self,
         kinds: Vec<sysprobe::proto::InfoKind>,
-    ) -> Result<(), crate::telemetry::TelemetryError> {
+    ) -> Result<(), vpn_core::telemetry::TelemetryError> {
         crate::telemetry::request_collect(&self.telemetry_tx, kinds).await
     }
 }
@@ -167,114 +167,19 @@ mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hash;
     use std::net::Ipv4Addr;
-    use std::sync::Arc as StdArc;
 
     use quic_link::Session;
+    use quic_link::test_util::make_session_pair;
+    use quic_link::test_util::repo_file;
 
-    #[derive(Debug)]
-    struct NoVerify;
-
-    impl rustls::client::danger::ServerCertVerifier for NoVerify {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &rustls_pki_types::CertificateDer<'_>,
-            _intermediates: &[rustls_pki_types::CertificateDer<'_>],
-            _server_name: &rustls_pki_types::ServerName<'_>,
-            _ocsp: &[u8],
-            _now: rustls_pki_types::UnixTime,
-        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls_pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls_pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            vec![
-                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-                rustls::SignatureScheme::ED25519,
-                rustls::SignatureScheme::RSA_PSS_SHA256,
-            ]
-        }
-    }
-
-    fn repo(p: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("vpn crate nested under repo root")
-            .join(p)
-    }
-
-    async fn make_client_sessions(n: usize) -> Vec<Session> {
-        let server = build_test_server();
-        let client_cfg = build_no_verify_client_config();
-        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let mut sessions = Vec::new();
-        for _ in 0..n {
-            let conn = client
-                .connect_with(client_cfg.clone(), addr, "localhost")
-                .expect("dial")
-                .await
-                .expect("connect");
-            sessions.push(Session::new(conn));
-        }
-        std::mem::forget(client);
-        sessions
-    }
-
-    fn build_test_server() -> quinn::Endpoint {
-        let cert = repo("cert.pem");
-        let key = repo("key.pem");
-        let server_cfg = quic_link::build_quinn_server_config(&cert, &key).expect("server cfg");
-        let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
-            .expect("server endpoint");
-        let server_for_accept = server.clone();
-        tokio::spawn(async move {
-            while let Some(incoming) = server_for_accept.accept().await {
-                let _ = incoming.accept().map(|c| {
-                    tokio::spawn(async move {
-                        let _ = c.await;
-                    });
-                });
-            }
-        });
-        server
-    }
-
-    fn build_no_verify_client_config() -> quinn::ClientConfig {
-        let rustls_client = rustls::ClientConfig::builder_with_provider(StdArc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(StdArc::new(NoVerify))
-        .with_no_client_auth();
-        let quic_client =
-            quinn::crypto::rustls::QuicClientConfig::try_from(StdArc::new(rustls_client)).unwrap();
-        quinn::ClientConfig::new(StdArc::new(quic_client))
+    async fn client_session() -> Session {
+        let (_, client) = make_session_pair(&repo_file("cert.pem"), &repo_file("key.pem")).await;
+        client
     }
 
     #[tokio::test]
     async fn test_connection_handle_eq_by_id_across_clones() {
-        let mut sessions = make_client_sessions(1).await;
-        let session = sessions.remove(0);
+        let session = client_session().await;
         let dup = session.clone();
         let h1 = ConnectionHandle::new(session, Ipv4Addr::new(10, 0, 0, 2));
         let h2 = ConnectionHandle::new(dup, Ipv4Addr::new(10, 0, 0, 9));
@@ -283,17 +188,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_handle_neq_different_id() {
-        let mut sessions = make_client_sessions(2).await;
-        let h1 = ConnectionHandle::new(sessions.remove(0), Ipv4Addr::new(10, 0, 0, 2));
-        let h2 = ConnectionHandle::new(sessions.remove(0), Ipv4Addr::new(10, 0, 0, 3));
+        let h1 = ConnectionHandle::new(client_session().await, Ipv4Addr::new(10, 0, 0, 2));
+        let h2 = ConnectionHandle::new(client_session().await, Ipv4Addr::new(10, 0, 0, 3));
         assert_ne!(h1.id(), h2.id());
         assert_ne!(h1, h2);
     }
 
     #[tokio::test]
     async fn test_connection_handle_hash_by_id() {
-        let mut sessions = make_client_sessions(1).await;
-        let session = sessions.remove(0);
+        let session = client_session().await;
         let h1 = ConnectionHandle::new(session.clone(), Ipv4Addr::new(10, 0, 0, 2));
         let h2 = ConnectionHandle::new(session, Ipv4Addr::new(10, 0, 0, 9));
         let mut s1 = DefaultHasher::new();
@@ -305,8 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_handle_dedups_in_hashset() {
-        let mut sessions = make_client_sessions(1).await;
-        let session = sessions.remove(0);
+        let session = client_session().await;
         let h1 = ConnectionHandle::new(session.clone(), Ipv4Addr::new(10, 0, 0, 2));
         let h2 = ConnectionHandle::new(session, Ipv4Addr::new(10, 0, 0, 3));
         let mut set = HashSet::new();

@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use ipnet::Ipv4Net;
-use vpn_server::ctrl::control_message::Msg;
-use vpn_server::data::DownlinkDispatcher;
+use vpn_core::ctrl::control_message::Msg;
+use vpn_core::data::DownlinkDispatcher;
 use vpn_server::server::RegistryDispatcher;
 
 fn ipv4_packet(dst: [u8; 4]) -> bytes::Bytes {

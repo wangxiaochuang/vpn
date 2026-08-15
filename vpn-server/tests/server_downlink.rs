@@ -8,7 +8,7 @@ use std::net::Ipv4Addr;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use vpn_server::data::{DownlinkDispatcher, PacketSource, downlink_pump};
+use vpn_core::data::{DownlinkDispatcher, PacketSource, downlink_pump};
 use vpn_server::server::RegistryDispatcher;
 
 fn sd_handle() -> shutdown::ShutdownHandle {

@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use vpn_client::client::{ClientError, connect_and_recv_hello};
 use vpn_client::config::ClientConfig;
-use vpn_client::ctrl::AuthOk;
-use vpn_client::ctrl::ControlMessage;
-use vpn_client::ctrl::ServerHello;
-use vpn_client::ctrl::control_message::Msg;
+use vpn_core::ctrl::AuthOk;
+use vpn_core::ctrl::ControlMessage;
+use vpn_core::ctrl::ServerHello;
+use vpn_core::ctrl::control_message::Msg;
 
 fn repo(p: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -28,7 +28,7 @@ fn client_config(addr: std::net::SocketAddr) -> ClientConfig {
 }
 
 fn server_hello(version: u32) -> ControlMessage {
-    use vpn_client::vpn::AuthMethod;
+    use vpn_core::vpn::AuthMethod;
     ControlMessage {
         msg: Some(Msg::ServerHello(ServerHello {
             protocol_version: version,
@@ -65,7 +65,7 @@ fn mismatch_config(addr: std::net::SocketAddr) -> ClientConfig {
 
 #[tokio::test]
 async fn test_connect_and_recv_hello_when_connection_fails_returns_err() {
-    let good = server_hello(vpn_client::ctrl::PROTOCOL_VERSION);
+    let good = server_hello(vpn_core::ctrl::PROTOCOL_VERSION);
     let (addr, _guard) = mock_server(good).await;
     let err = tokio::time::timeout(
         Duration::from_secs(5),
@@ -120,7 +120,7 @@ async fn test_connect_and_recv_hello_when_first_not_server_hello_returns_protoco
 
 #[tokio::test]
 async fn test_connect_and_recv_hello_when_valid_server_hello_returns_ok() {
-    let good = server_hello(vpn_client::ctrl::PROTOCOL_VERSION);
+    let good = server_hello(vpn_core::ctrl::PROTOCOL_VERSION);
     let (addr, _guard) = mock_server(good).await;
     let pre = tokio::time::timeout(
         Duration::from_secs(5),

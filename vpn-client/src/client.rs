@@ -9,15 +9,15 @@ use crate::config::MIN_MTU;
 use crate::credentials::CliCredentialCollector;
 use crate::credentials::CredentialCollector;
 use crate::credentials::StaticCredentialCollector;
-use crate::data::{PacketSink, PacketSource, Tun, forward};
-use crate::vpn::AuthOk;
-use crate::vpn::ControlMessage;
-use crate::vpn::control_message::Msg;
 use msgx::Channel;
 use msgx::channel::{Receiver, Sender};
 use quic_link::{KeepaliveConfig, LoopControl, Session, keepalive_loop};
 use shutdown::Shutdown;
 use shutdown::ShutdownHandle;
+use vpn_core::data::{PacketSink, PacketSource, Tun, forward};
+use vpn_core::vpn::AuthOk;
+use vpn_core::vpn::ControlMessage;
+use vpn_core::vpn::control_message::Msg;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientTunParams {
@@ -121,7 +121,7 @@ pub enum ClientError {
     InvalidRoute(String),
     #[error("authentication failed: {0}")]
     AuthDenied(String),
-    #[error("incompatible protocol version: server={server}, client={client}", server = .0, client = crate::ctrl::PROTOCOL_VERSION)]
+    #[error("incompatible protocol version: server={server}, client={client}", server = .0, client = vpn_core::ctrl::PROTOCOL_VERSION)]
     IncompatibleVersion(u32),
     #[error("protocol error: {0}")]
     Protocol(String),
@@ -190,8 +190,8 @@ fn parse_routes(raw: &[String]) -> Result<Vec<Ipv4Net>, ClientError> {
 
 fn deny_reason_text(reason: i32) -> &'static str {
     match reason {
-        r if r == crate::vpn::DenyReason::AuthFailed as i32 => "认证失败（用户名或密码错误）",
-        r if r == crate::vpn::DenyReason::ServerBusy as i32 => "服务端繁忙（IP 池耗尽）",
+        r if r == vpn_core::vpn::DenyReason::AuthFailed as i32 => "认证失败（用户名或密码错误）",
+        r if r == vpn_core::vpn::DenyReason::ServerBusy as i32 => "服务端繁忙（IP 池耗尽）",
         _ => "未知拒绝原因",
     }
 }
@@ -256,7 +256,7 @@ fn validate_username(raw: &str) -> anyhow::Result<String> {
 pub struct PreAuthClient {
     pub session: Session,
     pub channel: Channel<ControlMessage>,
-    pub supported_methods: Vec<crate::vpn::AuthMethod>,
+    pub supported_methods: Vec<vpn_core::vpn::AuthMethod>,
     endpoint: quic_link::Client,
 }
 
@@ -288,7 +288,7 @@ async fn send_open_signal(channel: &mut Channel<ControlMessage>) -> anyhow::Resu
 
 async fn recv_and_validate_hello(
     channel: &mut Channel<ControlMessage>,
-) -> Result<Vec<crate::vpn::AuthMethod>, ClientError> {
+) -> Result<Vec<vpn_core::vpn::AuthMethod>, ClientError> {
     let first = channel
         .recv()
         .await
@@ -296,7 +296,7 @@ async fn recv_and_validate_hello(
         .ok_or_else(|| ClientError::Protocol("control stream closed before ServerHello".into()))?;
     match first.msg {
         Some(Msg::ServerHello(h)) => {
-            if h.protocol_version != crate::ctrl::PROTOCOL_VERSION {
+            if h.protocol_version != vpn_core::ctrl::PROTOCOL_VERSION {
                 return Err(ClientError::IncompatibleVersion(h.protocol_version));
             }
             Ok(parse_supported_methods(&h.supported_methods))
@@ -307,9 +307,9 @@ async fn recv_and_validate_hello(
     }
 }
 
-fn parse_supported_methods(raw: &[i32]) -> Vec<crate::vpn::AuthMethod> {
+fn parse_supported_methods(raw: &[i32]) -> Vec<vpn_core::vpn::AuthMethod> {
     raw.iter()
-        .filter_map(|&i| crate::vpn::AuthMethod::try_from(i).ok())
+        .filter_map(|&i| vpn_core::vpn::AuthMethod::try_from(i).ok())
         .collect()
 }
 
@@ -322,7 +322,7 @@ async fn open_control_stream(session: &Session) -> anyhow::Result<Channel<Contro
 
 async fn authenticate<C: CredentialCollector>(
     channel: &mut Channel<ControlMessage>,
-    methods: &[crate::vpn::AuthMethod],
+    methods: &[vpn_core::vpn::AuthMethod],
     collector: &mut C,
 ) -> anyhow::Result<ClientTunParams> {
     let init = collector.collect_init(methods).await;
@@ -371,7 +371,7 @@ async fn handle_auth_msg<C: CredentialCollector>(
 
 async fn send_auth_init(
     channel: &mut Channel<ControlMessage>,
-    init: crate::vpn::AuthInit,
+    init: vpn_core::vpn::AuthInit,
 ) -> anyhow::Result<()> {
     channel
         .send(ControlMessage {
@@ -383,7 +383,7 @@ async fn send_auth_init(
 
 async fn send_auth_response(
     channel: &mut Channel<ControlMessage>,
-    response: crate::vpn::AuthResponse,
+    response: vpn_core::vpn::AuthResponse,
 ) -> anyhow::Result<()> {
     channel
         .send(ControlMessage {
@@ -394,7 +394,7 @@ async fn send_auth_response(
 }
 
 fn setup_tun(params: &ClientTunParams) -> anyhow::Result<std::sync::Arc<tun_rs::AsyncDevice>> {
-    let tun = crate::tun_setup::create_client_tun(params.assigned_ip, params.subnet, params.mtu)
+    let tun = vpn_core::tun_setup::create_client_tun(params.assigned_ip, params.subnet, params.mtu)
         .context("failed to create client TUN device")?;
     let dev_name = tun.name().unwrap_or_default();
     crate::route::ensure_subnet_route(&dev_name, params.subnet)
@@ -429,7 +429,7 @@ async fn run_keepalive(
     saw_disconnect: &mut bool,
 ) {
     let hb = || ControlMessage {
-        msg: Some(Msg::Heartbeat(crate::vpn::Heartbeat {})),
+        msg: Some(Msg::Heartbeat(vpn_core::vpn::Heartbeat {})),
     };
     keepalive_loop(
         session,
@@ -805,8 +805,12 @@ mod tests {
 
     #[test]
     fn test_deny_reason_text_maps_known_reasons() {
-        assert!(deny_reason_text(crate::vpn::DenyReason::AuthFailed as i32).contains("认证失败"));
-        assert!(deny_reason_text(crate::vpn::DenyReason::ServerBusy as i32).contains("服务端繁忙"));
+        assert!(
+            deny_reason_text(vpn_core::vpn::DenyReason::AuthFailed as i32).contains("认证失败")
+        );
+        assert!(
+            deny_reason_text(vpn_core::vpn::DenyReason::ServerBusy as i32).contains("服务端繁忙")
+        );
         assert!(deny_reason_text(999).contains("未知"));
     }
 

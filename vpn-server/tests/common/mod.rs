@@ -2,7 +2,6 @@
 
 use std::io;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use argon2::Argon2;
@@ -12,6 +11,8 @@ use argon2::password_hash::rand_core::OsRng;
 use bytes::Bytes;
 use ipnet::Ipv4Net;
 use quic_link::PacketSink;
+use quic_link::test_util::no_verify_client_config as client_config;
+use quic_link::test_util::repo_file as repo;
 use sysprobe::sink::TelemetrySink;
 use vpn_core::vpn::AuthMethod;
 use vpn_server::auth::{PasswordAuthenticator, UserStore};
@@ -51,13 +52,6 @@ pub fn alice_users() -> Vec<(String, String)> {
     vec![("alice".to_string(), hash_password(ALICE_PASSWORD))]
 }
 
-pub fn repo(p: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("vpn crate nested under repo root")
-        .join(p)
-}
-
 pub fn test_config() -> ServerConfig {
     ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -76,7 +70,7 @@ pub fn test_config() -> ServerConfig {
 pub fn net_profile(subnet: Ipv4Net, routes: Vec<Ipv4Net>) -> Arc<ClientNetProfile> {
     Arc::new(ClientNetProfile {
         subnet,
-        gateway: vpn_server::tun_setup::gateway_addr(subnet),
+        gateway: vpn_core::tun_setup::gateway_addr(subnet),
         mtu: 1280,
         routes,
     })
@@ -148,64 +142,8 @@ pub async fn make_test_state() -> Arc<TestDeps> {
     )
 }
 
-#[derive(Debug)]
-pub struct NoVerify;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls_pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
-        _server_name: &rustls_pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls_pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-        ]
-    }
-}
-
 pub fn client_endpoint() -> quinn::Endpoint {
     quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap()
-}
-
-pub fn client_config() -> quinn::ClientConfig {
-    let rustls_client = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(NoVerify))
-    .with_no_client_auth();
-    let quic_client =
-        quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client)).unwrap();
-    quinn::ClientConfig::new(Arc::new(quic_client))
 }
 
 pub struct ConnectionPair {
@@ -341,26 +279,26 @@ pub async fn test_client_connect(addr: std::net::SocketAddr) -> quinn::Connectio
 
 pub type ClientFramed = tokio_util::codec::Framed<
     quic_link::quinn_stream::QuinnStream,
-    vpn_server::framing::ControlCodec,
+    vpn_core::framing::ControlCodec,
 >;
 
 pub async fn open_control(conn: &quinn::Connection) -> ClientFramed {
     let (send, recv) = conn.open_bi().await.expect("open_bi");
     tokio_util::codec::Framed::new(
         quic_link::quinn_stream::QuinnStream::new(send, recv),
-        vpn_server::framing::ControlCodec::new(),
+        vpn_core::framing::ControlCodec::new(),
     )
 }
 
 pub async fn send_auth_request(framed: &mut ClientFramed, username: &str, password: &str) {
     use futures::SinkExt;
-    use vpn_server::ctrl::auth_init::Method;
-    use vpn_server::ctrl::control_message::Msg;
+    use vpn_core::ctrl::auth_init::Method;
+    use vpn_core::ctrl::control_message::Msg;
     framed
-        .send(vpn_server::ctrl::ControlMessage {
-            msg: Some(Msg::AuthInit(vpn_server::ctrl::AuthInit {
+        .send(vpn_core::ctrl::ControlMessage {
+            msg: Some(Msg::AuthInit(vpn_core::ctrl::AuthInit {
                 username: username.to_string(),
-                method: Some(Method::Password(vpn_server::ctrl::PasswordAuth {
+                method: Some(Method::Password(vpn_core::ctrl::PasswordAuth {
                     password: password.to_string(),
                 })),
             })),
@@ -372,10 +310,10 @@ pub async fn send_auth_request(framed: &mut ClientFramed, username: &str, passwo
 
 pub async fn send_heartbeat(framed: &mut ClientFramed) {
     use futures::SinkExt;
-    use vpn_server::ctrl::control_message::Msg;
+    use vpn_core::ctrl::control_message::Msg;
     framed
-        .send(vpn_server::ctrl::ControlMessage {
-            msg: Some(Msg::Heartbeat(vpn_server::ctrl::Heartbeat {})),
+        .send(vpn_core::ctrl::ControlMessage {
+            msg: Some(Msg::Heartbeat(vpn_core::ctrl::Heartbeat {})),
         })
         .await
         .expect("send heartbeat");
@@ -384,13 +322,13 @@ pub async fn send_heartbeat(framed: &mut ClientFramed) {
 pub async fn send_open_signal(framed: &mut ClientFramed) {
     use futures::SinkExt;
     framed
-        .send(vpn_server::ctrl::ControlMessage { msg: None })
+        .send(vpn_core::ctrl::ControlMessage { msg: None })
         .await
         .expect("send open signal");
 }
 
-pub async fn recv_server_hello(framed: &mut ClientFramed) -> vpn_server::ctrl::ServerHello {
-    use vpn_server::ctrl::control_message::Msg;
+pub async fn recv_server_hello(framed: &mut ClientFramed) -> vpn_core::ctrl::ServerHello {
+    use vpn_core::ctrl::control_message::Msg;
     let msg = recv_control(framed).await.expect("expected ServerHello");
     match msg.msg {
         Some(Msg::ServerHello(h)) => h,
@@ -398,7 +336,7 @@ pub async fn recv_server_hello(framed: &mut ClientFramed) -> vpn_server::ctrl::S
     }
 }
 
-pub async fn recv_control(framed: &mut ClientFramed) -> Option<vpn_server::ctrl::ControlMessage> {
+pub async fn recv_control(framed: &mut ClientFramed) -> Option<vpn_core::ctrl::ControlMessage> {
     use futures::StreamExt;
     framed.next().await.and_then(|r| r.ok())
 }

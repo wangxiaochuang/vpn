@@ -25,6 +25,8 @@ mod keepalive;
 #[doc(hidden)]
 pub mod quinn_stream;
 mod session;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 mod tls;
 
 pub use datagram::{DatagramRx, DatagramTx, PacketSink, PacketSource, forward};

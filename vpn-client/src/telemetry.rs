@@ -1,23 +1,41 @@
 use std::time::Duration;
 use std::time::Instant;
 
+use quic_link::Session;
 use shutdown::ShutdownHandle;
 use sysprobe::collector::CollectorRegistry;
+use sysprobe::collectors::DiskCollector;
+use sysprobe::collectors::NetifCollector;
+use sysprobe::collectors::PortCollector;
+use sysprobe::collectors::ProcessFullCollector;
+use sysprobe::collectors::ProcessSummaryCollector;
 use sysprobe::proto::TelemetryMessage;
 use sysprobe::proto::telemetry_message::Msg;
+use vpn_core::telemetry::TelemetryChannel;
+use vpn_core::telemetry::TelemetryReceiver;
+use vpn_core::telemetry::TelemetrySender;
+use vpn_core::telemetry::kinds_from_i32;
+use vpn_core::telemetry::report_msg;
 
-pub use vpn_core::telemetry::TelemetryChannel;
-pub use vpn_core::telemetry::TelemetryError;
-pub use vpn_core::telemetry::TelemetryPlane;
-pub use vpn_core::telemetry::TelemetryReceiver;
-pub use vpn_core::telemetry::TelemetrySender;
-pub use vpn_core::telemetry::TelemetryTxSlot;
-pub use vpn_core::telemetry::build_default_registry;
-pub use vpn_core::telemetry::make_telemetry_tx_slot;
-pub use vpn_core::telemetry::open_telemetry_stream;
+pub fn build_default_registry() -> CollectorRegistry {
+    let mut reg = CollectorRegistry::new();
+    reg.register(Box::new(ProcessSummaryCollector::new()));
+    reg.register(Box::new(ProcessFullCollector::new()));
+    reg.register(Box::new(PortCollector::new()));
+    reg.register(Box::new(NetifCollector::new()));
+    reg.register(Box::new(DiskCollector::new()));
+    reg
+}
 
-use quic_link::Session;
-use vpn_core::telemetry::{kinds_from_i32, report_msg};
+pub async fn open_telemetry_stream(session: &Session) -> Option<TelemetryChannel> {
+    match session.open_stream::<TelemetryMessage>().await {
+        Ok(ch) => Some(ch),
+        Err(e) => {
+            tracing::warn!("failed to open telemetry stream: {e}");
+            None
+        }
+    }
+}
 
 const PUSH_TICK: Duration = Duration::from_secs(1);
 

@@ -23,8 +23,3 @@ pub mod ledger;
 pub mod route;
 pub mod server;
 pub mod telemetry;
-
-pub use vpn_core::data;
-pub use vpn_core::framing;
-pub use vpn_core::tun_setup;
-pub use vpn_core::vpn;

@@ -4,6 +4,9 @@ license = "MIT"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-util = []
+
 [dependencies]
 msgx = { path = "../msgx" }
 shutdown = { path = "../shutdown" }
@@ -22,5 +25,6 @@ prost = "0.13"
 anyhow = "1"
 
 [dev-dependencies]
+quic-link = { path = ".", features = ["test-util"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

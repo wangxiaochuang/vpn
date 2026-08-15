@@ -14,8 +14,8 @@ use sysprobe::proto::telemetry_message::Msg;
 use sysprobe::sink::SinkError;
 use sysprobe::sink::SinkSource;
 use sysprobe::sink::TelemetrySink;
+use vpn_client::telemetry::build_default_registry;
 use vpn_client::telemetry::client_telemetry_loop;
-use vpn_core::telemetry::build_default_registry;
 use vpn_server::telemetry::request_collect;
 use vpn_server::telemetry::server_telemetry_loop;
 

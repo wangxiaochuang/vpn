@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use ipnet::Ipv4Net;
-use vpn_server::ctrl::control_message::Msg;
+use vpn_core::ctrl::control_message::Msg;
 
 async fn auth_alice(
     addr: std::net::SocketAddr,

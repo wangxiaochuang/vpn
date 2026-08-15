@@ -20,7 +20,7 @@ use sysprobe::proto::telemetry_message::Msg;
 use sysprobe::sink::SinkError;
 use sysprobe::sink::SinkSource;
 use sysprobe::sink::TelemetrySink;
-use vpn_server::framing::ControlCodec;
+use vpn_core::framing::ControlCodec;
 
 type CapturedReport = (SinkSource, TelemetryReport);
 

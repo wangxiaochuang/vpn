@@ -9,7 +9,7 @@ vpn-core = { path = "../vpn-core" }
 vpn-client = { path = "../vpn-client" }
 vpn-server = { path = "../vpn-server" }
 msgx = { path = "../msgx" }
-quic-link = { path = "../quic-link" }
+quic-link = { path = "../quic-link", features = ["test-util"] }
 shutdown = { path = "../shutdown" }
 sysprobe = { path = "../sysprobe" }
 quinn = { version = "0.11", features = ["rustls-aws-lc-rs"] }

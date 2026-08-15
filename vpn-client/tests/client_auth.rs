@@ -6,24 +6,24 @@ use std::time::Duration;
 
 use futures::SinkExt;
 use futures::StreamExt;
-use vpn_client::ctrl::auth_challenge::Challenge;
-use vpn_client::ctrl::auth_init::Method;
-use vpn_client::ctrl::auth_response::Response;
-use vpn_client::ctrl::control_message::Msg;
-use vpn_client::ctrl::{
+use vpn_core::ctrl::auth_challenge::Challenge;
+use vpn_core::ctrl::auth_init::Method;
+use vpn_core::ctrl::auth_response::Response;
+use vpn_core::ctrl::control_message::Msg;
+use vpn_core::ctrl::{
     AuthDenied, AuthMethod, AuthOk, AuthResponse, ControlMessage, DenyReason, PasswordAuth,
     ServerHello, TotpChallenge, TotpResponse,
 };
 
 type ClientFramed = tokio_util::codec::Framed<
     quic_link::quinn_stream::QuinnStream,
-    vpn_client::framing::ControlCodec,
+    vpn_core::framing::ControlCodec,
 >;
 
 fn hello_with_methods(methods: Vec<AuthMethod>) -> ControlMessage {
     ControlMessage {
         msg: Some(Msg::ServerHello(ServerHello {
-            protocol_version: vpn_client::ctrl::PROTOCOL_VERSION,
+            protocol_version: vpn_core::ctrl::PROTOCOL_VERSION,
             supported_methods: methods.into_iter().map(|m| m as i32).collect(),
         })),
     }
@@ -51,7 +51,7 @@ fn auth_denied() -> ControlMessage {
 
 fn totp_challenge() -> ControlMessage {
     ControlMessage {
-        msg: Some(Msg::AuthChallenge(vpn_client::ctrl::AuthChallenge {
+        msg: Some(Msg::AuthChallenge(vpn_core::ctrl::AuthChallenge {
             challenge: Some(Challenge::Totp(TotpChallenge {
                 prompt: "Enter TOTP code".to_string(),
             })),
@@ -61,7 +61,7 @@ fn totp_challenge() -> ControlMessage {
 
 fn password_init(username: &str, password: &str) -> ControlMessage {
     ControlMessage {
-        msg: Some(Msg::AuthInit(vpn_client::ctrl::AuthInit {
+        msg: Some(Msg::AuthInit(vpn_core::ctrl::AuthInit {
             username: username.to_string(),
             method: Some(Method::Password(PasswordAuth {
                 password: password.to_string(),
@@ -101,7 +101,7 @@ async fn connect_and_open_framed(addr: std::net::SocketAddr) -> ClientFramed {
     let (send, recv) = conn.open_bi().await.expect("open_bi");
     tokio_util::codec::Framed::new(
         quic_link::quinn_stream::QuinnStream::new(send, recv),
-        vpn_client::framing::ControlCodec::new(),
+        vpn_core::framing::ControlCodec::new(),
     )
 }
 

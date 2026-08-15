@@ -7,8 +7,8 @@ use std::time::Duration;
 use futures::SinkExt;
 use futures::StreamExt;
 use ipnet::Ipv4Net;
-use vpn_server::ctrl::control_message::Msg;
-use vpn_server::ctrl::{ControlMessage, Heartbeat};
+use vpn_core::ctrl::control_message::Msg;
+use vpn_core::ctrl::{ControlMessage, Heartbeat};
 
 #[tokio::test]
 async fn test_client_heartbeat_keeps_connection_alive() {

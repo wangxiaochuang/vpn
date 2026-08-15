@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use ipnet::Ipv4Net;
-use vpn_server::ctrl::control_message::Msg;
+use vpn_core::ctrl::control_message::Msg;
 
 #[tokio::test]
 async fn test_server_skips_telemetry_when_client_does_not_open_stream() {

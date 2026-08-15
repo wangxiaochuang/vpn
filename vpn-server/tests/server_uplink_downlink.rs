@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use quic_link::{PacketSink, PacketSource};
 use tokio::sync::mpsc;
-use vpn_server::data::downlink_pump;
+use vpn_core::data::downlink_pump;
 use vpn_server::server::RegistryDispatcher;
 use vpn_server::server::spawn_uplink_task;
 

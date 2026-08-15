@@ -4,7 +4,6 @@ use super::conn::{AuthStore, ClientNetProfile, ConnExitCause, ConnectionHandle};
 use super::handshake::try_authenticate;
 use crate::ledger::ConnectionLedger;
 use crate::telemetry::TelemetryPlane;
-use crate::telemetry::TelemetrySender;
 use crate::telemetry::TelemetryTxSlot;
 use msgx::Channel;
 use msgx::channel::{Receiver, Sender};
@@ -13,6 +12,7 @@ use shutdown::Shutdown;
 use shutdown::ShutdownHandle;
 use sysprobe::proto::TelemetryMessage;
 use sysprobe::sink::SinkSource;
+use vpn_core::telemetry::TelemetrySender;
 use vpn_core::vpn::control_message::Msg;
 use vpn_core::vpn::{ControlMessage, Disconnect, Heartbeat};
 
