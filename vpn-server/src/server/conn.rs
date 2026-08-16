@@ -258,7 +258,7 @@ mod tests {
             cert: std::path::PathBuf::new(),
             key: std::path::PathBuf::new(),
             routes,
-            users: vec![],
+            db: "sqlite://users.db".to_string(),
         }
     }
 

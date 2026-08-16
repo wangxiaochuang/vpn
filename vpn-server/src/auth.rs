@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
-use argon2::password_hash::PasswordHashString;
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use async_trait::async_trait;
 use thiserror::Error;
+use tracing::error;
+use tracing::warn;
+use user_store::UserStore;
 use vpn_core::vpn::AuthChallenge;
 use vpn_core::vpn::AuthInit;
 use vpn_core::vpn::AuthResponse;
@@ -13,53 +15,6 @@ use vpn_core::vpn::auth_init;
 pub enum AuthError {
     #[error("invalid credentials")]
     InvalidCredentials,
-    #[error("invalid password hash format")]
-    InvalidHash,
-    #[error("empty username is not allowed")]
-    EmptyUsername,
-    #[error("duplicate user: {0}")]
-    DuplicateUser(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct UserStore {
-    users: HashMap<String, PasswordHashString>,
-}
-
-impl UserStore {
-    pub fn from_users<I>(users: I) -> Result<Self, AuthError>
-    where
-        I: IntoIterator<Item = (String, String)>,
-    {
-        let mut map = HashMap::new();
-        for (username, phc) in users {
-            if username.is_empty() {
-                return Err(AuthError::EmptyUsername);
-            }
-            if map.contains_key(&username) {
-                return Err(AuthError::DuplicateUser(username));
-            }
-            let hash = PasswordHashString::new(&phc).map_err(|_| AuthError::InvalidHash)?;
-            map.insert(username, hash);
-        }
-        Ok(Self { users: map })
-    }
-
-    pub fn verify(&self, username: &str, password: &str) -> Result<(), AuthError> {
-        if let Some(phc) = self.users.get(username) {
-            if Argon2::default()
-                .verify_password(password.as_bytes(), &phc.password_hash())
-                .is_ok()
-            {
-                Ok(())
-            } else {
-                Err(AuthError::InvalidCredentials)
-            }
-        } else {
-            verify_dummy(password);
-            Err(AuthError::InvalidCredentials)
-        }
-    }
 }
 
 fn verify_dummy(password: &str) {
@@ -101,12 +56,47 @@ pub trait AuthChallengeHandler: Send {
 }
 
 pub struct PasswordAuthenticator {
-    store: UserStore,
+    store: Arc<dyn UserStore>,
 }
 
 impl PasswordAuthenticator {
-    pub fn new(store: UserStore) -> Self {
+    pub fn new(store: Arc<dyn UserStore>) -> Self {
         Self { store }
+    }
+
+    async fn authenticate(&self, username: &str, password: &str) -> AuthOutcome {
+        let stored = match self.store.password_hash(username).await {
+            Ok(stored) => stored,
+            Err(e) => {
+                error!("user store query failed: {e}");
+                return AuthOutcome::Denied(AuthError::InvalidCredentials);
+            }
+        };
+        match stored {
+            None => {
+                verify_dummy(password);
+                AuthOutcome::Denied(AuthError::InvalidCredentials)
+            }
+            Some(phc) => verify_stored(username, password, &phc),
+        }
+    }
+}
+
+fn verify_stored(username: &str, password: &str, phc: &str) -> AuthOutcome {
+    match PasswordHash::new(phc) {
+        Err(_) => {
+            warn!("malformed password hash for user {username}");
+            verify_dummy(password);
+            AuthOutcome::Denied(AuthError::InvalidCredentials)
+        }
+        Ok(hash) => verify_password(username, password, &hash),
+    }
+}
+
+fn verify_password(username: &str, password: &str, hash: &PasswordHash<'_>) -> AuthOutcome {
+    match Argon2::default().verify_password(password.as_bytes(), hash) {
+        Ok(()) => AuthOutcome::Completed(Identity(username.to_string())),
+        Err(_) => AuthOutcome::Denied(AuthError::InvalidCredentials),
     }
 }
 
@@ -114,10 +104,7 @@ impl PasswordAuthenticator {
 impl Authenticator for PasswordAuthenticator {
     async fn begin(&self, init: AuthInit) -> AuthOutcome {
         let password = extract_password(&init);
-        match self.store.verify(&init.username, &password) {
-            Ok(()) => AuthOutcome::Completed(Identity(init.username)),
-            Err(e) => AuthOutcome::Denied(e),
-        }
+        self.authenticate(&init.username, &password).await
     }
 }
 
@@ -135,6 +122,44 @@ mod tests {
     use argon2::PasswordHasher;
     use argon2::password_hash::SaltString;
     use argon2::password_hash::rand_core::OsRng;
+    use user_store::InMemoryUserStore;
+    use user_store::StoreError;
+
+    struct FailingStore;
+
+    #[async_trait]
+    impl UserStore for FailingStore {
+        async fn password_hash(&self, _username: &str) -> Result<Option<String>, StoreError> {
+            Err(StoreError::Io(Box::new(std::io::Error::other("db down"))))
+        }
+        async fn upsert(&self, _username: &str, _phc: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn delete(&self, _username: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+        async fn list(&self) -> Result<Vec<String>, StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct MalformedHashStore;
+
+    #[async_trait]
+    impl UserStore for MalformedHashStore {
+        async fn password_hash(&self, _username: &str) -> Result<Option<String>, StoreError> {
+            Ok(Some("not-a-valid-hash".to_string()))
+        }
+        async fn upsert(&self, _username: &str, _phc: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn delete(&self, _username: &str) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+        async fn list(&self) -> Result<Vec<String>, StoreError> {
+            Ok(Vec::new())
+        }
+    }
 
     fn hash_password(pw: &str) -> String {
         let salt = SaltString::generate(&mut OsRng);
@@ -144,116 +169,12 @@ mod tests {
             .to_string()
     }
 
-    #[test]
-    fn test_auth_error_display() {
-        assert_eq!(
-            AuthError::InvalidCredentials.to_string(),
-            "invalid credentials"
+    fn make_authenticators() -> (PasswordAuthenticator, Arc<InMemoryUserStore>) {
+        let store = Arc::new(
+            InMemoryUserStore::from_pairs([("alice".to_string(), hash_password("s3cret"))])
+                .unwrap(),
         );
-        assert_eq!(
-            AuthError::InvalidHash.to_string(),
-            "invalid password hash format"
-        );
-        assert_eq!(
-            AuthError::EmptyUsername.to_string(),
-            "empty username is not allowed"
-        );
-        assert_eq!(
-            AuthError::DuplicateUser("bob".to_string()).to_string(),
-            "duplicate user: bob"
-        );
-    }
-
-    #[test]
-    fn test_from_users_when_valid_hash_constructs_and_verifies_ok() {
-        let store = UserStore::from_users([("alice".to_string(), hash_password("s3cret"))])
-            .expect("valid users construct");
-        assert_eq!(store.verify("alice", "s3cret"), Ok(()));
-    }
-
-    #[test]
-    fn test_from_users_when_empty_list_constructs_empty_store() {
-        let store = UserStore::from_users(Vec::<(String, String)>::new()).unwrap();
-        assert_eq!(
-            store.verify("anyone", "anything"),
-            Err(AuthError::InvalidCredentials)
-        );
-    }
-
-    #[test]
-    fn test_from_users_when_invalid_hash_returns_invalid_hash() {
-        let err = UserStore::from_users([("alice".to_string(), "not-a-valid-hash".to_string())])
-            .unwrap_err();
-        assert_eq!(err, AuthError::InvalidHash);
-    }
-
-    #[test]
-    fn test_from_users_when_empty_username_returns_empty_username() {
-        let err = UserStore::from_users([(String::new(), hash_password("s3cret"))]).unwrap_err();
-        assert_eq!(err, AuthError::EmptyUsername);
-    }
-
-    #[test]
-    fn test_from_users_when_duplicate_username_returns_duplicate_user() {
-        let err = UserStore::from_users([
-            ("alice".to_string(), hash_password("s3cret")),
-            ("alice".to_string(), hash_password("other")),
-        ])
-        .unwrap_err();
-        assert_eq!(err, AuthError::DuplicateUser("alice".to_string()));
-    }
-
-    #[test]
-    fn test_verify_when_correct_credentials_returns_ok() {
-        let store =
-            UserStore::from_users([("alice".to_string(), hash_password("s3cret"))]).unwrap();
-        assert_eq!(store.verify("alice", "s3cret"), Ok(()));
-    }
-
-    #[test]
-    fn test_verify_when_wrong_password_returns_invalid_credentials() {
-        let store =
-            UserStore::from_users([("alice".to_string(), hash_password("s3cret"))]).unwrap();
-        assert_eq!(
-            store.verify("alice", "wrong"),
-            Err(AuthError::InvalidCredentials)
-        );
-    }
-
-    #[test]
-    fn test_verify_when_unknown_user_returns_invalid_credentials() {
-        let store =
-            UserStore::from_users([("alice".to_string(), hash_password("s3cret"))]).unwrap();
-        assert_eq!(
-            store.verify("eve", "anything"),
-            Err(AuthError::InvalidCredentials)
-        );
-    }
-
-    #[test]
-    fn test_verify_when_different_case_returns_invalid_credentials() {
-        let store =
-            UserStore::from_users([("alice".to_string(), hash_password("s3cret"))]).unwrap();
-        assert_eq!(
-            store.verify("Alice", "s3cret"),
-            Err(AuthError::InvalidCredentials)
-        );
-    }
-
-    #[test]
-    fn test_verify_when_leading_space_returns_invalid_credentials() {
-        let store =
-            UserStore::from_users([("alice".to_string(), hash_password("s3cret"))]).unwrap();
-        assert_eq!(
-            store.verify(" alice", "s3cret"),
-            Err(AuthError::InvalidCredentials)
-        );
-    }
-
-    fn make_password_authenticator() -> PasswordAuthenticator {
-        let store =
-            UserStore::from_users([("alice".to_string(), hash_password("s3cret"))]).unwrap();
-        PasswordAuthenticator::new(store)
+        (PasswordAuthenticator::new(store.clone()), store)
     }
 
     fn password_init(username: &str, password: &str) -> AuthInit {
@@ -266,9 +187,24 @@ mod tests {
         }
     }
 
+    fn assert_invalid_credentials(outcome: &AuthOutcome) {
+        assert!(
+            matches!(outcome, AuthOutcome::Denied(e) if *e == AuthError::InvalidCredentials),
+            "expected Denied(InvalidCredentials), got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_auth_error_display() {
+        assert_eq!(
+            AuthError::InvalidCredentials.to_string(),
+            "invalid credentials"
+        );
+    }
+
     #[tokio::test]
-    async fn test_password_authenticator_correct_credentials_returns_completed() {
-        let auth = make_password_authenticator();
+    async fn test_begin_when_correct_credentials_returns_completed() {
+        let (auth, _) = make_authenticators();
         let outcome = auth.begin(password_init("alice", "s3cret")).await;
         assert!(matches!(
             outcome,
@@ -277,37 +213,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_password_authenticator_wrong_password_returns_denied() {
-        let auth = make_password_authenticator();
-        let outcome = auth.begin(password_init("alice", "wrong")).await;
-        assert!(
-            matches!(outcome, AuthOutcome::Denied(ref e) if *e == AuthError::InvalidCredentials)
-        );
+    async fn test_begin_when_wrong_password_returns_denied() {
+        let (auth, _) = make_authenticators();
+        assert_invalid_credentials(&auth.begin(password_init("alice", "wrong")).await);
     }
 
     #[tokio::test]
-    async fn test_password_authenticator_unknown_user_returns_denied() {
-        let auth = make_password_authenticator();
-        let outcome = auth.begin(password_init("eve", "anything")).await;
+    async fn test_begin_when_unknown_user_returns_denied() {
+        let (auth, _) = make_authenticators();
+        assert_invalid_credentials(&auth.begin(password_init("eve", "anything")).await);
+    }
+
+    #[tokio::test]
+    async fn test_begin_when_empty_username_returns_denied() {
+        let (auth, _) = make_authenticators();
+        assert_invalid_credentials(&auth.begin(password_init("", "s3cret")).await);
+    }
+
+    #[tokio::test]
+    async fn test_begin_when_different_case_returns_denied() {
+        let (auth, _) = make_authenticators();
+        assert_invalid_credentials(&auth.begin(password_init("Alice", "s3cret")).await);
+    }
+
+    #[tokio::test]
+    async fn test_begin_when_leading_space_returns_denied() {
+        let (auth, _) = make_authenticators();
+        assert_invalid_credentials(&auth.begin(password_init(" alice", "s3cret")).await);
+    }
+
+    #[tokio::test]
+    async fn test_begin_when_user_upserted_takes_effect_immediately() {
+        let (auth, store) = make_authenticators();
+        store.upsert("bob", &hash_password("pw2")).await.unwrap();
         assert!(matches!(
-            outcome,
-            AuthOutcome::Denied(ref e) if *e == AuthError::InvalidCredentials
+            auth.begin(password_init("bob", "pw2")).await,
+            AuthOutcome::Completed(Identity(ref id)) if id == "bob"
         ));
     }
 
     #[tokio::test]
-    async fn test_password_authenticator_empty_username_returns_denied() {
-        let auth = make_password_authenticator();
-        let outcome = auth.begin(password_init("", "s3cret")).await;
+    async fn test_begin_when_password_rotated_old_password_denied() {
+        let (auth, store) = make_authenticators();
+        store
+            .upsert("alice", &hash_password("new-pw"))
+            .await
+            .unwrap();
+        assert_invalid_credentials(&auth.begin(password_init("alice", "s3cret")).await);
         assert!(matches!(
-            outcome,
-            AuthOutcome::Denied(ref e) if *e == AuthError::InvalidCredentials
+            auth.begin(password_init("alice", "new-pw")).await,
+            AuthOutcome::Completed(_)
         ));
     }
 
     #[tokio::test]
-    async fn test_password_authenticator_completed_identity_equals_username() {
-        let auth = make_password_authenticator();
+    async fn test_begin_when_user_deleted_denies_with_dummy_path() {
+        let (auth, store) = make_authenticators();
+        assert!(store.delete("alice").await.unwrap());
+        assert_invalid_credentials(&auth.begin(password_init("alice", "s3cret")).await);
+    }
+
+    #[tokio::test]
+    async fn test_begin_when_store_fails_returns_denied_fail_closed() {
+        let auth = PasswordAuthenticator::new(Arc::new(FailingStore));
+        assert_invalid_credentials(&auth.begin(password_init("alice", "s3cret")).await);
+    }
+
+    #[tokio::test]
+    async fn test_begin_when_malformed_hash_returns_denied() {
+        let auth = PasswordAuthenticator::new(Arc::new(MalformedHashStore));
+        assert_invalid_credentials(&auth.begin(password_init("alice", "s3cret")).await);
+    }
+
+    #[tokio::test]
+    async fn test_begin_returns_identity_equal_to_username() {
+        let (auth, _) = make_authenticators();
         let outcome = auth.begin(password_init("alice", "s3cret")).await;
         let AuthOutcome::Completed(identity) = outcome else {
             panic!("expected Completed, got {outcome:?}");

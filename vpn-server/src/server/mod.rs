@@ -2,16 +2,18 @@ use std::sync::Arc;
 
 use self::conn::build_net_profile;
 use self::downlink::DownlinkDaemon;
-use crate::auth::{PasswordAuthenticator, UserStore};
+use crate::auth::PasswordAuthenticator;
 use crate::config::ServerConfig;
 use crate::ledger::ConnectionLedger;
 use crate::telemetry::TelemetryPlane;
+use anyhow::Context;
 use ipnet::Ipv4Net;
 use quic_link::{Server, Session};
 use shutdown::Shutdown;
 use shutdown::ShutdownHandle;
 use sysprobe::sink::ConsoleSink;
 use sysprobe::sink::TelemetrySink;
+use user_store::SqliteUserStore;
 use vpn_core::data::Tun;
 
 pub mod conn;
@@ -97,8 +99,8 @@ pub struct VpnServer {
 }
 
 impl VpnServer {
-    pub fn boot(config: ServerConfig) -> anyhow::Result<Self> {
-        let (accept, tun, ledger) = build_accept(config)?;
+    pub async fn boot(config: ServerConfig) -> anyhow::Result<Self> {
+        let (accept, tun, ledger) = build_accept(config).await?;
         Ok(Self {
             tun,
             ledger,
@@ -132,14 +134,14 @@ impl VpnServer {
 }
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
-    VpnServer::boot(config)?.run().await
+    VpnServer::boot(config).await?.run().await
 }
 
-fn build_accept(
+async fn build_accept(
     config: ServerConfig,
 ) -> anyhow::Result<(AcceptLoop, Tun, Arc<ConnectionLedger<ConnectionHandle>>)> {
     let endpoint = build_server(&config)?;
-    let auth = build_auth_store(&config)?;
+    let auth = build_auth_store(&config).await?;
     let ledger = build_ledger(config.tun_subnet)?;
     let tun = create_tun(config.tun_subnet, config.mtu)?;
     let net_profile = build_net_profile(config);
@@ -172,14 +174,11 @@ fn build_server(config: &ServerConfig) -> anyhow::Result<Server> {
     Ok(server)
 }
 
-fn build_auth_store(config: &ServerConfig) -> anyhow::Result<Arc<AuthStore>> {
-    let user_pairs: Vec<(String, String)> = config
-        .users
-        .iter()
-        .map(|u| (u.username.clone(), u.password_hash.clone()))
-        .collect();
-    let store = UserStore::from_users(user_pairs)?;
-    let authenticator = PasswordAuthenticator::new(store);
+async fn build_auth_store(config: &ServerConfig) -> anyhow::Result<Arc<AuthStore>> {
+    let store = SqliteUserStore::connect(&config.db)
+        .await
+        .context("database initialization failed")?;
+    let authenticator = PasswordAuthenticator::new(Arc::new(store));
     Ok(Arc::new(AuthStore {
         authenticator: Arc::new(authenticator),
         supported_methods: vec![vpn_core::vpn::AuthMethod::Password],
@@ -194,4 +193,53 @@ fn build_telemetry_plane() -> Arc<TelemetryPlane> {
     Arc::new(TelemetryPlane::new(vec![
         Arc::new(ConsoleSink) as Arc<dyn TelemetrySink>
     ]))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn config_with_db(db: &str) -> ServerConfig {
+        ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            tun_subnet: "10.0.0.0/24".parse().unwrap(),
+            mtu: 1280,
+            cert: std::path::PathBuf::new(),
+            key: std::path::PathBuf::new(),
+            routes: vec![],
+            db: db.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_auth_store_when_db_valid_returns_password_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = format!("sqlite://{}", dir.path().join("users.db").display());
+        let auth = build_auth_store(&config_with_db(&db)).await.unwrap();
+        assert_eq!(
+            auth.supported_methods,
+            vec![vpn_core::vpn::AuthMethod::Password]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_auth_store_when_db_unwritable_fails_fast() {
+        let config = config_with_db("sqlite:///nonexistent-dir/users.db");
+        let err = build_auth_store(&config)
+            .await
+            .err()
+            .expect("boot should fail fast");
+        assert!(err.to_string().contains("database"));
+    }
+
+    #[tokio::test]
+    async fn test_build_auth_store_when_db_invalid_url_fails_fast() {
+        let config = config_with_db("not-a-url");
+        let err = build_auth_store(&config)
+            .await
+            .err()
+            .expect("boot should fail fast");
+        assert!(err.to_string().contains("database"));
+    }
 }

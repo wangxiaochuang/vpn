@@ -4,18 +4,10 @@ use std::path::{Path, PathBuf};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
 
-use crate::auth::AuthError;
-use crate::auth::UserStore;
 use crate::ipam::IpPool;
 pub use vpn_core::config::ConfigError;
 pub use vpn_core::config::MIN_MTU;
 pub use vpn_core::config::{deserialize_ipv4_net, deserialize_ipv4_net_vec};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserConfig {
-    pub username: String,
-    pub password_hash: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -25,7 +17,7 @@ pub struct ServerConfig {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub routes: Vec<Ipv4Net>,
-    pub users: Vec<UserConfig>,
+    pub db: String,
 }
 
 impl ServerConfig {
@@ -38,12 +30,7 @@ impl ServerConfig {
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
         let server = raw.server;
         validate_server_fields(server.mtu, server.tun_subnet, &server.routes)?;
-        let users = build_user_configs(raw.users);
-        let user_pairs: Vec<(String, String)> = users
-            .iter()
-            .map(|u| (u.username.clone(), u.password_hash.clone()))
-            .collect();
-        map_user_error(UserStore::from_users(user_pairs))?;
+        validate_db(&server.db)?;
         Ok(Self {
             listen: server.listen,
             tun_subnet: server.tun_subnet,
@@ -51,7 +38,7 @@ impl ServerConfig {
             cert: server.cert,
             key: server.key,
             routes: server.routes,
-            users,
+            db: server.db,
         })
     }
 }
@@ -77,29 +64,17 @@ fn is_default_route(routes: &[Ipv4Net]) -> bool {
         .any(|r| r.network() == Ipv4Addr::UNSPECIFIED && r.prefix_len() == 0)
 }
 
-fn build_user_configs(raw: Vec<RawUser>) -> Vec<UserConfig> {
-    raw.into_iter()
-        .map(|u| UserConfig {
-            username: u.username,
-            password_hash: u.password_hash,
-        })
-        .collect()
-}
-
-fn map_user_error(res: Result<UserStore, AuthError>) -> Result<(), ConfigError> {
-    match res {
-        Ok(_) | Err(AuthError::InvalidCredentials) => Ok(()),
-        Err(AuthError::EmptyUsername) => Err(ConfigError::EmptyUsername),
-        Err(AuthError::DuplicateUser(name)) => Err(ConfigError::DuplicateUser(name)),
-        Err(AuthError::InvalidHash) => Err(ConfigError::InvalidHash),
+fn validate_db(db: &str) -> Result<(), ConfigError> {
+    match db.split_once("://") {
+        None => Err(ConfigError::InvalidDatabaseUrl),
+        Some(("sqlite", _)) => Ok(()),
+        Some((scheme, _)) => Err(ConfigError::UnsupportedDatabase(scheme.to_string())),
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     server: RawServer,
-    #[serde(default)]
-    users: Vec<RawUser>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,12 +87,8 @@ struct RawServer {
     key: PathBuf,
     #[serde(default, deserialize_with = "deserialize_ipv4_net_vec")]
     routes: Vec<Ipv4Net>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawUser {
-    username: String,
-    password_hash: String,
+    #[serde(default)]
+    db: String,
 }
 
 #[cfg(test)]
@@ -130,21 +101,7 @@ struct RawUser {
 )]
 mod tests {
     use super::*;
-    use argon2::Argon2;
-    use argon2::PasswordHasher;
-    use argon2::password_hash::SaltString;
-    use argon2::password_hash::rand_core::OsRng;
     use std::io::Write;
-
-    fn hash_password(pw: &str) -> String {
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(pw.as_bytes(), &salt)
-            .unwrap()
-            .to_string()
-    }
-
-    const VALID_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$j3xYVqWV0EE+AG6htXRGTA$g446kNT7dmrxnDjw/DZYHbCWrO83sNJtAdIqmWjcknE";
 
     fn write_config(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
         let path = dir.path().join(name);
@@ -153,50 +110,40 @@ mod tests {
         path
     }
 
-    fn minimal_config_body(hash: &str) -> String {
-        format!(
-            r#"[server]
+    fn minimal_config_body() -> String {
+        r#"[server]
 listen = "127.0.0.1:4433"
 tun_subnet = "10.0.0.0/24"
 mtu = 1280
 cert = "server.crt"
 key = "server.key"
-
-[[users]]
-username = "alice"
-password_hash = "{hash}"
+db = "sqlite://users.db"
 "#
-        )
+        .to_string()
     }
 
     #[test]
     fn test_load_when_valid_minimal_returns_ok_with_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "ok.toml", &minimal_config_body(VALID_HASH));
+        let path = write_config(&dir, "ok.toml", &minimal_config_body());
         let cfg = ServerConfig::load(&path).unwrap();
         assert_eq!(cfg.listen, "127.0.0.1:4433".parse().unwrap());
         assert_eq!(cfg.tun_subnet, "10.0.0.0/24".parse::<Ipv4Net>().unwrap());
         assert_eq!(cfg.mtu, 1280);
         assert_eq!(cfg.cert, PathBuf::from("server.crt"));
         assert_eq!(cfg.key, PathBuf::from("server.key"));
-        assert_eq!(cfg.users.len(), 1);
-        assert_eq!(cfg.users[0].username, "alice");
+        assert_eq!(cfg.db, "sqlite://users.db");
         assert!(cfg.routes.is_empty());
     }
 
-    fn config_body_with_routes(hash: &str, routes: &str) -> String {
-        let body = minimal_config_body(hash);
-        body.replacen(
-            "\n\n[[users]]",
-            &format!("\nroutes = {routes}\n\n[[users]]"),
-            1,
-        )
+    fn config_body_with_routes(routes: &str) -> String {
+        minimal_config_body().replacen('\n', &format!("\nroutes = {routes}\n"), 1)
     }
 
     #[test]
     fn test_load_when_routes_present_returns_ok_with_routes() {
         let dir = tempfile::tempdir().unwrap();
-        let body = config_body_with_routes(VALID_HASH, r#"["192.168.100.0/24", "10.88.0.0/16"]"#);
+        let body = config_body_with_routes(r#"["192.168.100.0/24", "10.88.0.0/16"]"#);
         let path = write_config(&dir, "routes.toml", &body);
         let cfg = ServerConfig::load(&path).unwrap();
         assert_eq!(cfg.routes.len(), 2);
@@ -210,7 +157,7 @@ password_hash = "{hash}"
     #[test]
     fn test_load_when_routes_absent_defaults_to_empty_vec() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "no_routes.toml", &minimal_config_body(VALID_HASH));
+        let path = write_config(&dir, "no_routes.toml", &minimal_config_body());
         let cfg = ServerConfig::load(&path).unwrap();
         assert_eq!(cfg.routes, Vec::<Ipv4Net>::new());
     }
@@ -218,7 +165,7 @@ password_hash = "{hash}"
     #[test]
     fn test_load_when_routes_contains_default_route_returns_default_route_not_allowed() {
         let dir = tempfile::tempdir().unwrap();
-        let body = config_body_with_routes(VALID_HASH, r#"["0.0.0.0/0"]"#);
+        let body = config_body_with_routes(r#"["0.0.0.0/0"]"#);
         let path = write_config(&dir, "default_route.toml", &body);
         let err = ServerConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::DefaultRouteNotAllowed));
@@ -227,7 +174,7 @@ password_hash = "{hash}"
     #[test]
     fn test_load_when_routes_overlap_tun_subnet_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
-        let body = config_body_with_routes(VALID_HASH, r#"["10.0.0.0/16"]"#);
+        let body = config_body_with_routes(r#"["10.0.0.0/16"]"#);
         let path = write_config(&dir, "overlap.toml", &body);
         assert!(ServerConfig::load(&path).is_ok());
     }
@@ -249,33 +196,18 @@ password_hash = "{hash}"
     }
 
     #[test]
-    fn test_load_when_mtu_1280_returns_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body(VALID_HASH).replace("mtu = 1280", "mtu = 1280");
-        let path = write_config(&dir, "mtu_ok.toml", &body);
-        assert!(ServerConfig::load(&path).is_ok());
-    }
-
-    #[test]
     fn test_load_when_mtu_too_small_returns_mtu_too_small() {
         let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body(VALID_HASH).replace("mtu = 1280", "mtu = 1000");
+        let body = minimal_config_body().replace("mtu = 1280", "mtu = 1000");
         let path = write_config(&dir, "mtu_bad.toml", &body);
         let err = ServerConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::MtuTooSmall(1000)));
     }
 
     #[test]
-    fn test_load_when_subnet_24_returns_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "net24.toml", &minimal_config_body(VALID_HASH));
-        assert!(ServerConfig::load(&path).is_ok());
-    }
-
-    #[test]
     fn test_load_when_subnet_31_returns_invalid_subnet() {
         let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body(VALID_HASH).replace("10.0.0.0/24", "10.0.0.0/31");
+        let body = minimal_config_body().replace("10.0.0.0/24", "10.0.0.0/31");
         let path = write_config(&dir, "net31.toml", &body);
         let err = ServerConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidSubnet));
@@ -284,70 +216,67 @@ password_hash = "{hash}"
     #[test]
     fn test_load_when_subnet_33_returns_parse_error() {
         let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body(VALID_HASH).replace("10.0.0.0/24", "10.0.0.0/33");
+        let body = minimal_config_body().replace("10.0.0.0/24", "10.0.0.0/33");
         let path = write_config(&dir, "net33.toml", &body);
         let err = ServerConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)));
     }
 
     #[test]
-    fn test_load_when_valid_single_user_returns_ok() {
+    fn test_load_when_db_missing_returns_invalid_database_url() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "user_ok.toml", &minimal_config_body(VALID_HASH));
-        assert!(ServerConfig::load(&path).is_ok());
-    }
-
-    #[test]
-    fn test_load_when_empty_username_returns_empty_username() {
-        let dir = tempfile::tempdir().unwrap();
-        let body =
-            minimal_config_body(VALID_HASH).replace(r#"username = "alice""#, r#"username = """#);
-        let path = write_config(&dir, "empty_user.toml", &body);
+        let body = minimal_config_body().replace("db = \"sqlite://users.db\"\n", "");
+        let path = write_config(&dir, "no_db.toml", &body);
         let err = ServerConfig::load(&path).unwrap_err();
-        assert!(matches!(err, ConfigError::EmptyUsername));
+        assert!(matches!(err, ConfigError::InvalidDatabaseUrl));
     }
 
     #[test]
-    fn test_load_when_duplicate_user_returns_duplicate_user() {
+    fn test_load_when_db_empty_returns_invalid_database_url() {
         let dir = tempfile::tempdir().unwrap();
-        let mut body = minimal_config_body(VALID_HASH);
-        body.push_str(&format!(
-            "\n[[users]]\nusername = \"alice\"\npassword_hash = \"{VALID_HASH}\"\n"
+        let body = minimal_config_body().replace("sqlite://users.db", "");
+        let path = write_config(&dir, "empty_db.toml", &body);
+        let err = ServerConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidDatabaseUrl));
+    }
+
+    #[test]
+    fn test_load_when_db_not_a_url_returns_invalid_database_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = minimal_config_body().replace("sqlite://users.db", "not-a-url");
+        let path = write_config(&dir, "bad_db.toml", &body);
+        let err = ServerConfig::load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidDatabaseUrl));
+    }
+
+    #[test]
+    fn test_load_when_db_mysql_returns_unsupported_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = minimal_config_body().replace("sqlite://users.db", "mysql://host/db");
+        let path = write_config(&dir, "mysql.toml", &body);
+        let err = ServerConfig::load(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::UnsupportedDatabase(ref s) if s == "mysql"
         ));
-        let path = write_config(&dir, "dup.toml", &body);
-        let err = ServerConfig::load(&path).unwrap_err();
-        assert!(matches!(err, ConfigError::DuplicateUser(ref n) if n == "alice"));
-    }
-
-    #[test]
-    fn test_load_when_invalid_hash_returns_invalid_hash() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body("not-a-valid-hash");
-        let path = write_config(&dir, "bad_hash.toml", &body);
-        let err = ServerConfig::load(&path).unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidHash));
     }
 
     #[test]
     fn test_load_when_syntax_error_takes_precedence_over_validation() {
         let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body(VALID_HASH).replace("mtu = 1280", "mtu = 1\nlisten = ");
+        let body = minimal_config_body().replace("mtu = 1280", "mtu = 1\nlisten = ");
         let path = write_config(&dir, "precedence.toml", &body);
         let err = ServerConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)));
     }
 
     #[test]
-    fn test_generated_hash_round_trips_through_load() {
+    fn test_load_when_users_section_present_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body(&hash_password("s3cret"));
-        let path = write_config(&dir, "gen_hash.toml", &body);
-        assert!(ServerConfig::load(&path).is_ok());
-    }
-
-    #[test]
-    fn test_map_user_error_invalid_credentials_is_tolerated() {
-        let res: Result<(), ConfigError> = map_user_error(Err(AuthError::InvalidCredentials));
-        assert!(res.is_ok());
+        let mut body = minimal_config_body();
+        body.push_str("\n[[users]]\nusername = \"alice\"\npassword_hash = \"x\"\n");
+        let path = write_config(&dir, "legacy_users.toml", &body);
+        let cfg = ServerConfig::load(&path).unwrap();
+        assert_eq!(cfg.db, "sqlite://users.db");
     }
 }

@@ -10,8 +10,10 @@ anyhow = "1"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 rpassword = "7.5"
-toml_edit = "0.22"
 thiserror = "2"
+toml = "0.8"
+user-store = { path = "../user-store" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 tempfile = "3"

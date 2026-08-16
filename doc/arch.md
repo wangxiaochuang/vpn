@@ -33,7 +33,7 @@
              ┌───────────────┴────────┐      ┌────────────────┴──────────────┐
              │       客户端            │      │            服务端             │
              ├────────────────────────┤      ├───────────────────────────────┤
-             │  凭据交互输入 (不回显)   │      │  用户表: argon2 哈希           │
+              │  凭据交互输入 (不回显)   │      │  用户库: SQLite + argon2 哈希 │
              │  TUN: 服务端分配 IP      │      │  IpPool + SessionRegistry     │
              │  MTU = 1280            │      │    (ConnectionLedger 单锁)     │
              │     ↓ subnet 路由      │      │  TUN: 网关 IP (池首地址)       │
@@ -96,9 +96,12 @@
 │     自签 cert.pem / key.pem（客户端直接将其作为信任 CA）  │
 ├──────────────────────────────────────────────────────────┤
 │ 应用层: 可插拔多步认证 (challenge-response)                │
-│   - 服务端配置文件存储用户列表                            │
+│   - 用户凭据存于数据库 (sqlite, 见 [server].db 配置)      │
 │   - 密码使用 argon2 哈希存储（未知用户做 dummy verify，    │
 │     防时序侧信道探测用户存在性）                           │
+│   - 存取抽象为 UserStore trait (user-store crate)，       │
+│     认证期逐次查询，xtask 增删改用户即时生效              │
+│   - 存储故障 fail closed（拒绝认证 + 日志，不泄露细节）   │
 │   - 认证抽象为 Authenticator trait (可插拔认证方式)       │
 │   - 支持多步 challenge-response (TOTP/MFA 等扩展点)       │
 │   - username 同时作为在线身份 (见 §6)                    │
@@ -437,10 +440,7 @@ mtu = 1280
 cert = "cert.pem"      # 由 CA 签发的服务端证书（开发用自签证书在仓库根目录）
 key = "key.pem"        # 对应私钥
 routes = ["192.168.100.0/24", "10.88.0.0/16"]  # 可选：需通过 VPN 访问的额外子网（split tunneling），缺省为空
-
-[[users]]
-username = "alice"
-password_hash = "$argon2..."   # argon2 哈希
+db = "sqlite://users.db"   # 用户数据库（sqlx URL；首启自动建库建表；scheme 目前仅支持 sqlite）
 ```
 
 客户端：
@@ -455,7 +455,7 @@ ca_cert = "cert.pem"              # 信任的 CA 证书，用于校验服务端
 
 客户端解析语义：`server` 为 `SocketAddr`（当前仅支持 `IP:port`，域名 DNS 解析列后续）；`server_name` 非空、`ca_cert` 非空（文件存在性由 TLS 构造阶段校验）；`ClientConfig` 不含 `username` 字段、不含密码字段。
 
-服务端用户管理工具 `cargo xtask add-user`（workspace 内独立 `xtask` crate，`.cargo/config.toml` 定义 alias）：交互式输入两次密码（rpassword 不回显），生成 argon2id PHC 哈希后写回 `server.toml` 的 `[[users]]`，同名用户只更新 `password_hash`，toml_edit 原地编辑保留注释与格式，无 `[[users]]` 段时自动创建。
+服务端用户管理工具 `cargo xtask add-user [--config server.toml] <username>`（workspace 内独立 `xtask` crate，`.cargo/config.toml` 定义 alias）：从配置读 `db` URL，交互式输入两次密码（rpassword 不回显），生成 argon2id PHC 哈希后经 `user-store` upsert 进数据库，同名用户仅更新哈希。配套 `cargo xtask list-users`（列出全部用户名）与 `cargo xtask delete-user <username>`（删除用户，不存在时非零退出）。服务端认证期逐次查库，上述操作**无需重启服务端**即生效。
 
 ## 12. 技术栈
 
@@ -468,6 +468,7 @@ ca_cert = "cert.pem"              # 信任的 CA 证书，用于校验服务端
 | 消息序列化 | `prost` (protobuf) |
 | CLI | `clap` |
 | 密码哈希 | `argon2` |
+| 用户数据库 | `sqlx` (SQLite, WAL) |
 | 系统路由 | `route_manager`（客户端 split tunneling） |
 
 证书为预先签发的 PEM 文件（rcgen 仅为历史参考，原 `tlsgen.rs` 已删除）。演进遵循**最小新增依赖**原则：能复用既有库则复用，必要时才引入轻量库（如 IP 包解析），具体选型由实现澄清。
@@ -489,19 +490,20 @@ Cargo workspace 成员：
 |-------|------|
 | `vpn-core` | 共享纯逻辑 + proto：framing/ctrl 协议、数据面（forward/downlink_pump）、TUN 设置、共享遥测消息 helper（`TelemetryChannel/Sender/Receiver` 别名、`TelemetryError`、消息构造函数） |
 | `vpn-client` | 客户端 lib + bin：QUIC 控制面/数据面客户端、TUN、OS 路由、客户端配置、客户端 telemetry（`build_default_registry` / `open_telemetry_stream` / push-pull 循环） |
-| `vpn-server` | 服务端 lib + bin：QUIC 控制面/数据面服务端、认证（argon2）、IPAM、SessionRegistry、服务端配置、服务端 telemetry（`TelemetryPlane` fan-out / `TelemetryTxSlot` / `request_collect`） |
+| `vpn-server` | 服务端 lib + bin：QUIC 控制面/数据面服务端、认证（`PasswordAuthenticator` 持 `Arc<dyn UserStore>`，argon2 验证在认证层）、IPAM、SessionRegistry、服务端配置、服务端 telemetry（`TelemetryPlane` fan-out / `TelemetryTxSlot` / `request_collect`） |
 | `vpn-tests` | 端到端集成测试（dev-dependencies 依赖 vpn-client/vpn-server/vpn-core） |
 | `msgx` | 控制面 framing + length-prefixed codec + 心跳 tracker（`ProtoCodec` / `Channel` / `KeepaliveTracker`） |
 | `quic-link` | QUIC 连接管道：TLS 配置、Endpoint、bidi stream → Channel 适配、datagram 收发、保活循环（`Session` 封装 `quinn::Connection`，对外不含 `quinn::` 类型）；依赖方向 `quic-link → msgx`；`test-util` feature（仅 dev-dependencies 引用）提供测试脚手架（`NoVerify` 免校验 verifier、`no_verify_client_config` / `make_session_pair` 工厂、`repo_file`），下游测试复用而非重写 |
 | `shutdown` | 通用的 tokio 长驻服务优雅关闭协调（`Shutdown`：信号 → token → drain，含超时/abort 兜底） |
 | `sysprobe` | 通用客户端信息采集框架：proto 数据模型、`Collector` trait + `CollectorRegistry`（cadence 调度 / pull 响应）、内置跨平台 collectors（进程/端口/网卡/磁盘）、`TelemetrySink` trait + `ConsoleSink`；与传输完全解耦 |
-| `xtask` | 开发/运维工具（`cargo xtask add-user` 交互式添加用户/改密） |
+| `user-store` | 用户凭据存储抽象：async `UserStore` trait（`password_hash` / `upsert` / `delete` / `list`，只管存取不含验证）+ `SqliteUserStore`（sqlx，create_if_missing + WAL + 幂等建表）+ `InMemoryUserStore`（测试替身）；upsert 写入路径校验用户名非空与 PHC 格式 |
+| `xtask` | 开发/运维工具（`add-user` / `list-users` / `delete-user`，读写 `server.toml` 指向的用户数据库） |
 
 ## 14. 范围与非目标
 
 **当前包含**：
 
-- 用户名/密码认证（服务端配置存储，argon2 哈希）
+- 用户名/密码认证（SQLite 数据库存储，argon2 哈希，认证期逐次查询）
 - 可插拔认证框架（`Authenticator` trait + challenge-response loop，为 MFA/LDAP/token 等扩展预留）
 - 单端口、单 subnet 的 IP 分配
 - 连接时分配空闲 IP，断开即释放（不持久化、不 lease）
@@ -699,7 +701,8 @@ Cargo workspace 成员：
 | 控制面 stream / 数据面 datagram | 兼顾信令可靠性与数据面低延迟 |
 | 控制面单条双向 stream + length-prefix 分帧 | 一条 stream 承载认证/配置/心跳，开销小、实现简单，边界清晰 |
 | 应用层用户名密码（非 TLS-PSK） | 简单直观，username 天然作在线身份 |
-| argon2 哈希存储密码 | 配置泄露时不暴露明文，成本极低 |
+| argon2 哈希存储密码 | 数据库泄露时不暴露明文，成本极低 |
+| 用户凭据从 TOML 迁移到 SQLite（`user-store` crate，per-auth 查询） | 增删改用户无需重启服务端即生效；`UserStore` trait 抽象使后端可替换（MySQL 等后续增量）；SQLite WAL 使认证读与管理写不互斥；存储故障 fail closed（拒绝认证 + 日志，协议上与凭据错误不可区分） |
 | username 作为在线身份（非持久身份） | 简化实现；掉线即释放 IP，内存表足矣 |
 | 同名新连接顶替旧连接 | 后到即合法，直观，避免等待心跳超时的竞态 |
 | datagram 装原始 IP 包原样转发 | 最简实现，QUIC 连接已标识会话 |

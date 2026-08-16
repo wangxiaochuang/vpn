@@ -41,6 +41,7 @@ cargo fmt --check               # 格式检查
 - `quic-link/` —— QUIC 连接管道（TLS、Endpoint、stream→Channel 适配、datagram、保活）；依赖方向 `quic-link → msgx`
 - `shutdown/` —— 通用 tokio 长驻服务优雅关闭协调（信号 → token → drain）
 - `sysprobe/` —— 客户端信息采集框架（Collector + Registry + TelemetrySink），与传输完全解耦
+- `user-store/` —— 用户凭据存储抽象（async `UserStore` trait + SQLite/内存实现）
 - `xtask/` —— 开发/运维工具，`cargo xtask ...`
 
 ## 技术栈
@@ -53,6 +54,7 @@ cargo fmt --check               # 格式检查
 - **序列化**：`prost`（protobuf）
 - **CLI**：`clap`
 - **密码哈希**：`argon2`
+- **用户数据库**：`sqlx`（SQLite，WAL）
 - **证书生成**：`rcgen`（仅历史参考，原 `tlsgen.rs` 已删除）；自签证书已存在于根目录 `cert.pem` / `key.pem`
 
 ## 约定

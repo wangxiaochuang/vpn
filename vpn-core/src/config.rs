@@ -13,12 +13,10 @@ pub enum ConfigError {
     MtuTooSmall(u16),
     #[error("tun subnet is invalid or has no allocatable addresses")]
     InvalidSubnet,
-    #[error("user list contains an empty username")]
-    EmptyUsername,
-    #[error("duplicate user: {0}")]
-    DuplicateUser(String),
-    #[error("password hash is not a valid argon2 PHC string")]
-    InvalidHash,
+    #[error("database url is missing, empty, or malformed")]
+    InvalidDatabaseUrl,
+    #[error("database backend {0} is not supported yet")]
+    UnsupportedDatabase(String),
     #[error("server_name must not be empty")]
     EmptyServerName,
     #[error("ca_cert must not be empty")]
@@ -69,9 +67,8 @@ mod tests {
                 .to_string(),
             ConfigError::MtuTooSmall(1000).to_string(),
             ConfigError::InvalidSubnet.to_string(),
-            ConfigError::EmptyUsername.to_string(),
-            ConfigError::DuplicateUser("alice".into()).to_string(),
-            ConfigError::InvalidHash.to_string(),
+            ConfigError::InvalidDatabaseUrl.to_string(),
+            ConfigError::UnsupportedDatabase("mysql".into()).to_string(),
         ]
     }
 
@@ -92,27 +89,16 @@ mod tests {
         assert!(all[1].contains("parse"));
         assert!(all[2].contains("1000") && all[2].contains("1280"));
         assert!(all[3].contains("subnet"));
-        assert!(all[4].contains("empty"));
-        assert!(all[5].contains("alice"));
-        assert!(all[6].contains("hash"));
+        assert!(all[4].contains("database"));
+        assert!(all[5].contains("mysql") && all[5].contains("not supported"));
     }
 
     #[test]
     fn test_default_route_not_allowed_display_is_distinct() {
         let default_route = ConfigError::DefaultRouteNotAllowed.to_string();
-        let all_others = [
-            ConfigError::Io(io_stub()).to_string(),
-            ConfigError::Parse(toml::from_str::<serde::de::IgnoredAny>("x =").unwrap_err())
-                .to_string(),
-            ConfigError::MtuTooSmall(1000).to_string(),
-            ConfigError::InvalidSubnet.to_string(),
-            ConfigError::EmptyUsername.to_string(),
-            ConfigError::DuplicateUser("alice".into()).to_string(),
-            ConfigError::InvalidHash.to_string(),
-            ConfigError::EmptyServerName.to_string(),
-            ConfigError::EmptyCaCert.to_string(),
-        ];
-        for other in &all_others {
+        let mut others = all_config_error_displays();
+        others.retain(|s| s != &default_route);
+        for other in &others {
             assert_ne!(&default_route, other);
         }
         assert!(default_route.contains("default route") || default_route.contains("0.0.0.0/0"));
@@ -132,8 +118,8 @@ mod tests {
     fn test_client_error_new_variants_display_distinct_from_existing() {
         let all = all_config_error_displays();
         assert_displays_unique(&all);
-        assert!(all[7].contains("server_name"));
-        assert!(all[8].contains("ca_cert"));
-        assert!(all[9].contains("default route"));
+        assert!(all[6].contains("server_name"));
+        assert!(all[7].contains("ca_cert"));
+        assert!(all[8].contains("default route"));
     }
 }

@@ -1,165 +1,182 @@
-use thiserror::Error;
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
+use std::fs;
+use std::path::Path;
 
-#[derive(Debug, Error)]
-pub enum UsersError {
-    #[error("empty username is not allowed")]
-    EmptyUsername,
+use anyhow::Context;
+use anyhow::bail;
+use toml::Table;
+use user_store::SqliteUserStore;
+use user_store::UserStore as _;
+
+use crate::hash;
+
+pub struct UserAdmin {
+    store: SqliteUserStore,
 }
 
-pub fn add_or_update_user(
-    doc: &mut DocumentMut,
-    username: &str,
-    password_hash: &str,
-) -> Result<bool, UsersError> {
-    if username.is_empty() {
-        return Err(UsersError::EmptyUsername);
+impl UserAdmin {
+    pub async fn open(config_path: &Path) -> anyhow::Result<Self> {
+        let db = read_db_url(config_path)?;
+        let store = SqliteUserStore::connect(&db)
+            .await
+            .with_context(|| format!("failed to open database {db}"))?;
+        Ok(Self { store })
     }
-    let root = doc.as_table_mut();
-    match root.get_mut("users") {
-        Some(Item::ArrayOfTables(arr)) => {
-            for user in arr.iter_mut() {
-                if user.get("username").and_then(Item::as_str) == Some(username) {
-                    user["password_hash"] = toml_edit::value(password_hash);
-                    return Ok(false);
-                }
-            }
-            let mut new_user = Table::new();
-            new_user["username"] = toml_edit::value(username);
-            new_user["password_hash"] = toml_edit::value(password_hash);
-            arr.push(new_user);
+
+    pub async fn add_user(&self, username: &str, password: &str) -> anyhow::Result<bool> {
+        if username.is_empty() {
+            bail!("empty username is not allowed");
         }
-        _ => {
-            let mut arr = ArrayOfTables::new();
-            let mut new_user = Table::new();
-            new_user["username"] = toml_edit::value(username);
-            new_user["password_hash"] = toml_edit::value(password_hash);
-            arr.push(new_user);
-            root.insert("users", Item::ArrayOfTables(arr));
-        }
+        let existed = self.store.password_hash(username).await?.is_some();
+        let phc = hash::hash_password(password);
+        self.store.upsert(username, &phc).await?;
+        Ok(!existed)
     }
-    Ok(true)
+
+    pub async fn list_users(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.store.list().await?)
+    }
+
+    pub async fn delete_user(&self, username: &str) -> anyhow::Result<bool> {
+        if username.is_empty() {
+            bail!("empty username is not allowed");
+        }
+        self.store.delete(username).await.map_err(Into::into)
+    }
+}
+
+pub fn read_db_url(config_path: &Path) -> anyhow::Result<String> {
+    let content = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read config file {}", config_path.display()))?;
+    let table = content
+        .parse::<Table>()
+        .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
+    let db = table
+        .get("server")
+        .and_then(|s| s.get("db"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if db.is_empty() {
+        bail!(
+            "config file {} has no [server].db field",
+            config_path.display()
+        );
+    }
+    Ok(db.to_string())
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
+    use std::io::Write;
 
-    fn doc(content: &str) -> DocumentMut {
-        DocumentMut::from_str(content).unwrap()
+    fn write_config(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join("server.toml");
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        path
     }
 
-    fn server_body() -> &'static str {
-        r#"[server]
-listen = "0.0.0.0:4433"
-mtu = 1280
-# keep me
-cert = "cert.pem"
-key = "key.pem"
-"#
+    fn config_body(db: &str) -> String {
+        format!("[server]\nlisten = \"0.0.0.0:4433\"\ndb = \"{db}\"\n")
     }
 
-    #[test]
-    fn test_users_add_when_new_user_appends_entry() {
-        let mut d = doc(server_body());
-        assert!(add_or_update_user(&mut d, "alice", "PHC1").unwrap());
-        let users = d
-            .as_table()
-            .get("users")
-            .and_then(Item::as_array_of_tables)
-            .expect("users array exists");
-        assert_eq!(users.len(), 1);
-        assert_eq!(users.get(0).unwrap()["username"].as_str(), Some("alice"));
-        assert_eq!(
-            users.get(0).unwrap()["password_hash"].as_str(),
-            Some("PHC1")
-        );
+    async fn temp_admin() -> (tempfile::TempDir, UserAdmin) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = format!("sqlite://{}", dir.path().join("users.db").display());
+        let path = write_config(&dir, &config_body(&db));
+        let admin = UserAdmin::open(&path).await.unwrap();
+        (dir, admin)
     }
 
     #[test]
-    fn test_users_add_when_existing_user_updates_hash_only() {
-        let mut d = doc(server_body());
-        assert!(add_or_update_user(&mut d, "alice", "PHC1").unwrap());
-        assert!(!add_or_update_user(&mut d, "alice", "PHC2").unwrap());
-        let users = d
-            .as_table()
-            .get("users")
-            .and_then(Item::as_array_of_tables)
-            .unwrap();
-        assert_eq!(users.len(), 1);
-        assert_eq!(users.get(0).unwrap()["username"].as_str(), Some("alice"));
-        assert_eq!(
-            users.get(0).unwrap()["password_hash"].as_str(),
-            Some("PHC2")
-        );
+    fn test_read_db_url_when_db_present_returns_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, &config_body("sqlite://users.db"));
+        assert_eq!(read_db_url(&path).unwrap(), "sqlite://users.db");
     }
 
     #[test]
-    fn test_users_edit_preserves_unrelated_content() {
-        let mut d = doc(server_body());
-        add_or_update_user(&mut d, "alice", "PHC1").unwrap();
-        let out = d.to_string();
-        assert!(out.contains("listen = \"0.0.0.0:4433\""));
-        assert!(out.contains("# keep me"));
-        assert!(out.contains("mtu = 1280"));
-        assert!(out.contains("cert = \"cert.pem\""));
+    fn test_read_db_url_when_db_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "[server]\nlisten = \"0.0.0.0:4433\"\n");
+        assert!(read_db_url(&path).is_err());
     }
 
     #[test]
-    fn test_users_add_when_no_users_section_creates_array() {
-        let mut d = doc(server_body());
-        assert!(add_or_update_user(&mut d, "bob", "PHC1").unwrap());
-        let users = d
-            .as_table()
-            .get("users")
-            .and_then(Item::as_array_of_tables)
-            .expect("users array created");
-        assert_eq!(users.len(), 1);
-        assert_eq!(users.get(0).unwrap()["username"].as_str(), Some("bob"));
+    fn test_read_db_url_when_file_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.toml");
+        assert!(read_db_url(&path).is_err());
     }
 
     #[test]
-    fn test_users_add_when_empty_username_returns_error() {
-        let mut d = doc(server_body());
-        let err = add_or_update_user(&mut d, "", "PHC1").unwrap_err();
-        assert!(matches!(err, UsersError::EmptyUsername));
+    fn test_read_db_url_when_toml_invalid_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "listen = ");
+        assert!(read_db_url(&path).is_err());
     }
 
-    #[test]
-    fn test_users_add_when_multiple_distinct_users_appends_both() {
-        let mut d = doc(server_body());
-        assert!(add_or_update_user(&mut d, "alice", "PHC1").unwrap());
-        assert!(add_or_update_user(&mut d, "bob", "PHC2").unwrap());
-        let users = d
-            .as_table()
-            .get("users")
-            .and_then(Item::as_array_of_tables)
-            .unwrap();
-        assert_eq!(users.len(), 2);
-        assert_eq!(users.get(1).unwrap()["username"].as_str(), Some("bob"));
+    #[tokio::test]
+    async fn test_open_when_config_db_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "[server]\nlisten = \"0.0.0.0:4433\"\n");
+        assert!(UserAdmin::open(&path).await.is_err());
     }
 
-    #[test]
-    fn test_users_add_when_update_preserves_other_users() {
-        let mut d = doc(server_body());
-        add_or_update_user(&mut d, "alice", "PHC1").unwrap();
-        add_or_update_user(&mut d, "bob", "PHC2").unwrap();
-        assert!(!add_or_update_user(&mut d, "alice", "PHC3").unwrap());
-        let users = d
-            .as_table()
-            .get("users")
-            .and_then(Item::as_array_of_tables)
-            .unwrap();
-        assert_eq!(users.len(), 2);
-        assert_eq!(
-            users.get(0).unwrap()["password_hash"].as_str(),
-            Some("PHC3")
-        );
-        assert_eq!(
-            users.get(1).unwrap()["password_hash"].as_str(),
-            Some("PHC2")
-        );
+    #[tokio::test]
+    async fn test_add_user_when_new_upserts_and_reports_added() {
+        let (_dir, admin) = temp_admin().await;
+        assert!(admin.add_user("alice", "s3cret").await.unwrap());
+        assert_eq!(admin.list_users().await.unwrap(), vec!["alice".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_add_user_when_existing_updates_hash_only() {
+        let (_dir, admin) = temp_admin().await;
+        admin.add_user("alice", "s3cret").await.unwrap();
+        assert!(!admin.add_user("alice", "rotated").await.unwrap());
+        assert_eq!(admin.list_users().await.unwrap(), vec!["alice".to_string()]);
+        let hash = admin.store.password_hash("alice").await.unwrap().unwrap();
+        assert_ne!(hash, hash::hash_password("s3cret"));
+    }
+
+    #[tokio::test]
+    async fn test_add_user_when_empty_username_rejected_without_write() {
+        let (_dir, admin) = temp_admin().await;
+        assert!(admin.add_user("", "s3cret").await.is_err());
+        assert!(admin.list_users().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_users_returns_sorted_usernames() {
+        let (_dir, admin) = temp_admin().await;
+        admin.add_user("carol", "pw").await.unwrap();
+        admin.add_user("alice", "pw").await.unwrap();
+        admin.add_user("bob", "pw").await.unwrap();
+        let expected = vec!["alice", "bob", "carol"];
+        let names = admin.list_users().await.unwrap();
+        let got: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_when_present_returns_true() {
+        let (_dir, admin) = temp_admin().await;
+        admin.add_user("alice", "pw").await.unwrap();
+        assert!(admin.delete_user("alice").await.unwrap());
+        assert!(admin.list_users().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_when_missing_returns_false() {
+        let (_dir, admin) = temp_admin().await;
+        assert!(!admin.delete_user("eve").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_delete_user_when_empty_username_rejected() {
+        let (_dir, admin) = temp_admin().await;
+        assert!(admin.delete_user("").await.is_err());
     }
 }

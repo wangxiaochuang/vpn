@@ -14,8 +14,9 @@ use quic_link::PacketSink;
 pub use quic_link::test_util::no_verify_client_config as client_config;
 pub use quic_link::test_util::repo_file as repo;
 use sysprobe::sink::TelemetrySink;
+use user_store::InMemoryUserStore;
 use vpn_core::vpn::AuthMethod;
-use vpn_server::auth::{PasswordAuthenticator, UserStore};
+use vpn_server::auth::PasswordAuthenticator;
 use vpn_server::config::ServerConfig;
 use vpn_server::ledger::ConnectionLedger;
 use vpn_server::server::AuthStore;
@@ -28,6 +29,7 @@ pub const ALICE_PASSWORD: &str = "s3cret";
 pub struct TestDeps {
     pub ledger: Arc<ConnectionLedger<ConnectionHandle>>,
     pub auth: Arc<AuthStore>,
+    pub store: Arc<dyn user_store::UserStore>,
     pub net_profile: Arc<ClientNetProfile>,
     pub telemetry: Arc<TelemetryPlane>,
 }
@@ -52,7 +54,7 @@ pub fn alice_users() -> Vec<(String, String)> {
     vec![("alice".to_string(), hash_password(ALICE_PASSWORD))]
 }
 
-pub fn test_config() -> ServerConfig {
+pub fn test_config(db: &str) -> ServerConfig {
     ServerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         tun_subnet: Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap(),
@@ -60,10 +62,7 @@ pub fn test_config() -> ServerConfig {
         cert: repo("cert.pem"),
         key: repo("key.pem"),
         routes: vec![],
-        users: vec![vpn_server::config::UserConfig {
-            username: "alice".to_string(),
-            password_hash: hash_password(ALICE_PASSWORD),
-        }],
+        db: db.to_string(),
     }
 }
 
@@ -76,13 +75,17 @@ pub fn net_profile(subnet: Ipv4Net, routes: Vec<Ipv4Net>) -> Arc<ClientNetProfil
     })
 }
 
-pub fn auth_store(users: Vec<(String, String)>) -> Arc<AuthStore> {
-    let store = UserStore::from_users(users).unwrap();
-    let authenticator = PasswordAuthenticator::new(store);
-    Arc::new(AuthStore {
+pub fn auth_store(
+    users: Vec<(String, String)>,
+) -> (Arc<AuthStore>, Arc<dyn user_store::UserStore>) {
+    let store: Arc<dyn user_store::UserStore> =
+        Arc::new(InMemoryUserStore::from_pairs(users).unwrap());
+    let authenticator = PasswordAuthenticator::new(store.clone());
+    let auth = Arc::new(AuthStore {
         authenticator: Arc::new(authenticator),
         supported_methods: vec![AuthMethod::Password],
-    })
+    });
+    (auth, store)
 }
 
 pub fn test_ledger(subnet: Ipv4Net) -> Arc<ConnectionLedger<ConnectionHandle>> {
@@ -101,9 +104,11 @@ fn build_test_deps(
     routes: Vec<Ipv4Net>,
     telemetry: Arc<TelemetryPlane>,
 ) -> Arc<TestDeps> {
+    let (auth, store) = auth_store(users);
     Arc::new(TestDeps {
         ledger: test_ledger(subnet),
-        auth: auth_store(users),
+        auth,
+        store,
         net_profile: net_profile(subnet, routes),
         telemetry,
     })
@@ -119,9 +124,11 @@ pub fn test_state_with_sink(
     sink: Arc<dyn TelemetrySink>,
 ) -> Arc<TestDeps> {
     let plane = Arc::new(TelemetryPlane::new(vec![sink]));
+    let (auth, store) = auth_store(users);
     Arc::new(TestDeps {
         ledger: test_ledger(subnet),
-        auth: auth_store(users),
+        auth,
+        store,
         net_profile: net_profile(subnet, vec![]),
         telemetry: plane,
     })
@@ -221,6 +228,30 @@ pub async fn start_test_server(
 ) -> (quinn::Endpoint, Arc<TestDeps>) {
     let (endpoint, state, _shutdown) = start_test_server_with_shutdown(users, subnet).await;
     (endpoint, state)
+}
+
+pub async fn start_test_server_with_store(
+    store: Arc<dyn user_store::UserStore>,
+    subnet: Ipv4Net,
+) -> (quinn::Endpoint, Arc<TestDeps>, shutdown::ShutdownHandle) {
+    let server_cfg = quic_link::build_quinn_server_config(&repo("cert.pem"), &repo("key.pem"))
+        .expect("server cfg");
+    let endpoint = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
+        .expect("server endpoint");
+    let authenticator = PasswordAuthenticator::new(store.clone());
+    let state = Arc::new(TestDeps {
+        ledger: test_ledger(subnet),
+        auth: Arc::new(AuthStore {
+            authenticator: Arc::new(authenticator),
+            supported_methods: vec![AuthMethod::Password],
+        }),
+        store,
+        net_profile: net_profile(subnet, vec![]),
+        telemetry: test_telemetry_plane(),
+    });
+    let handle = shutdown::Shutdown::default().handle();
+    spawn_accept_loop(endpoint.clone(), state.clone(), handle.clone()).await;
+    (endpoint, state, handle)
 }
 
 pub async fn start_test_server_with_routes(
