@@ -199,7 +199,8 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 
 - 客户端认证成功后 spawn 遥测 task，开流并**先发一条空 report 作为"开启信号"**；
 - 服务端认证成功后以 5s 超时（`TELEMETRY_ACCEPT_TIMEOUT`）accept 该 stream 并 spawn 服务端遥测 task；
-- 两侧 supervisor 的退出原因枚举中 `TelemetryEnded` 一律**忽略**（遥测退出不触发连接 cleanup）。
+- 两侧 supervisor 的退出原因枚举中 `TelemetryEnded` 一律**忽略**（遥测退出不触发连接 cleanup）；
+- 遥测 task panic 在 task 边界经 `catch_unwind` 捕获并归一化为 `TelemetryEnded` + `error!` 日志（代码兑现"采集 panic 不影响控制流与数据面"的承诺）；心跳 / 数据面 task panic 仍为致命 `TaskPanicked`。
 
 ### 8.2 采集与调度
 
@@ -282,7 +283,7 @@ Tun(Arc<AsyncDevice>)                                         // data plane 局�
 
 "信号 → 取消令牌 → JoinSet 带超时 drain"的协调逻辑抽为独立 workspace crate **`shutdown`**（`Shutdown` 持有 `CancellationToken` + drain 超时默认 5s，超时 `abort_all`；`Shutdown::spawn_signal_watchdog` 方法注册 SIGINT/SIGTERM → `trigger`，clone 在方法内部吸收，含 ready oneshot 握手；`wait_for_interrupt` 方法内联 select 兜底 ctrl_c；`Shutdown::with_signal_watchdog` 工厂一步完成"构造 + 装信号源 + ready 握手"）。调用方负责 conn/endpoint 的 close 顺序编排，crate 不持有传输资源。
 
-**`ConnExitCause` 关闭协议**（纯枚举"遗言"契约）：`ServerShutdown`（全局 sd 触发）/ `CtrlEnded` / `UplinkEnded` / `TelemetryEnded`（被忽略）/ `TaskPanicked` → 各自映射 close code/reason。`ServerShutdown` 时先 drain 后 close（让 ctrl task 发送 Disconnect 通知再关连接），其他 cause 先 close 后 drain（session.close 打断卡住的 recv）。每 task 返回 ConnExitCause；task panic 经 JoinSet::join_next Err 可见（error! 日志）。不引入 per-conn cancel token、绝不 trigger 全局 sd——session.close 自然打断所有 task。
+**`ConnExitCause` 关闭协议**（纯枚举"遗言"契约）：`ServerShutdown`（全局 sd 触发）/ `CtrlEnded` / `UplinkEnded` / `TelemetryEnded`（被忽略）/ `TaskPanicked` → 各自映射 close code/reason。`ServerShutdown` 时先 drain 后 close（让 ctrl task 发送 Disconnect 通知再关连接），其他 cause 先 close 后 drain（session.close 打断卡住的 recv）。每 task 返回 ConnExitCause；心跳 / 数据面 task panic 经 JoinSet::join_next Err 可见（error! 日志），遥测 task panic 则在 task 边界经 catch_unwind 归一化为 `TelemetryEnded`（非致命）。不引入 per-conn cancel token、绝不 trigger 全局 sd——session.close 自然打断所有 task。
 
 服务端 Ctrl-C/SIGTERM：
 
@@ -323,7 +324,7 @@ ClientConfig + Collector
                                                └──────┬───────┘
                                                 run(self, &sd)
                                                        ▼
-                                               DataPlane::spawn + run
+                                                ConnectionSupervisor::spawn + run
 ```
 
 各阶段步骤（方法名即代码入口）：
@@ -353,15 +354,16 @@ ClientConfig + Collector
            TUN 地址 = 服务端分配的虚拟 IP（区别于服务端的网关地址）
            macOS 显式 associate_route(true)
        → ensure_subnet_route(dev, subnet) + add_routes(dev, &params.routes)
-       → DataPlane::spawn(session.clone(), Tun(tun), channel, sd)
-       → 4 个数据面 task 一批 spawn 进 JoinSet<ExitCause>:
+        → ConnectionSupervisor::spawn(session.clone(), Tun(tun), channel, sd)
+        → 4 类连接 task 一批 spawn 进 JoinSet<ExitCause>:
          心跳（keepalive_loop：每 10s 发心跳，30s 判死；收到 Disconnect → 立即退出）
          上行 forward(Tun, datagram_tx, cancel)、下行 forward(datagram_rx, Tun, cancel)、遥测
        → 每个 task 返回 ExitCause（"遗言"契约：Interrupted/ServerDisconnect/HeartbeatEnded/
          UplinkEnded/DownlinkEnded/TelemetryEnded/TaskPanicked）
-  6. plane.run(sd).await（DataPlane supervisor）
-       → tokio::select!(biased) 监听 sd.triggered()（Ctrl+C/SIGTERM → Interrupted）
-         与 JoinSet::join_next()（首个 task 遗言；JoinError → error! + TaskPanicked）
+   6. supervisor.run(sd).await（ConnectionSupervisor，`client/supervisor.rs` 与服务端 `server/supervisor.rs` 布局对齐）
+        → tokio::select!(biased) 监听 sd.triggered()（Ctrl+C/SIGTERM → Interrupted）
+          与 JoinSet::join_next()（首个 task 遗言；JoinError → error! + TaskPanicked；
+          遥测 task panic 已在 task 边界归一化为 TelemetryEnded，不会以 JoinError 形态到达）
        → TelemetryEnded 被忽略并 continue（遥测退出不影响整体关闭之外的面）
        → 其余 ExitCause → session.close(cause.code(), cause.reason()) 通知对端
        → sd.trigger() 广播取消 → sd.drain(&mut tasks) 等待清理（5s 超时 abort）

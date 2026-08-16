@@ -12,7 +12,7 @@ use bytes::Bytes;
 use quic_link::Session;
 use shutdown::Shutdown;
 use sysprobe::proto::TelemetryMessage;
-use vpn_client::client::{DataPlane, ExitCause};
+use vpn_client::client::{ConnectionSupervisor, ExitCause};
 use vpn_core::ctrl::control_message::Msg;
 use vpn_core::ctrl::{ControlMessage, Heartbeat};
 
@@ -90,14 +90,15 @@ async fn open_control_pair(
 }
 
 #[tokio::test]
-async fn test_data_plane_core_task_end_triggers_teardown() {
+async fn test_supervisor_core_task_end_triggers_teardown() {
     let pair = common::make_connected_pair().await;
     let (channel, server_sender) = open_control_pair(&pair).await;
 
     let sd = Shutdown::default();
-    let plane = DataPlane::spawn(client_session(&pair), MockTun::new(MODE_ERR), channel, &sd);
+    let supervisor =
+        ConnectionSupervisor::spawn(client_session(&pair), MockTun::new(MODE_ERR), channel, &sd);
 
-    let cause = plane.run(sd.clone()).await;
+    let cause = supervisor.run(sd.clone()).await;
     assert_eq!(cause, ExitCause::UplinkEnded);
     let observed = tokio::time::timeout(Duration::from_secs(2), async {
         while pair.server.close_reason().is_none() {
@@ -114,7 +115,7 @@ async fn test_data_plane_core_task_end_triggers_teardown() {
 }
 
 #[tokio::test]
-async fn test_data_plane_telemetry_end_ignored_and_wait_continues() {
+async fn test_supervisor_telemetry_end_ignored_and_wait_continues() {
     let pair = common::make_connected_pair().await;
     let (channel, server_sender) = open_control_pair(&pair).await;
 
@@ -128,13 +129,13 @@ async fn test_data_plane_telemetry_end_ignored_and_wait_continues() {
 
     let sd = Shutdown::default();
     let sd_for_run = sd.clone();
-    let plane = DataPlane::spawn(
+    let supervisor = ConnectionSupervisor::spawn(
         client_session(&pair),
         MockTun::new(MODE_PENDING),
         channel,
         &sd,
     );
-    let mut run_task = tokio::spawn(async move { plane.run(sd_for_run).await });
+    let mut run_task = tokio::spawn(async move { supervisor.run(sd_for_run).await });
 
     let server_channel = tokio::time::timeout(Duration::from_secs(3), server_accept)
         .await
@@ -159,18 +160,18 @@ async fn test_data_plane_telemetry_end_ignored_and_wait_continues() {
 }
 
 #[tokio::test]
-async fn test_data_plane_task_panic_maps_to_task_panicked() {
+async fn test_supervisor_task_panic_maps_to_task_panicked() {
     let pair = common::make_connected_pair().await;
     let (channel, server_sender) = open_control_pair(&pair).await;
 
     let sd = Shutdown::default();
-    let plane = DataPlane::spawn(
+    let supervisor = ConnectionSupervisor::spawn(
         client_session(&pair),
         MockTun::new(MODE_PANIC),
         channel,
         &sd,
     );
-    let run_task = tokio::spawn(async move { plane.run(sd).await });
+    let run_task = tokio::spawn(async move { supervisor.run(sd).await });
     let cause = tokio::time::timeout(Duration::from_secs(3), run_task)
         .await
         .expect("run should resolve")

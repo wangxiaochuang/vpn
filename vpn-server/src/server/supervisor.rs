@@ -215,7 +215,16 @@ async fn telemetry_task(
     let (writer, reader) = channel.split();
     set_telemetry_sender(&telemetry_tx, writer).await;
     let source = build_sink_source(&session, &username);
-    crate::telemetry::server_telemetry_loop(reader, telemetry, source, shutdown).await;
+    let fut = async move {
+        crate::telemetry::server_telemetry_loop(reader, telemetry, source, shutdown).await;
+    };
+    guarded_telemetry(fut).await
+}
+
+async fn guarded_telemetry<F: Future<Output = ()>>(fut: F) -> ConnExitCause {
+    if let Err(panic) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await {
+        tracing::error!("telemetry task panicked: {panic:?}");
+    }
     ConnExitCause::TelemetryEnded
 }
 
@@ -295,5 +304,17 @@ mod tests {
             sd.cancelled().await;
             log.lock().unwrap().push(tag);
         });
+    }
+
+    #[tokio::test]
+    async fn test_guarded_telemetry_normalizes_panic() {
+        let cause = guarded_telemetry(async { panic!("telemetry boom") }).await;
+        assert_eq!(cause, ConnExitCause::TelemetryEnded);
+    }
+
+    #[tokio::test]
+    async fn test_guarded_telemetry_normal_exit() {
+        let cause = guarded_telemetry(async {}).await;
+        assert_eq!(cause, ConnExitCause::TelemetryEnded);
     }
 }

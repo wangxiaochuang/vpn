@@ -1,10 +1,10 @@
-mod data_plane;
 mod established;
 mod preauth;
+mod supervisor;
 
-pub use self::data_plane::{DataPlane, ExitCause, heartbeat_loop};
 pub use self::established::EstablishedClient;
 pub use self::preauth::{ClientError, PreAuthClient, parse_auth_ok};
+pub use self::supervisor::{ConnectionSupervisor, ExitCause, heartbeat_loop};
 
 use std::net::Ipv4Addr;
 

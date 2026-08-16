@@ -1,7 +1,7 @@
 use anyhow::Context;
 
 use super::ClientTunParams;
-use super::data_plane::DataPlane;
+use super::supervisor::ConnectionSupervisor;
 use msgx::Channel;
 use quic_link::Session;
 use shutdown::Shutdown;
@@ -38,8 +38,9 @@ impl EstablishedClient {
     pub async fn run(self, sd: &Shutdown) -> anyhow::Result<()> {
         let tun = setup_tun(&self.params)?;
         log_client_authenticated(&self.params);
-        let plane = DataPlane::spawn(self.session.clone(), Tun(tun), self.channel, sd);
-        let cause = plane.run(sd.clone()).await;
+        let supervisor =
+            ConnectionSupervisor::spawn(self.session.clone(), Tun(tun), self.channel, sd);
+        let cause = supervisor.run(sd.clone()).await;
         tracing::info!("client exited: {cause}");
         Ok(())
     }

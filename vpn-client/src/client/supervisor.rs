@@ -10,7 +10,7 @@ use vpn_core::data::{PacketSink, PacketSource, forward};
 use vpn_core::vpn::ControlMessage;
 use vpn_core::vpn::control_message::Msg;
 
-/// 数据面 task 的结束原因（"遗言"契约）。纯枚举，不携带错误信息。
+/// 连接 supervisor 各 task 的结束原因（"遗言"契约）。纯枚举，不携带错误信息。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCause {
     Interrupted,
@@ -135,14 +135,14 @@ fn resolve_cause(saw_disconnect: bool, shutdown: &ShutdownHandle) -> ExitCause {
     }
 }
 
-/// 数据面 supervisor：集中 spawn 心跳/上行/下行/遥测 task，并统一关闭协调。
-pub struct DataPlane<S> {
+/// 每连接 supervisor：集中 spawn 心跳/上行/下行/遥测 task，并统一关闭协调。
+pub struct ConnectionSupervisor<S> {
     session: Session,
     tasks: tokio::task::JoinSet<ExitCause>,
     _tun: std::marker::PhantomData<S>,
 }
 
-impl<S> DataPlane<S>
+impl<S> ConnectionSupervisor<S>
 where
     S: PacketSource + PacketSink + Clone + Unpin + Send + Sync + 'static,
 {
@@ -249,7 +249,17 @@ fn spawn_telemetry_task(
     sd: &Shutdown,
 ) {
     let handle = sd.handle();
-    tasks.spawn(async move { crate::telemetry::run_client_telemetry(session, handle).await });
+    let fut = async move {
+        crate::telemetry::run_client_telemetry(session, handle).await;
+    };
+    tasks.spawn(guarded_telemetry(fut));
+}
+
+async fn guarded_telemetry<F: Future<Output = ()>>(fut: F) -> ExitCause {
+    if let Err(panic) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await {
+        tracing::error!("telemetry task panicked: {panic:?}");
+    }
+    ExitCause::TelemetryEnded
 }
 
 async fn downlink<S>(session: Session, tun: S, cancel: ShutdownHandle) -> ExitCause
@@ -313,5 +323,17 @@ mod tests {
         let a = ExitCause::HeartbeatEnded;
         let b = a;
         assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn test_guarded_telemetry_normalizes_panic() {
+        let cause = guarded_telemetry(async { panic!("telemetry boom") }).await;
+        assert_eq!(cause, ExitCause::TelemetryEnded);
+    }
+
+    #[tokio::test]
+    async fn test_guarded_telemetry_normal_exit() {
+        let cause = guarded_telemetry(async {}).await;
+        assert_eq!(cause, ExitCause::TelemetryEnded);
     }
 }
