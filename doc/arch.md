@@ -294,7 +294,7 @@ Tun(Arc<AsyncDevice>)                                         // data plane 局�
 
 客户端 Ctrl-C 或任一 task 结束：广播 cancel → conn.close → 等各 task 清理（`sd.drain`，5s 超时 abort 兜底）→ endpoint.close（endpoint 生命周期由连接建立流程返回，延长到数据面结束）。
 
-客户端在 `run()` 入口即注册 SIGINT/SIGTERM watchdog（await ready 握手确保 handler 注册完成），避免用户名/密码输入期间 rpassword 的 raise(SIGINT) 触发 SIG_DFL 杀死进程导致终端 ISIG 残留（之后 Ctrl-C 只产生字节不产生信号）；用户名/密码读取用 spawn_blocking 让出 runtime 保证 handler 尽快注册。
+客户端在 `VpnClient::run()` 内部、任何连接与密码读取之前注册 SIGINT/SIGTERM watchdog（await ready 握手确保 handler 注册完成），避免用户名/密码输入期间 rpassword 的 raise(SIGINT) 触发 SIG_DFL 杀死进程导致终端 ISIG 残留（之后 Ctrl-C 只产生字节不产生信号）；用户名/密码读取用 spawn_blocking 让出 runtime 保证 handler 尽快注册。`Shutdown` 对薄函数入口（`client::run` / `client::run_with_credentials`）完全封装，调用方无需传入或返回。
 
 客户端收到服务端 Disconnect：心跳循环经回调识别后立即退出（不等 30s 心跳超时），触发优雅关闭流程。
 
@@ -302,42 +302,70 @@ Tun(Arc<AsyncDevice>)                                         // data plane 局�
 
 ### 10.3 客户端运行流程
 
-`vpn-client --config client.toml` 的运行流程（与服务端对称，客户端是主动方）：
+`vpn-client --config client.toml` 的运行流程（与服务端对称，客户端是主动方）。启动链路以三个对象组织（`vpn-client/src/client/`，与服务端 `server/{mod,conn,...}` 布局对齐）：
 
 ```
- 1. connect_and_recv_hello(config)
-      → Client::builder + connect 建立 QUIC 连接（quic-link 封装，TLS 校验由 trust_ca/server_name 配置）
-      → 打开控制 stream，发送 open signal（触发服务端 accept_bi）
-      → 接收 ServerHello，校验 protocol_version == PROTOCOL_VERSION（不兼容则退出，不提示密码）
- 2. 交互式读取用户名（rpassword，不回显），空用户名直接退出；再交互式读取密码（rpassword，不回显）
-      → 凭据收集移至连接建立之后，服务端不可达时不白问密码
- 3. authenticate(channel, collector)
-      → CredentialCollector::collect_init → 构造 AuthInit{ username, PasswordAuth{ password } }
-      → 发送 AuthInit, 进入 challenge-response loop:
-         - AuthOk{ assigned_ip, subnet, gateway, mtu, routes }
-             → parse_auth_ok 校验（§3.2）
-             → 返回 EstablishedClient（session / channel / params / endpoint，endpoint 字段声明在最后
-               → 析构顺序保证 endpoint 活得比所有使用 session 的 task 更久，无需 std::mem::forget）
-         - AuthDenied{ reason } → 打印可读信息退出（不建 TUN）
-         - AuthChallenge{ challenge } → collect_response → 发送 AuthResponse → 继续 loop
- 4. setup_tun(&est.params)
-      → create_client_tun(assigned_ip, subnet, mtu)
-          TUN 地址 = 服务端分配的虚拟 IP（区别于服务端的网关地址）
-          macOS 显式 associate_route(true)
-      → ensure_subnet_route(dev, subnet) + add_routes(dev, &params.routes)
- 5. DataPlane::spawn(est.session.clone(), Tun(tun), est.channel, &sd)
-      → 4 个数据面 task 一批 spawn 进 JoinSet<ExitCause>:
-        心跳（keepalive_loop：每 10s 发心跳，30s 判死；收到 Disconnect → 立即退出）
-        上行 forward(Tun, datagram_tx, cancel)、下行 forward(datagram_rx, Tun, cancel)、遥测
-      → 每个 task 返回 ExitCause（"遗言"契约：Interrupted/ServerDisconnect/HeartbeatEnded/
-        UplinkEnded/DownlinkEnded/TelemetryEnded/TaskPanicked）
- 6. plane.run(sd).await（DataPlane supervisor）
-      → tokio::select!(biased) 监听 sd.triggered()（Ctrl+C/SIGTERM → Interrupted）
-        与 JoinSet::join_next()（首个 task 遗言；JoinError → error! + TaskPanicked）
-      → TelemetryEnded 被忽略并 continue（遥测退出不影响整体关闭之外的面）
-      → 其余 ExitCause → session.close(cause.code(), cause.reason()) 通知对端
-      → sd.trigger() 广播取消 → sd.drain(&mut tasks) 等待清理（5s 超时 abort）
- 7. run 返回后 EstablishedClient 按字段顺序析构（session 先、endpoint 最后），进程退出（不自动重连）
+ClientConfig + Collector
+        │ client::run / client::run_with_credentials（薄函数入口）
+        │   = VpnClient::new(config, collector).run()
+        ▼
+   ┌──────────────┐  PreAuthClient::connect(config)   ┌──────────────┐
+   │  VpnClient   │ ────────────────────────────────► │ PreAuthClient│
+   │ config (私有) │                                   │  字段全私有   │
+   │ collector    │ ◄─── &mut collector ──┐            └──────┬───────┘
+   └──────┬───────┘                        │          authenticate(&mut C)
+          │ run(mut self)                  │          （消费 self，内部组装）
+          │  sd = Shutdown::with_signal_watchdog()     │
+          │  est.run(&sd)                  │                   ▼
+          ▼                                └───────── ┌──────────────┐
+                                               │Established   │
+                                               │Client 字段私有│
+                                               └──────┬───────┘
+                                                run(self, &sd)
+                                                       ▼
+                                               DataPlane::spawn + run
+```
+
+各阶段步骤（方法名即代码入口）：
+
+```
+  1. VpnClient::run(mut self)
+       → 内部构造 Shutdown::with_signal_watchdog()（ready await 完成后才继续，
+         保证密码输入期 Ctrl-C 可被捕获）
+  2. PreAuthClient::connect(config)
+       → Client::builder + connect 建立 QUIC 连接（quic-link 封装，TLS 校验由 trust_ca/server_name 配置）
+       → 打开控制 stream，发送 open signal（触发服务端 accept_bi）
+       → 接收 ServerHello，校验 protocol_version == PROTOCOL_VERSION（不兼容则退出，不提示密码）
+  3. 交互式读取用户名（rpassword，不回显），空用户名直接退出；再交互式读取密码（rpassword，不回显）
+       → 凭据收集移至连接建立之后，服务端不可达时不白问密码
+  4. PreAuthClient::authenticate(mut self, collector)
+       → CredentialCollector::collect_init → 构造 AuthInit{ username, PasswordAuth{ password } }
+       → 发送 AuthInit, 进入 challenge-response loop:
+          - AuthOk{ assigned_ip, subnet, gateway, mtu, routes }
+              → parse_auth_ok 校验（§3.2）
+              → 方法内部组装并返回 EstablishedClient（session / channel / params / endpoint，
+                endpoint 字段声明在最后 → 析构顺序保证 endpoint 活得比所有使用 session 的
+                task 更久，无需 std::mem::forget）
+          - AuthDenied{ reason } → 打印可读信息退出（不建 TUN）
+          - AuthChallenge{ challenge } → collect_response → 发送 AuthResponse → 继续 loop
+  5. EstablishedClient::run(self, &sd)
+       → setup_tun(params)：create_client_tun(assigned_ip, subnet, mtu)
+           TUN 地址 = 服务端分配的虚拟 IP（区别于服务端的网关地址）
+           macOS 显式 associate_route(true)
+       → ensure_subnet_route(dev, subnet) + add_routes(dev, &params.routes)
+       → DataPlane::spawn(session.clone(), Tun(tun), channel, sd)
+       → 4 个数据面 task 一批 spawn 进 JoinSet<ExitCause>:
+         心跳（keepalive_loop：每 10s 发心跳，30s 判死；收到 Disconnect → 立即退出）
+         上行 forward(Tun, datagram_tx, cancel)、下行 forward(datagram_rx, Tun, cancel)、遥测
+       → 每个 task 返回 ExitCause（"遗言"契约：Interrupted/ServerDisconnect/HeartbeatEnded/
+         UplinkEnded/DownlinkEnded/TelemetryEnded/TaskPanicked）
+  6. plane.run(sd).await（DataPlane supervisor）
+       → tokio::select!(biased) 监听 sd.triggered()（Ctrl+C/SIGTERM → Interrupted）
+         与 JoinSet::join_next()（首个 task 遗言；JoinError → error! + TaskPanicked）
+       → TelemetryEnded 被忽略并 continue（遥测退出不影响整体关闭之外的面）
+       → 其余 ExitCause → session.close(cause.code(), cause.reason()) 通知对端
+       → sd.trigger() 广播取消 → sd.drain(&mut tasks) 等待清理（5s 超时 abort）
+  7. run 返回后 EstablishedClient 按字段顺序析构（session 先、endpoint 最后），进程退出（不自动重连）
 ```
 
 **split tunneling 路由说明**：客户端把 `subnet` 内的流量导入 TUN（Linux 上执行 `ip route add <subnet> dev <dev>`，幂等；macOS/BSD 依赖 tun-rs `associate_route` 自动加/删路由，客户端在 TUN 构造时显式开启）。此外服务端可通过配置 `routes` 字段声明需通过 VPN 访问的额外子网（如服务端背后的办公内网 `192.168.100.0/24`），认证成功后随 `AuthOk` 下发；客户端用 `route_manager` crate 程序化将这些路由绑定到 TUN 接口（跨平台：Linux netlink / macOS-BSD PF_ROUTE / Windows IP Helper），不 shell out 调用系统命令。`0.0.0.0/0`（默认路由）被配置阶段拒绝。**不做全流量代理**（默认路由 + server `/32` 例外方案），外网流量不经由服务端转发。

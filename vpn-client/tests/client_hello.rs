@@ -5,7 +5,7 @@ mod common;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use vpn_client::client::{ClientError, connect_and_recv_hello};
+use vpn_client::client::{ClientError, PreAuthClient};
 use vpn_client::config::ClientConfig;
 use vpn_core::ctrl::AuthOk;
 use vpn_core::ctrl::ControlMessage;
@@ -64,12 +64,12 @@ fn mismatch_config(addr: std::net::SocketAddr) -> ClientConfig {
 }
 
 #[tokio::test]
-async fn test_connect_and_recv_hello_when_connection_fails_returns_err() {
+async fn test_preauth_connect_when_connection_fails_returns_err() {
     let good = server_hello(vpn_core::ctrl::PROTOCOL_VERSION);
     let (addr, _guard) = mock_server(good).await;
     let err = tokio::time::timeout(
         Duration::from_secs(5),
-        connect_and_recv_hello(&mismatch_config(addr)),
+        PreAuthClient::connect(&mismatch_config(addr)),
     )
     .await
     .expect("TLS name mismatch should fail fast, not hang");
@@ -80,10 +80,10 @@ async fn test_connect_and_recv_hello_when_connection_fails_returns_err() {
 }
 
 #[tokio::test]
-async fn test_connect_and_recv_hello_when_version_mismatch_returns_incompatible() {
+async fn test_preauth_connect_when_version_mismatch_returns_incompatible() {
     let bad = server_hello(99);
     let (addr, _guard) = mock_server(bad).await;
-    let err = match connect_and_recv_hello(&client_config(addr)).await {
+    let err = match PreAuthClient::connect(&client_config(addr)).await {
         Ok(_) => panic!("version mismatch must fail"),
         Err(e) => e,
     };
@@ -94,7 +94,7 @@ async fn test_connect_and_recv_hello_when_version_mismatch_returns_incompatible(
 }
 
 #[tokio::test]
-async fn test_connect_and_recv_hello_when_first_not_server_hello_returns_protocol_err() {
+async fn test_preauth_connect_when_first_not_server_hello_returns_protocol_err() {
     let not_hello = ControlMessage {
         msg: Some(Msg::AuthOk(AuthOk {
             assigned_ip: "10.0.0.2".to_string(),
@@ -105,7 +105,7 @@ async fn test_connect_and_recv_hello_when_first_not_server_hello_returns_protoco
         })),
     };
     let (addr, _guard) = mock_server(not_hello).await;
-    let err = match connect_and_recv_hello(&client_config(addr)).await {
+    let err = match PreAuthClient::connect(&client_config(addr)).await {
         Ok(_) => panic!("non-ServerHello first message must fail"),
         Err(e) => e,
     };
@@ -119,15 +119,15 @@ async fn test_connect_and_recv_hello_when_first_not_server_hello_returns_protoco
 }
 
 #[tokio::test]
-async fn test_connect_and_recv_hello_when_valid_server_hello_returns_ok() {
+async fn test_preauth_connect_when_valid_server_hello_returns_ok() {
     let good = server_hello(vpn_core::ctrl::PROTOCOL_VERSION);
     let (addr, _guard) = mock_server(good).await;
     let pre = tokio::time::timeout(
         Duration::from_secs(5),
-        connect_and_recv_hello(&client_config(addr)),
+        PreAuthClient::connect(&client_config(addr)),
     )
     .await
     .expect("timed out")
     .expect("valid ServerHello should succeed");
-    let _ = pre.session.id();
+    let _ = pre.session_id();
 }
