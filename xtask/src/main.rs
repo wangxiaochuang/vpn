@@ -5,6 +5,7 @@ use anyhow::bail;
 use clap::{Parser, Subcommand};
 
 mod hash;
+mod telemetry_query;
 mod users;
 
 #[derive(Parser)]
@@ -30,6 +31,7 @@ enum Command {
         config: PathBuf,
         username: String,
     },
+    TelemetryQuery(telemetry_query::Args),
 }
 
 #[tokio::main]
@@ -39,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
         Command::AddUser { config, username } => add_user(&config, &username).await,
         Command::ListUsers { config } => list_users(&config).await,
         Command::DeleteUser { config, username } => delete_user(&config, &username).await,
+        Command::TelemetryQuery(args) => telemetry_query::run(&args).await,
     }
 }
 

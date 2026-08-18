@@ -18,6 +18,7 @@
 pub mod auth;
 pub mod config;
 pub mod ctrl;
+pub mod db;
 pub mod ipam;
 pub mod ledger;
 pub mod route;

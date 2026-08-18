@@ -14,10 +14,10 @@ use quic_link::PacketSink;
 pub use quic_link::test_util::no_verify_client_config as client_config;
 pub use quic_link::test_util::repo_file as repo;
 use sysprobe::sink::TelemetrySink;
-use user_store::InMemoryUserStore;
 use vpn_core::vpn::AuthMethod;
 use vpn_server::auth::PasswordAuthenticator;
 use vpn_server::config::ServerConfig;
+use vpn_server::db::open_user_store;
 use vpn_server::ledger::ConnectionLedger;
 use vpn_server::server::AuthStore;
 use vpn_server::server::ClientNetProfile;
@@ -29,9 +29,10 @@ pub const ALICE_PASSWORD: &str = "s3cret";
 pub struct TestDeps {
     pub ledger: Arc<ConnectionLedger<ConnectionHandle>>,
     pub auth: Arc<AuthStore>,
-    pub store: Arc<dyn user_store::UserStore>,
+    pub store: Arc<dyn vpn_server::db::UserStore>,
     pub net_profile: Arc<ClientNetProfile>,
     pub telemetry: Arc<TelemetryPlane>,
+    _db_dir: tempfile::TempDir,
 }
 
 pub struct DiscardSink;
@@ -62,7 +63,8 @@ pub fn test_config(db: &str) -> ServerConfig {
         cert: repo("cert.pem"),
         key: repo("key.pem"),
         routes: vec![],
-        db: db.to_string(),
+        users_db: db.to_string(),
+        telemetry_db: db.to_string(),
     }
 }
 
@@ -75,17 +77,25 @@ pub fn net_profile(subnet: Ipv4Net, routes: Vec<Ipv4Net>) -> Arc<ClientNetProfil
     })
 }
 
-pub fn auth_store(
+pub async fn auth_store(
     users: Vec<(String, String)>,
-) -> (Arc<AuthStore>, Arc<dyn user_store::UserStore>) {
-    let store: Arc<dyn user_store::UserStore> =
-        Arc::new(InMemoryUserStore::from_pairs(users).unwrap());
+) -> (
+    Arc<AuthStore>,
+    Arc<dyn vpn_server::db::UserStore>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("users.db").display());
+    let store = open_user_store(&url).await.unwrap();
+    for (username, phc) in users {
+        store.upsert(&username, &phc).await.unwrap();
+    }
     let authenticator = PasswordAuthenticator::new(store.clone());
     let auth = Arc::new(AuthStore {
         authenticator: Arc::new(authenticator),
         supported_methods: vec![AuthMethod::Password],
     });
-    (auth, store)
+    (auth, store, dir)
 }
 
 pub fn test_ledger(subnet: Ipv4Net) -> Arc<ConnectionLedger<ConnectionHandle>> {
@@ -98,48 +108,53 @@ pub fn test_telemetry_plane() -> Arc<TelemetryPlane> {
     ]))
 }
 
-fn build_test_deps(
+async fn build_test_deps(
     subnet: Ipv4Net,
     users: Vec<(String, String)>,
     routes: Vec<Ipv4Net>,
     telemetry: Arc<TelemetryPlane>,
 ) -> Arc<TestDeps> {
-    let (auth, store) = auth_store(users);
+    let (auth, store, db_dir) = auth_store(users).await;
     Arc::new(TestDeps {
         ledger: test_ledger(subnet),
         auth,
         store,
         net_profile: net_profile(subnet, routes),
         telemetry,
+        _db_dir: db_dir,
     })
 }
 
-pub fn test_state_with_subnet(subnet: Ipv4Net, users: Vec<(String, String)>) -> Arc<TestDeps> {
-    test_state_with_subnet_and_routes(subnet, users, vec![])
+pub async fn test_state_with_subnet(
+    subnet: Ipv4Net,
+    users: Vec<(String, String)>,
+) -> Arc<TestDeps> {
+    test_state_with_subnet_and_routes(subnet, users, vec![]).await
 }
 
-pub fn test_state_with_sink(
+pub async fn test_state_with_sink(
     subnet: Ipv4Net,
     users: Vec<(String, String)>,
     sink: Arc<dyn TelemetrySink>,
 ) -> Arc<TestDeps> {
     let plane = Arc::new(TelemetryPlane::new(vec![sink]));
-    let (auth, store) = auth_store(users);
+    let (auth, store, db_dir) = auth_store(users).await;
     Arc::new(TestDeps {
         ledger: test_ledger(subnet),
         auth,
         store,
         net_profile: net_profile(subnet, vec![]),
         telemetry: plane,
+        _db_dir: db_dir,
     })
 }
 
-pub fn test_state_with_subnet_and_routes(
+pub async fn test_state_with_subnet_and_routes(
     subnet: Ipv4Net,
     users: Vec<(String, String)>,
     routes: Vec<Ipv4Net>,
 ) -> Arc<TestDeps> {
-    build_test_deps(subnet, users, routes, test_telemetry_plane())
+    build_test_deps(subnet, users, routes, test_telemetry_plane()).await
 }
 
 pub async fn make_test_state() -> Arc<TestDeps> {
@@ -147,6 +162,7 @@ pub async fn make_test_state() -> Arc<TestDeps> {
         Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap(),
         alice_users(),
     )
+    .await
 }
 
 pub fn client_endpoint() -> quinn::Endpoint {
@@ -231,7 +247,7 @@ pub async fn start_test_server(
 }
 
 pub async fn start_test_server_with_store(
-    store: Arc<dyn user_store::UserStore>,
+    store: Arc<dyn vpn_server::db::UserStore>,
     subnet: Ipv4Net,
 ) -> (quinn::Endpoint, Arc<TestDeps>, shutdown::ShutdownHandle) {
     let server_cfg = quic_link::build_quinn_server_config(&repo("cert.pem"), &repo("key.pem"))
@@ -248,6 +264,7 @@ pub async fn start_test_server_with_store(
         store,
         net_profile: net_profile(subnet, vec![]),
         telemetry: test_telemetry_plane(),
+        _db_dir: tempfile::tempdir().unwrap(),
     });
     let handle = shutdown::Shutdown::default().handle();
     spawn_accept_loop(endpoint.clone(), state.clone(), handle.clone()).await;
@@ -263,7 +280,7 @@ pub async fn start_test_server_with_routes(
         .expect("server cfg");
     let endpoint = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
         .expect("server endpoint");
-    let state = test_state_with_subnet_and_routes(subnet, users, routes);
+    let state = test_state_with_subnet_and_routes(subnet, users, routes).await;
 
     let handle = shutdown::Shutdown::default().handle();
     spawn_accept_loop(endpoint.clone(), state.clone(), handle.clone()).await;
@@ -290,7 +307,7 @@ pub async fn start_test_server_with_shutdown(
         .expect("server cfg");
     let endpoint = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap())
         .expect("server endpoint");
-    let state = test_state_with_subnet(subnet, users);
+    let state = test_state_with_subnet(subnet, users).await;
 
     let sd = shutdown::Shutdown::default();
     spawn_accept_loop(endpoint.clone(), state.clone(), sd.handle()).await;

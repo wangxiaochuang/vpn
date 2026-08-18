@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
+use crate::db::UserStore;
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use async_trait::async_trait;
 use thiserror::Error;
 use tracing::error;
 use tracing::warn;
-use user_store::UserStore;
 use vpn_core::vpn::AuthChallenge;
 use vpn_core::vpn::AuthInit;
 use vpn_core::vpn::AuthResponse;
@@ -119,26 +119,26 @@ fn extract_password(init: &AuthInit) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::db::DbError;
+    use crate::db::open_user_store;
     use argon2::PasswordHasher;
     use argon2::password_hash::SaltString;
     use argon2::password_hash::rand_core::OsRng;
-    use user_store::InMemoryUserStore;
-    use user_store::StoreError;
 
     struct FailingStore;
 
     #[async_trait]
     impl UserStore for FailingStore {
-        async fn password_hash(&self, _username: &str) -> Result<Option<String>, StoreError> {
-            Err(StoreError::Io(Box::new(std::io::Error::other("db down"))))
+        async fn password_hash(&self, _username: &str) -> Result<Option<String>, DbError> {
+            Err(DbError::Io(Box::new(std::io::Error::other("db down"))))
         }
-        async fn upsert(&self, _username: &str, _phc: &str) -> Result<(), StoreError> {
+        async fn upsert(&self, _username: &str, _phc: &str) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete(&self, _username: &str) -> Result<bool, StoreError> {
+        async fn delete(&self, _username: &str) -> Result<bool, DbError> {
             Ok(false)
         }
-        async fn list(&self) -> Result<Vec<String>, StoreError> {
+        async fn list(&self) -> Result<Vec<String>, DbError> {
             Ok(Vec::new())
         }
     }
@@ -147,16 +147,16 @@ mod tests {
 
     #[async_trait]
     impl UserStore for MalformedHashStore {
-        async fn password_hash(&self, _username: &str) -> Result<Option<String>, StoreError> {
+        async fn password_hash(&self, _username: &str) -> Result<Option<String>, DbError> {
             Ok(Some("not-a-valid-hash".to_string()))
         }
-        async fn upsert(&self, _username: &str, _phc: &str) -> Result<(), StoreError> {
+        async fn upsert(&self, _username: &str, _phc: &str) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete(&self, _username: &str) -> Result<bool, StoreError> {
+        async fn delete(&self, _username: &str) -> Result<bool, DbError> {
             Ok(false)
         }
-        async fn list(&self) -> Result<Vec<String>, StoreError> {
+        async fn list(&self) -> Result<Vec<String>, DbError> {
             Ok(Vec::new())
         }
     }
@@ -169,12 +169,17 @@ mod tests {
             .to_string()
     }
 
-    fn make_authenticators() -> (PasswordAuthenticator, Arc<InMemoryUserStore>) {
-        let store = Arc::new(
-            InMemoryUserStore::from_pairs([("alice".to_string(), hash_password("s3cret"))])
-                .unwrap(),
-        );
-        (PasswordAuthenticator::new(store.clone()), store)
+    type TestStores = (PasswordAuthenticator, Arc<dyn UserStore>, tempfile::TempDir);
+
+    async fn make_authenticators() -> TestStores {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("users.db").display());
+        let store = open_user_store(&url).await.unwrap();
+        store
+            .upsert("alice", &hash_password("s3cret"))
+            .await
+            .unwrap();
+        (PasswordAuthenticator::new(store.clone()), store, dir)
     }
 
     fn password_init(username: &str, password: &str) -> AuthInit {
@@ -204,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_begin_when_correct_credentials_returns_completed() {
-        let (auth, _) = make_authenticators();
+        let (auth, _, _) = make_authenticators().await;
         let outcome = auth.begin(password_init("alice", "s3cret")).await;
         assert!(matches!(
             outcome,
@@ -214,37 +219,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_begin_when_wrong_password_returns_denied() {
-        let (auth, _) = make_authenticators();
+        let (auth, _, _) = make_authenticators().await;
         assert_invalid_credentials(&auth.begin(password_init("alice", "wrong")).await);
     }
 
     #[tokio::test]
     async fn test_begin_when_unknown_user_returns_denied() {
-        let (auth, _) = make_authenticators();
+        let (auth, _, _) = make_authenticators().await;
         assert_invalid_credentials(&auth.begin(password_init("eve", "anything")).await);
     }
 
     #[tokio::test]
     async fn test_begin_when_empty_username_returns_denied() {
-        let (auth, _) = make_authenticators();
+        let (auth, _, _) = make_authenticators().await;
         assert_invalid_credentials(&auth.begin(password_init("", "s3cret")).await);
     }
 
     #[tokio::test]
     async fn test_begin_when_different_case_returns_denied() {
-        let (auth, _) = make_authenticators();
+        let (auth, _, _) = make_authenticators().await;
         assert_invalid_credentials(&auth.begin(password_init("Alice", "s3cret")).await);
     }
 
     #[tokio::test]
     async fn test_begin_when_leading_space_returns_denied() {
-        let (auth, _) = make_authenticators();
+        let (auth, _, _) = make_authenticators().await;
         assert_invalid_credentials(&auth.begin(password_init(" alice", "s3cret")).await);
     }
 
     #[tokio::test]
     async fn test_begin_when_user_upserted_takes_effect_immediately() {
-        let (auth, store) = make_authenticators();
+        let (auth, store, _) = make_authenticators().await;
         store.upsert("bob", &hash_password("pw2")).await.unwrap();
         assert!(matches!(
             auth.begin(password_init("bob", "pw2")).await,
@@ -254,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_begin_when_password_rotated_old_password_denied() {
-        let (auth, store) = make_authenticators();
+        let (auth, store, _) = make_authenticators().await;
         store
             .upsert("alice", &hash_password("new-pw"))
             .await
@@ -268,7 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_begin_when_user_deleted_denies_with_dummy_path() {
-        let (auth, store) = make_authenticators();
+        let (auth, store, _) = make_authenticators().await;
         assert!(store.delete("alice").await.unwrap());
         assert_invalid_credentials(&auth.begin(password_init("alice", "s3cret")).await);
     }
@@ -287,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_begin_returns_identity_equal_to_username() {
-        let (auth, _) = make_authenticators();
+        let (auth, _, _) = make_authenticators().await;
         let outcome = auth.begin(password_init("alice", "s3cret")).await;
         let AuthOutcome::Completed(identity) = outcome else {
             panic!("expected Completed, got {outcome:?}");

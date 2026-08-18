@@ -96,10 +96,10 @@
 │     自签 cert.pem / key.pem（客户端直接将其作为信任 CA）  │
 ├──────────────────────────────────────────────────────────┤
 │ 应用层: 可插拔多步认证 (challenge-response)                │
-│   - 用户凭据存于数据库 (sqlite, 见 [server].db 配置)      │
+│   - 用户凭据存于数据库 (sqlite, 见 [server].users_db 配置) │
 │   - 密码使用 argon2 哈希存储（未知用户做 dummy verify，    │
 │     防时序侧信道探测用户存在性）                           │
-│   - 存取抽象为 UserStore trait (user-store crate)，       │
+│   - 存取抽象为 UserStore trait (vpn-server::db 模块)，   │
 │     认证期逐次查询，xtask 增删改用户即时生效              │
 │   - 存储故障 fail closed（拒绝认证 + 日志，不泄露细节）   │
 │   - 认证抽象为 Authenticator trait (可插拔认证方式)       │
@@ -214,7 +214,9 @@ username  ──并发控制──►  同名新连接顶替旧连接 (见 §6, 
 
 ### 8.3 服务端消费
 
-- **`TelemetryPlane`**：多 sink fan-out（`Vec<Arc<dyn TelemetrySink>>`，当前默认装配 `ConsoleSink`）；`store` 遍历所有 sink 依次调用，**单个 sink 失败 / 超时（默认 1 秒）记录 warn 并跳过**，不阻断其它 sink；向后兼容单 sink。
+- **`TelemetryStore` trait**（`vpn-server::db`）：存储契约（`append` 按 item 粒度单事务写入、`query` 声明式 `TelemetryFilter` 过滤），sqlite 实现经 `db::open_telemetry_store(url)` 工厂构造（幂等建表 + 索引）。
+- **`SqliteTelemetrySink` 适配器**：持有 `Arc<dyn TelemetryStore>`，impl `sysprobe::TelemetrySink`，将 `DbError` 转换为 `SinkError::Backend`；不引入重试 / 超时 / fan-out 逻辑。
+- **`TelemetryPlane`**：多 sink fan-out（`Vec<Arc<dyn TelemetrySink>>`，默认装配 `ConsoleSink` + sqlite 适配器）；`store` 遍历所有 sink 依次调用，**单个 sink 失败 / 超时（默认 1 秒）记录 warn 并跳过**，不阻断其它 sink；向后兼容单 sink。
 - **`TelemetrySink` trait**：消费侧携带 `SinkSource{ session_id, username, virtual_ip }` 上下文。
 - **主动 pull**：服务端可经 `ConnectionHandle` 的 `request_collect` 发送 `CollectRequest`，客户端遥测循环响应采集并回推 report。
 
@@ -440,7 +442,8 @@ mtu = 1280
 cert = "cert.pem"      # 由 CA 签发的服务端证书（开发用自签证书在仓库根目录）
 key = "key.pem"        # 对应私钥
 routes = ["192.168.100.0/24", "10.88.0.0/16"]  # 可选：需通过 VPN 访问的额外子网（split tunneling），缺省为空
-db = "sqlite://users.db"   # 用户数据库（sqlx URL；首启自动建库建表；scheme 目前仅支持 sqlite）
+users_db = "sqlite://users.db"           # 用户凭据库 URL（首启自动建库建表）
+telemetry_db = "sqlite://telemetry.db"   # 遥测库 URL（与用户库分库；按领域独立配置）
 ```
 
 客户端：
@@ -455,7 +458,7 @@ ca_cert = "cert.pem"              # 信任的 CA 证书，用于校验服务端
 
 客户端解析语义：`server` 为 `SocketAddr`（当前仅支持 `IP:port`，域名 DNS 解析列后续）；`server_name` 非空、`ca_cert` 非空（文件存在性由 TLS 构造阶段校验）；`ClientConfig` 不含 `username` 字段、不含密码字段。
 
-服务端用户管理工具 `cargo xtask add-user [--config server.toml] <username>`（workspace 内独立 `xtask` crate，`.cargo/config.toml` 定义 alias）：从配置读 `db` URL，交互式输入两次密码（rpassword 不回显），生成 argon2id PHC 哈希后经 `user-store` upsert 进数据库，同名用户仅更新哈希。配套 `cargo xtask list-users`（列出全部用户名）与 `cargo xtask delete-user <username>`（删除用户，不存在时非零退出）。服务端认证期逐次查库，上述操作**无需重启服务端**即生效。
+服务端用户管理工具 `cargo xtask add-user [--config server.toml] <username>`（workspace 内独立 `xtask` crate，`.cargo/config.toml` 定义 alias）：从配置读 `users_db` URL，交互式输入两次密码（rpassword 不回显），生成 argon2id PHC 哈希后经 `vpn_server::db` upsert 进数据库，同名用户仅更新哈希。配套 `cargo xtask list-users`（列出全部用户名）与 `cargo xtask delete-user <username>`（删除用户，不存在时非零退出）；另有 `cargo xtask telemetry-query`（按 `telemetry_db` 查询遥测记录，支持 user/kind/since/until/limit 过滤）。服务端认证期逐次查库，上述操作**无需重启服务端**即生效。
 
 ## 12. 技术栈
 
@@ -490,14 +493,21 @@ Cargo workspace 成员：
 |-------|------|
 | `vpn-core` | 共享纯逻辑 + proto：framing/ctrl 协议、数据面（forward/downlink_pump）、TUN 设置、共享遥测消息 helper（`TelemetryChannel/Sender/Receiver` 别名、`TelemetryError`、消息构造函数） |
 | `vpn-client` | 客户端 lib + bin：QUIC 控制面/数据面客户端、TUN、OS 路由、客户端配置、客户端 telemetry（`build_default_registry` / `open_telemetry_stream` / push-pull 循环） |
-| `vpn-server` | 服务端 lib + bin：QUIC 控制面/数据面服务端、认证（`PasswordAuthenticator` 持 `Arc<dyn UserStore>`，argon2 验证在认证层）、IPAM、SessionRegistry、服务端配置、服务端 telemetry（`TelemetryPlane` fan-out / `TelemetryTxSlot` / `request_collect`） |
+| `vpn-server` | 服务端 lib + bin：QUIC 控制面/数据面服务端、认证（`PasswordAuthenticator` 持 `Arc<dyn db::UserStore>`，argon2 验证在认证层）、IPAM、SessionRegistry、服务端配置、服务端 telemetry（`TelemetryPlane` fan-out / `TelemetryTxSlot` / `request_collect`）、`db` 存储层模块（trait + sqlite 后端 + 工厂，见下） |
 | `vpn-tests` | 端到端集成测试（dev-dependencies 依赖 vpn-client/vpn-server/vpn-core） |
 | `msgx` | 控制面 framing + length-prefixed codec + 心跳 tracker（`ProtoCodec` / `Channel` / `KeepaliveTracker`） |
 | `quic-link` | QUIC 连接管道：TLS 配置、Endpoint、bidi stream → Channel 适配、datagram 收发、保活循环（`Session` 封装 `quinn::Connection`，对外不含 `quinn::` 类型）；依赖方向 `quic-link → msgx`；`test-util` feature（仅 dev-dependencies 引用）提供测试脚手架（`NoVerify` 免校验 verifier、`no_verify_client_config` / `make_session_pair` 工厂、`repo_file`），下游测试复用而非重写 |
 | `shutdown` | 通用的 tokio 长驻服务优雅关闭协调（`Shutdown`：信号 → token → drain，含超时/abort 兜底） |
 | `sysprobe` | 通用客户端信息采集框架：proto 数据模型、`Collector` trait + `CollectorRegistry`（cadence 调度 / pull 响应）、内置跨平台 collectors（进程/端口/网卡/磁盘）、`TelemetrySink` trait + `ConsoleSink`；与传输完全解耦 |
-| `user-store` | 用户凭据存储抽象：async `UserStore` trait（`password_hash` / `upsert` / `delete` / `list`，只管存取不含验证）+ `SqliteUserStore`（sqlx，create_if_missing + WAL + 幂等建表）+ `InMemoryUserStore`（测试替身）；upsert 写入路径校验用户名非空与 PHC 格式 |
-| `xtask` | 开发/运维工具（`add-user` / `list-users` / `delete-user`，读写 `server.toml` 指向的用户数据库） |
+| `xtask` | 开发/运维工具（`add-user` / `list-users` / `delete-user` / `telemetry-query`，读写 `server.toml` 指向的用户库与遥测库） |
+
+`vpn-server::db` 存储层模块布局：
+
+- `db/mod.rs`：`UserStore` / `TelemetryStore` trait、后端无关错误 `DbError`（`Io` + `InvalidInput`）、`TelemetryRow`（`id: String`，不绑自增假设）/ `TelemetryFilter`（声明式字段）、scheme 分发工厂 `open_user_store` / `open_telemetry_store`（当前仅 sqlite，未知 scheme 返回 `InvalidInput`）
+- `db/contract.rs`：契约测试套件（对 `&dyn Trait` 参数化，后端接入零改动复用）
+- `db/sqlite/`：共享 pool 打开逻辑（WAL + create_if_missing）+ `SqliteUserStore` + `SqliteTelemetryStore` + `SqliteTelemetrySink` 薄适配器（`DbError → SinkError::Backend`）
+
+**[规划] 后端演进**：认证类数据未来走关系型数据库（postgres，仅实现 `UserStore`）、遥测数据走 mongodb（仅实现 `TelemetryStore`，`TelemetryRow.id: String` 为 ObjectId 预留映射）；trait 签名、`DbError`、工厂形态三处已保证后端落地为纯增量。
 
 ## 14. 范围与非目标
 
@@ -702,7 +712,7 @@ Cargo workspace 成员：
 | 控制面单条双向 stream + length-prefix 分帧 | 一条 stream 承载认证/配置/心跳，开销小、实现简单，边界清晰 |
 | 应用层用户名密码（非 TLS-PSK） | 简单直观，username 天然作在线身份 |
 | argon2 哈希存储密码 | 数据库泄露时不暴露明文，成本极低 |
-| 用户凭据从 TOML 迁移到 SQLite（`user-store` crate，per-auth 查询） | 增删改用户无需重启服务端即生效；`UserStore` trait 抽象使后端可替换（MySQL 等后续增量）；SQLite WAL 使认证读与管理写不互斥；存储故障 fail closed（拒绝认证 + 日志，协议上与凭据错误不可区分） |
+| 用户凭据从 TOML 迁移到 SQLite（`vpn-server::db` 模块，per-auth 查询） | 增删改用户无需重启服务端即生效；`UserStore` trait 抽象使后端可替换（postgres 等后续增量）；SQLite WAL 使认证读与管理写不互斥；存储故障 fail closed（拒绝认证 + 日志，协议上与凭据错误不可区分） |
 | username 作为在线身份（非持久身份） | 简化实现；掉线即释放 IP，内存表足矣 |
 | 同名新连接顶替旧连接 | 后到即合法，直观，避免等待心跳超时的竞态 |
 | datagram 装原始 IP 包原样转发 | 最简实现，QUIC 连接已标识会话 |

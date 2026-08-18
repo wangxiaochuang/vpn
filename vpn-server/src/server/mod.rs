@@ -4,6 +4,9 @@ use self::conn::build_net_profile;
 use self::downlink::DownlinkDaemon;
 use crate::auth::PasswordAuthenticator;
 use crate::config::ServerConfig;
+use crate::db::open_telemetry_store;
+use crate::db::open_user_store;
+use crate::db::sqlite::SqliteTelemetrySink;
 use crate::ledger::ConnectionLedger;
 use crate::telemetry::TelemetryPlane;
 use anyhow::Context;
@@ -13,7 +16,6 @@ use shutdown::Shutdown;
 use shutdown::ShutdownHandle;
 use sysprobe::sink::ConsoleSink;
 use sysprobe::sink::TelemetrySink;
-use user_store::SqliteUserStore;
 use vpn_core::data::Tun;
 
 pub mod conn;
@@ -144,8 +146,8 @@ async fn build_accept(
     let auth = build_auth_store(&config).await?;
     let ledger = build_ledger(config.tun_subnet)?;
     let tun = create_tun(config.tun_subnet, config.mtu)?;
+    let telemetry = build_telemetry_plane(&config.telemetry_db).await?;
     let net_profile = build_net_profile(config);
-    let telemetry = build_telemetry_plane();
     let accept = AcceptLoop::new(
         endpoint,
         tun.clone(),
@@ -175,10 +177,10 @@ fn build_server(config: &ServerConfig) -> anyhow::Result<Server> {
 }
 
 async fn build_auth_store(config: &ServerConfig) -> anyhow::Result<Arc<AuthStore>> {
-    let store = SqliteUserStore::connect(&config.db)
+    let store = open_user_store(&config.users_db)
         .await
         .context("database initialization failed")?;
-    let authenticator = PasswordAuthenticator::new(Arc::new(store));
+    let authenticator = PasswordAuthenticator::new(store);
     Ok(Arc::new(AuthStore {
         authenticator: Arc::new(authenticator),
         supported_methods: vec![vpn_core::vpn::AuthMethod::Password],
@@ -189,10 +191,15 @@ fn build_ledger(subnet: Ipv4Net) -> anyhow::Result<Arc<ConnectionLedger<Connecti
     Ok(Arc::new(ConnectionLedger::new(subnet)?))
 }
 
-fn build_telemetry_plane() -> Arc<TelemetryPlane> {
-    Arc::new(TelemetryPlane::new(vec![
-        Arc::new(ConsoleSink) as Arc<dyn TelemetrySink>
-    ]))
+async fn build_telemetry_plane(db: &str) -> anyhow::Result<Arc<TelemetryPlane>> {
+    let store = open_telemetry_store(db)
+        .await
+        .context("database initialization failed")?;
+    let sink = SqliteTelemetrySink::new(store);
+    Ok(Arc::new(TelemetryPlane::new(vec![
+        Arc::new(ConsoleSink) as Arc<dyn TelemetrySink>,
+        Arc::new(sink) as Arc<dyn TelemetrySink>,
+    ])))
 }
 
 #[cfg(test)]
@@ -208,7 +215,8 @@ mod tests {
             cert: std::path::PathBuf::new(),
             key: std::path::PathBuf::new(),
             routes: vec![],
-            db: db.to_string(),
+            users_db: db.to_string(),
+            telemetry_db: db.to_string(),
         }
     }
 
@@ -241,5 +249,63 @@ mod tests {
             .err()
             .expect("boot should fail fast");
         assert!(err.to_string().contains("database"));
+    }
+
+    #[tokio::test]
+    async fn test_build_telemetry_plane_when_db_valid_assembles_two_sinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = format!("sqlite://{}", dir.path().join("telemetry.db").display());
+        let plane = build_telemetry_plane(&db).await.unwrap();
+        assert_eq!(plane.sinks_len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_build_telemetry_plane_persists_reports_to_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = format!("sqlite://{}", dir.path().join("telemetry.db").display());
+        let plane = build_telemetry_plane(&db).await.unwrap();
+        plane
+            .store(&sample_source(), &sample_report())
+            .await
+            .unwrap();
+        let rows = query_by_user(&db, "alice").await;
+        let row = rows.first().expect("row should be persisted");
+        assert_eq!(row.kind, sysprobe::proto::InfoKind::ProcessSummary as i32);
+    }
+
+    async fn query_by_user(db: &str, username: &str) -> Vec<crate::db::TelemetryRow> {
+        let store = crate::db::open_telemetry_store(db).await.unwrap();
+        let filter = crate::db::TelemetryFilter {
+            username: Some(username.into()),
+            ..crate::db::TelemetryFilter::default()
+        };
+        store.query(&filter).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_build_telemetry_plane_when_db_unwritable_fails_fast() {
+        let err = build_telemetry_plane("sqlite:///nonexistent-dir/telemetry.db")
+            .await
+            .err()
+            .expect("boot should fail fast");
+        assert!(err.to_string().contains("database"));
+    }
+
+    fn sample_report() -> sysprobe::proto::TelemetryReport {
+        sysprobe::proto::TelemetryReport {
+            ts_ms: 1,
+            items: vec![sysprobe::proto::InfoSnapshot {
+                kind: sysprobe::proto::InfoKind::ProcessSummary as i32,
+                payload: None,
+            }],
+        }
+    }
+
+    fn sample_source() -> sysprobe::sink::SinkSource {
+        sysprobe::sink::SinkSource {
+            session_id: 1,
+            username: "alice".into(),
+            virtual_ip: None,
+        }
     }
 }

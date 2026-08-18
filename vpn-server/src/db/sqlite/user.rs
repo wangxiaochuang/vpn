@@ -1,14 +1,10 @@
-use std::str::FromStr;
-
+use crate::db::DbError;
+use crate::db::UserStore;
+use crate::db::validate_upsert;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::sqlite::SqliteJournalMode;
-use sqlx::sqlite::SqlitePoolOptions;
 
-use crate::StoreError;
-use crate::UserStore;
-use crate::validate_upsert;
+use super::open_pool;
 
 const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS users (\
     username TEXT PRIMARY KEY, password_hash TEXT NOT NULL)";
@@ -18,51 +14,26 @@ pub struct SqliteUserStore {
     pool: SqlitePool,
 }
 
-fn io_err(e: sqlx::Error) -> StoreError {
-    StoreError::Io(Box::new(e))
-}
-
 impl SqliteUserStore {
-    pub async fn connect(url: &str) -> Result<Self, StoreError> {
-        let options = connect_options(url)?;
-        let pool = SqlitePoolOptions::new()
-            .connect_with(options)
-            .await
-            .map_err(io_err)?;
-        sqlx::query(CREATE_TABLE_SQL)
-            .execute(&pool)
-            .await
-            .map_err(io_err)?;
+    pub async fn connect(url: &str) -> Result<Self, DbError> {
+        let pool = open_pool(url, &[CREATE_TABLE_SQL]).await?;
         Ok(Self { pool })
     }
 }
 
-fn connect_options(url: &str) -> Result<SqliteConnectOptions, StoreError> {
-    if !url.starts_with("sqlite:") {
-        return Err(StoreError::InvalidInput(format!(
-            "invalid sqlite url: {url}"
-        )));
-    }
-    let options = SqliteConnectOptions::from_str(url)
-        .map_err(|e| StoreError::InvalidInput(format!("invalid sqlite url: {e}")))?;
-    Ok(options
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal))
-}
-
 #[async_trait]
 impl UserStore for SqliteUserStore {
-    async fn password_hash(&self, username: &str) -> Result<Option<String>, StoreError> {
+    async fn password_hash(&self, username: &str) -> Result<Option<String>, DbError> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT password_hash FROM users WHERE username = ?")
                 .bind(username)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(io_err)?;
+                .map_err(super::io_err)?;
         Ok(row.map(|r| r.0))
     }
 
-    async fn upsert(&self, username: &str, phc: &str) -> Result<(), StoreError> {
+    async fn upsert(&self, username: &str, phc: &str) -> Result<(), DbError> {
         validate_upsert(username, phc)?;
         sqlx::query(
             "INSERT INTO users (username, password_hash) VALUES (?, ?) \
@@ -72,24 +43,24 @@ impl UserStore for SqliteUserStore {
         .bind(phc)
         .execute(&self.pool)
         .await
-        .map_err(io_err)?;
+        .map_err(super::io_err)?;
         Ok(())
     }
 
-    async fn delete(&self, username: &str) -> Result<bool, StoreError> {
+    async fn delete(&self, username: &str) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM users WHERE username = ?")
             .bind(username)
             .execute(&self.pool)
             .await
-            .map_err(io_err)?;
+            .map_err(super::io_err)?;
         Ok(result.rows_affected() > 0)
     }
 
-    async fn list(&self) -> Result<Vec<String>, StoreError> {
+    async fn list(&self) -> Result<Vec<String>, DbError> {
         let rows: Vec<(String,)> = sqlx::query_as("SELECT username FROM users ORDER BY username")
             .fetch_all(&self.pool)
             .await
-            .map_err(io_err)?;
+            .map_err(super::io_err)?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 }
@@ -98,9 +69,7 @@ impl UserStore for SqliteUserStore {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::InMemoryUserStore;
-    use crate::contract;
-    use std::time::Duration;
+    use crate::db::contract;
 
     fn temp_url(dir: &tempfile::TempDir) -> String {
         format!("sqlite://{}", dir.path().join("users.db").display())
@@ -189,7 +158,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_invalid_url_returns_invalid_input() {
         let err = SqliteUserStore::connect("not-a-url").await.unwrap_err();
-        assert!(matches!(err, StoreError::InvalidInput(_)));
+        assert!(matches!(err, DbError::InvalidInput(_)));
     }
 
     #[tokio::test]
@@ -197,51 +166,7 @@ mod tests {
         let err = SqliteUserStore::connect("sqlite:///nonexistent-dir/users.db")
             .await
             .unwrap_err();
-        assert!(matches!(err, StoreError::Io(_)));
-    }
-
-    #[tokio::test]
-    async fn test_sqlite_and_memory_agree_after_upserts() {
-        let (_dir, sqlite) = temp_store().await;
-        let memory = InMemoryUserStore::new();
-        let phc1 = valid_phc();
-        let phc2 = valid_phc();
-        for phc in [&phc1, &phc2] {
-            sqlite.upsert("alice", phc).await.unwrap();
-            memory.upsert("alice", phc).await.unwrap();
-            assert_eq!(
-                sqlite.password_hash("alice").await.unwrap(),
-                memory.password_hash("alice").await.unwrap()
-            );
-            assert_eq!(
-                sqlite.password_hash("alice").await.unwrap(),
-                Some(phc.clone())
-            );
-        }
-        assert_eq!(sqlite.list().await.unwrap(), memory.list().await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_sqlite_and_memory_agree_after_delete() {
-        let (_dir, sqlite) = temp_store().await;
-        let memory = InMemoryUserStore::new();
-        for store in [
-            &sqlite as &dyn crate::UserStore,
-            &memory as &dyn crate::UserStore,
-        ] {
-            store.upsert("alice", &valid_phc()).await.unwrap();
-        }
-        for _ in [0, 1] {
-            assert_eq!(
-                sqlite.delete("alice").await.unwrap(),
-                memory.delete("alice").await.unwrap()
-            );
-        }
-        assert_eq!(
-            sqlite.password_hash("alice").await.unwrap(),
-            memory.password_hash("alice").await.unwrap()
-        );
-        assert_eq!(sqlite.list().await.unwrap(), memory.list().await.unwrap());
+        assert!(matches!(err, DbError::Io(_)));
     }
 
     async fn seed_users(store: &SqliteUserStore, count: usize) {
@@ -271,13 +196,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_read_and_write_complete_without_deadlock() {
+        use std::time::Duration;
         let (_dir, store) = temp_store().await;
         seed_users(&store, 10).await;
         let store = std::sync::Arc::new(store);
         let reader = spawn_reader(store.clone());
         let writer = spawn_writer(store);
-        let timeout = Duration::from_secs(30);
-        tokio::time::timeout(timeout, async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             reader.await.unwrap();
             writer.await.unwrap();
         })

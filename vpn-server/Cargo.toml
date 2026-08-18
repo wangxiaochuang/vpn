@@ -10,7 +10,6 @@ msgx = { path = "../msgx" }
 quic-link = { path = "../quic-link" }
 shutdown = { path = "../shutdown" }
 sysprobe = { path = "../sysprobe" }
-user-store = { path = "../user-store" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tun-rs = { version = "2", features = ["async"] }
@@ -28,9 +27,12 @@ argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 futures = "0.3"
 async-trait = "0.1"
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+] }
 
 [dev-dependencies]
-user-store = { path = "../user-store" }
 quic-link = { path = "../quic-link", features = ["test-util"] }
 quinn = { version = "0.11", features = ["rustls-aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = [

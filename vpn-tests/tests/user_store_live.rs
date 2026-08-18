@@ -4,12 +4,10 @@ mod common;
 
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use ipnet::Ipv4Net;
-use user_store::SqliteUserStore;
-use user_store::UserStore as _;
 use vpn_core::ctrl::control_message::Msg;
+use vpn_server::db::open_user_store;
 
 fn subnet() -> Ipv4Net {
     Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap()
@@ -31,14 +29,14 @@ async fn auth_succeeds(addr: SocketAddr, username: &str, password: &str) -> bool
 async fn test_boot_creates_db_and_authenticates_seeded_user() {
     let dir = tempfile::tempdir().unwrap();
     let db = temp_db(&dir);
-    let seeding = SqliteUserStore::connect(&db).await.unwrap();
+    let seeding = open_user_store(&db).await.unwrap();
     seeding
         .upsert("alice", &common::hash_password(common::ALICE_PASSWORD))
         .await
         .unwrap();
     drop(seeding);
 
-    let store = Arc::new(SqliteUserStore::connect(&db).await.unwrap());
+    let store = open_user_store(&db).await.unwrap();
     let (endpoint, _state, _sd) = common::start_test_server_with_store(store, subnet()).await;
     let addr = endpoint.local_addr().unwrap();
     assert!(
@@ -49,7 +47,7 @@ async fn test_boot_creates_db_and_authenticates_seeded_user() {
 
 async fn start_running_server(dir: &tempfile::TempDir) -> (SocketAddr, String) {
     let db = temp_db(dir);
-    let store = Arc::new(SqliteUserStore::connect(&db).await.unwrap());
+    let store = open_user_store(&db).await.unwrap();
     store
         .upsert("alice", &common::hash_password(common::ALICE_PASSWORD))
         .await
@@ -62,7 +60,7 @@ async fn start_running_server(dir: &tempfile::TempDir) -> (SocketAddr, String) {
 async fn test_new_user_takes_effect_without_restart() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, db) = start_running_server(&dir).await;
-    let admin = SqliteUserStore::connect(&db).await.unwrap();
+    let admin = open_user_store(&db).await.unwrap();
     admin
         .upsert("bob", &common::hash_password("pw2"))
         .await
@@ -74,7 +72,7 @@ async fn test_new_user_takes_effect_without_restart() {
 async fn test_password_rotation_takes_effect_without_restart() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, db) = start_running_server(&dir).await;
-    let admin = SqliteUserStore::connect(&db).await.unwrap();
+    let admin = open_user_store(&db).await.unwrap();
     admin
         .upsert("alice", &common::hash_password("new-pw"))
         .await

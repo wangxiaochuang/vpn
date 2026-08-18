@@ -65,7 +65,8 @@ async fn test_server_ingests_telemetry_report_to_sink() {
         Ipv4Net::new(std::net::Ipv4Addr::new(10, 0, 0, 0), 24).unwrap(),
         common::alice_users(),
         Arc::new(sink.clone()) as Arc<dyn TelemetrySink>,
-    );
+    )
+    .await;
     let (endpoint, _sd) = common::start_test_server_with_state(state).await;
 
     let mut writer = auth_and_get_telemetry_writer(&endpoint).await;

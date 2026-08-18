@@ -12,7 +12,6 @@ msgx = { path = "../msgx" }
 quic-link = { path = "../quic-link", features = ["test-util"] }
 shutdown = { path = "../shutdown" }
 sysprobe = { path = "../sysprobe" }
-user-store = { path = "../user-store" }
 quinn = { version = "0.11", features = ["rustls-aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = [
     "std",
@@ -25,5 +24,6 @@ bytes = "1"
 ipnet = "2"
 futures = "0.3"
 async-trait = "0.1"
+prost = "0.13"
 argon2 = "0.5"
 tempfile = "3"

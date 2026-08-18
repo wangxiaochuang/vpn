@@ -1,22 +1,23 @@
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::bail;
 use toml::Table;
-use user_store::SqliteUserStore;
-use user_store::UserStore as _;
+use vpn_server::db::UserStore;
+use vpn_server::db::open_user_store;
 
 use crate::hash;
 
 pub struct UserAdmin {
-    store: SqliteUserStore,
+    store: Arc<dyn UserStore>,
 }
 
 impl UserAdmin {
     pub async fn open(config_path: &Path) -> anyhow::Result<Self> {
-        let db = read_db_url(config_path)?;
-        let store = SqliteUserStore::connect(&db)
+        let db = read_users_db_url(config_path)?;
+        let store = open_user_store(&db)
             .await
             .with_context(|| format!("failed to open database {db}"))?;
         Ok(Self { store })
@@ -44,7 +45,15 @@ impl UserAdmin {
     }
 }
 
-pub fn read_db_url(config_path: &Path) -> anyhow::Result<String> {
+pub fn read_users_db_url(config_path: &Path) -> anyhow::Result<String> {
+    read_db_field(config_path, "users_db")
+}
+
+pub fn read_telemetry_db_url(config_path: &Path) -> anyhow::Result<String> {
+    read_db_field(config_path, "telemetry_db")
+}
+
+fn read_db_field(config_path: &Path, field: &str) -> anyhow::Result<String> {
     let content = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read config file {}", config_path.display()))?;
     let table = content
@@ -52,12 +61,12 @@ pub fn read_db_url(config_path: &Path) -> anyhow::Result<String> {
         .with_context(|| format!("failed to parse config file {}", config_path.display()))?;
     let db = table
         .get("server")
-        .and_then(|s| s.get("db"))
+        .and_then(|s| s.get(field))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if db.is_empty() {
         bail!(
-            "config file {} has no [server].db field",
+            "config file {} has no [server].{field} field",
             config_path.display()
         );
     }
@@ -78,7 +87,9 @@ mod tests {
     }
 
     fn config_body(db: &str) -> String {
-        format!("[server]\nlisten = \"0.0.0.0:4433\"\ndb = \"{db}\"\n")
+        format!(
+            "[server]\nlisten = \"0.0.0.0:4433\"\nusers_db = \"{db}\"\ntelemetry_db = \"sqlite://telemetry.db\"\n"
+        )
     }
 
     async fn temp_admin() -> (tempfile::TempDir, UserAdmin) {
@@ -93,28 +104,28 @@ mod tests {
     fn test_read_db_url_when_db_present_returns_url() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(&dir, &config_body("sqlite://users.db"));
-        assert_eq!(read_db_url(&path).unwrap(), "sqlite://users.db");
+        assert_eq!(read_users_db_url(&path).unwrap(), "sqlite://users.db");
     }
 
     #[test]
     fn test_read_db_url_when_db_missing_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(&dir, "[server]\nlisten = \"0.0.0.0:4433\"\n");
-        assert!(read_db_url(&path).is_err());
+        assert!(read_users_db_url(&path).is_err());
     }
 
     #[test]
     fn test_read_db_url_when_file_missing_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.toml");
-        assert!(read_db_url(&path).is_err());
+        assert!(read_users_db_url(&path).is_err());
     }
 
     #[test]
     fn test_read_db_url_when_toml_invalid_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(&dir, "listen = ");
-        assert!(read_db_url(&path).is_err());
+        assert!(read_users_db_url(&path).is_err());
     }
 
     #[tokio::test]

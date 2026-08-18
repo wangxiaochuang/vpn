@@ -258,7 +258,8 @@ mod tests {
             cert: std::path::PathBuf::new(),
             key: std::path::PathBuf::new(),
             routes,
-            db: "sqlite://users.db".to_string(),
+            users_db: "sqlite://users.db".to_string(),
+            telemetry_db: "sqlite://telemetry.db".to_string(),
         }
     }
 

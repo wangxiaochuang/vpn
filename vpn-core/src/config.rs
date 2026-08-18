@@ -15,8 +15,6 @@ pub enum ConfigError {
     InvalidSubnet,
     #[error("database url is missing, empty, or malformed")]
     InvalidDatabaseUrl,
-    #[error("database backend {0} is not supported yet")]
-    UnsupportedDatabase(String),
     #[error("server_name must not be empty")]
     EmptyServerName,
     #[error("ca_cert must not be empty")]
@@ -68,7 +66,6 @@ mod tests {
             ConfigError::MtuTooSmall(1000).to_string(),
             ConfigError::InvalidSubnet.to_string(),
             ConfigError::InvalidDatabaseUrl.to_string(),
-            ConfigError::UnsupportedDatabase("mysql".into()).to_string(),
         ]
     }
 
@@ -90,7 +87,6 @@ mod tests {
         assert!(all[2].contains("1000") && all[2].contains("1280"));
         assert!(all[3].contains("subnet"));
         assert!(all[4].contains("database"));
-        assert!(all[5].contains("mysql") && all[5].contains("not supported"));
     }
 
     #[test]
@@ -118,8 +114,8 @@ mod tests {
     fn test_client_error_new_variants_display_distinct_from_existing() {
         let all = all_config_error_displays();
         assert_displays_unique(&all);
-        assert!(all[6].contains("server_name"));
-        assert!(all[7].contains("ca_cert"));
-        assert!(all[8].contains("default route"));
+        assert!(all[5].contains("server_name"));
+        assert!(all[6].contains("ca_cert"));
+        assert!(all[7].contains("default route"));
     }
 }

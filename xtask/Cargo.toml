@@ -12,8 +12,10 @@ password-hash = { version = "0.5", features = ["getrandom"] }
 rpassword = "7.5"
 thiserror = "2"
 toml = "0.8"
-user-store = { path = "../user-store" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+prost = "0.13"
+sysprobe = { path = "../sysprobe" }
+vpn-server = { path = "../vpn-server" }
 
 [dev-dependencies]
 tempfile = "3"

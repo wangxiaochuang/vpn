@@ -17,7 +17,8 @@ pub struct ServerConfig {
     pub cert: PathBuf,
     pub key: PathBuf,
     pub routes: Vec<Ipv4Net>,
-    pub db: String,
+    pub users_db: String,
+    pub telemetry_db: String,
 }
 
 impl ServerConfig {
@@ -30,7 +31,8 @@ impl ServerConfig {
     fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
         let server = raw.server;
         validate_server_fields(server.mtu, server.tun_subnet, &server.routes)?;
-        validate_db(&server.db)?;
+        validate_db_url(&server.users_db)?;
+        validate_db_url(&server.telemetry_db)?;
         Ok(Self {
             listen: server.listen,
             tun_subnet: server.tun_subnet,
@@ -38,7 +40,8 @@ impl ServerConfig {
             cert: server.cert,
             key: server.key,
             routes: server.routes,
-            db: server.db,
+            users_db: server.users_db,
+            telemetry_db: server.telemetry_db,
         })
     }
 }
@@ -64,12 +67,11 @@ fn is_default_route(routes: &[Ipv4Net]) -> bool {
         .any(|r| r.network() == Ipv4Addr::UNSPECIFIED && r.prefix_len() == 0)
 }
 
-fn validate_db(db: &str) -> Result<(), ConfigError> {
-    match db.split_once("://") {
-        None => Err(ConfigError::InvalidDatabaseUrl),
-        Some(("sqlite", _)) => Ok(()),
-        Some((scheme, _)) => Err(ConfigError::UnsupportedDatabase(scheme.to_string())),
+fn validate_db_url(url: &str) -> Result<(), ConfigError> {
+    if url.is_empty() {
+        return Err(ConfigError::InvalidDatabaseUrl);
     }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,7 +90,9 @@ struct RawServer {
     #[serde(default, deserialize_with = "deserialize_ipv4_net_vec")]
     routes: Vec<Ipv4Net>,
     #[serde(default)]
-    db: String,
+    users_db: String,
+    #[serde(default)]
+    telemetry_db: String,
 }
 
 #[cfg(test)]
@@ -117,7 +121,8 @@ tun_subnet = "10.0.0.0/24"
 mtu = 1280
 cert = "server.crt"
 key = "server.key"
-db = "sqlite://users.db"
+users_db = "sqlite://users.db"
+telemetry_db = "sqlite://telemetry.db"
 "#
         .to_string()
     }
@@ -132,7 +137,8 @@ db = "sqlite://users.db"
         assert_eq!(cfg.mtu, 1280);
         assert_eq!(cfg.cert, PathBuf::from("server.crt"));
         assert_eq!(cfg.key, PathBuf::from("server.key"));
-        assert_eq!(cfg.db, "sqlite://users.db");
+        assert_eq!(cfg.users_db, "sqlite://users.db");
+        assert_eq!(cfg.telemetry_db, "sqlite://telemetry.db");
         assert!(cfg.routes.is_empty());
     }
 
@@ -223,42 +229,30 @@ db = "sqlite://users.db"
     }
 
     #[test]
-    fn test_load_when_db_missing_returns_invalid_database_url() {
+    fn test_load_when_users_db_missing_returns_invalid_database_url() {
         let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body().replace("db = \"sqlite://users.db\"\n", "");
-        let path = write_config(&dir, "no_db.toml", &body);
+        let body = minimal_config_body().replace("users_db = \"sqlite://users.db\"\n", "");
+        let path = write_config(&dir, "no_users_db.toml", &body);
         let err = ServerConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidDatabaseUrl));
     }
 
     #[test]
-    fn test_load_when_db_empty_returns_invalid_database_url() {
+    fn test_load_when_telemetry_db_empty_returns_invalid_database_url() {
         let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body().replace("sqlite://users.db", "");
-        let path = write_config(&dir, "empty_db.toml", &body);
+        let body = minimal_config_body().replace("sqlite://telemetry.db", "");
+        let path = write_config(&dir, "empty_telemetry.toml", &body);
         let err = ServerConfig::load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidDatabaseUrl));
     }
 
     #[test]
-    fn test_load_when_db_not_a_url_returns_invalid_database_url() {
+    fn test_load_when_db_unknown_scheme_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body().replace("sqlite://users.db", "not-a-url");
-        let path = write_config(&dir, "bad_db.toml", &body);
-        let err = ServerConfig::load(&path).unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidDatabaseUrl));
-    }
-
-    #[test]
-    fn test_load_when_db_mysql_returns_unsupported_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = minimal_config_body().replace("sqlite://users.db", "mysql://host/db");
-        let path = write_config(&dir, "mysql.toml", &body);
-        let err = ServerConfig::load(&path).unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::UnsupportedDatabase(ref s) if s == "mysql"
-        ));
+        let body = minimal_config_body().replace("sqlite://users.db", "mongodb://host/db");
+        let path = write_config(&dir, "mongo.toml", &body);
+        let cfg = ServerConfig::load(&path).unwrap();
+        assert_eq!(cfg.users_db, "mongodb://host/db");
     }
 
     #[test]
@@ -277,6 +271,6 @@ db = "sqlite://users.db"
         body.push_str("\n[[users]]\nusername = \"alice\"\npassword_hash = \"x\"\n");
         let path = write_config(&dir, "legacy_users.toml", &body);
         let cfg = ServerConfig::load(&path).unwrap();
-        assert_eq!(cfg.db, "sqlite://users.db");
+        assert_eq!(cfg.users_db, "sqlite://users.db");
     }
 }

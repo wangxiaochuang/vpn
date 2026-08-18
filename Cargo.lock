@@ -2463,19 +2463,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "user-store"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "async-trait",
- "password-hash",
- "sqlx",
- "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2583,6 +2570,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "shutdown",
+ "sqlx",
  "sysprobe",
  "tempfile",
  "thiserror",
@@ -2592,7 +2580,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tun-rs",
- "user-store",
  "vpn-core",
 ]
 
@@ -2606,6 +2593,7 @@ dependencies = [
  "futures",
  "ipnet",
  "msgx",
+ "prost",
  "quic-link",
  "quinn",
  "rustls",
@@ -2615,7 +2603,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "user-store",
  "vpn-client",
  "vpn-core",
  "vpn-server",
@@ -3150,12 +3137,14 @@ dependencies = [
  "argon2",
  "clap",
  "password-hash",
+ "prost",
  "rpassword",
+ "sysprobe",
  "tempfile",
  "thiserror",
  "tokio",
  "toml",
- "user-store",
+ "vpn-server",
 ]
 
 [[package]]
